@@ -173,6 +173,51 @@ class RiskTests(unittest.TestCase):
         )
         self.assertFalse(any(a.side == "BUY" for a in planned.actions))
 
+    def test_abstaining_model_lets_the_quant_candidate_through(self):
+        portfolio = Portfolio(5_000_000)
+        view = self._view(portfolio)
+        abstain = AgentDecision(source="llm", veto_all=False, regime="trend", comment="no view", decisions=[])
+        planned = self.risk.plan(
+            portfolio=portfolio, agent=abstain, candidates=[candidate()],
+            marks={"BTCTMN": 100}, rules={"BTCTMN": rule()}, unavailable=set(),
+            now=self.now, view=view, order_times=[], cooldowns={}, now_unix=self.unix,
+        )
+        buys = [a for a in planned.actions if a.side == "BUY"]
+        self.assertEqual(len(buys), 1)
+        self.assertEqual(buys[0].symbol, "BTCTMN")
+
+    def test_hostile_regime_is_a_veto(self):
+        portfolio = Portfolio(5_000_000)
+        view = self._view(portfolio)
+        hostile = AgentDecision(source="llm", veto_all=False, regime="hostile", comment="book is offered", decisions=[])
+        planned = self.risk.plan(
+            portfolio=portfolio, agent=hostile, candidates=[candidate()],
+            marks={"BTCTMN": 100}, rules={"BTCTMN": rule()}, unavailable=set(),
+            now=self.now, view=view, order_times=[], cooldowns={}, now_unix=self.unix,
+        )
+        self.assertFalse(any(a.side == "BUY" for a in planned.actions))
+        self.assertTrue(any("veto" in row["reason"] for row in planned.rejected))
+
+    def test_quarter_kelly_cuts_the_fixed_fraction(self):
+        settings = cfg()
+        settings["risk"]["kelly_fraction"] = 0.25
+        settings["risk"]["kelly_win_prob"] = 0.55
+        settings["risk"]["kelly_payoff"] = 1.0
+        risk = RiskManager(settings)
+        portfolio = Portfolio(5_000_000)
+        view = risk.view(
+            portfolio, {}, self.now, peak_equity=portfolio.cash, day_start_equity=portfolio.cash,
+            kill_switch=False, kill_reason="",
+        )
+        planned = risk.plan(
+            portfolio=portfolio, agent=buy(size=0.12), candidates=[candidate()],
+            marks={"BTCTMN": 100}, rules={"BTCTMN": rule()}, unavailable=set(),
+            now=self.now, view=view, order_times=[], cooldowns={}, now_unix=self.unix,
+        )
+        buys = [a for a in planned.actions if a.side == "BUY"]
+        self.assertEqual(len(buys), 1)
+        self.assertAlmostEqual(buys[0].size_fraction, 0.025)
+
     def test_hourly_entry_cap(self):
         portfolio = Portfolio(5_000_000)
         view = self._view(portfolio)

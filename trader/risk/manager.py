@@ -11,7 +11,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from trader.engine.portfolio import Portfolio
-from trader.strategy.parser import AgentDecision
+from trader.strategy.parser import AgentDecision, ParsedDecision
+from trader.strategy.quotes import fractional_kelly
 from trader.strategy.signals import Candidate
 from trader.timeutil import day_key, to_tehran
 from trader.types import MarketRule
@@ -116,7 +117,7 @@ class RiskManager:
         if daily >= float(risk["daily_max_drawdown"]):
             blocked = True
             new_kill = True
-            new_reason = f"daily drawdown {daily:.2%} hit the kill switch"
+            new_reason = f"daily max-loss {daily:.2%} hit the kill switch"
             reason = new_reason
         elif drawdown >= float(risk["global_max_drawdown"]):
             blocked = True
@@ -184,11 +185,10 @@ class RiskManager:
         entry_cap = int(risk["max_entries_per_hour"])
         order_cap = int(risk["max_orders_per_hour"])
 
-        if not agent.veto_all and view.phase == "normal" and not view.kill_switch:
+        hostile = (agent.regime or "").lower() == "hostile"
+        if view.phase == "normal" and not view.kill_switch:
             for decision in agent.decisions:
-                if decision.action == "HOLD" or decision.veto:
-                    continue
-                if decision.action in {"SELL", "CLOSE"}:
+                if decision.action in {"SELL", "CLOSE"} and not decision.veto:
                     if decision.symbol in held and decision.symbol not in forced_symbols:
                         actions.append(
                             Action(
@@ -203,50 +203,53 @@ class RiskManager:
                         )
                     else:
                         rejected.append({"symbol": decision.symbol, "reason": "close ignored; no position"})
-                    continue
-                if decision.action != "BUY":
-                    continue
-                rejection = self._reject_buy(
-                    decision,
-                    candidate_by_symbol,
-                    portfolio,
-                    view,
-                    unavailable,
-                    rules,
-                    cooldowns,
-                    now_unix,
-                    entries_this_hour,
-                    order_cap,
-                    entry_cap,
-                )
-                if rejection:
-                    rejected.append(rejection)
-                    continue
-                candidate = candidate_by_symbol[decision.symbol]
-                size = decision.size_fraction if decision.size_fraction is not None else candidate.size_fraction
-                size = min(size, candidate.size_fraction, float(risk["max_fraction_per_trade"]))
-                room = float(risk["max_gross_exposure"]) - view.gross_exposure
-                size = min(size, room)
-                if size <= 0:
-                    rejected.append({"symbol": decision.symbol, "reason": "no exposure room"})
-                    continue
-                actions.append(
-                    Action(
-                        symbol=decision.symbol,
-                        side="BUY",
-                        order_type="LIMIT",
-                        size_fraction=size,
-                        reason=decision.rationale or candidate.setup,
-                        source=agent.source,
-                        price_direction="up",
-                        aggressive=True,
+            if agent.veto_all or hostile:
+                rejected.append({"symbol": "*", "reason": "model vetoed the regime"})
+            else:
+                for decision in _entry_decisions(agent, candidates):
+                    rejection = self._reject_buy(
+                        decision,
+                        candidate_by_symbol,
+                        portfolio,
+                        view,
+                        unavailable,
+                        rules,
+                        cooldowns,
+                        now_unix,
+                        entries_this_hour,
+                        order_cap,
+                        entry_cap,
                     )
-                )
-                entries_this_hour += 1
-                # one new entry per cycle, even if the cap allows more
-                break
-        elif agent.veto_all:
-            rejected.append({"symbol": "*", "reason": "model vetoed every new entry"})
+                    if rejection:
+                        rejected.append(rejection)
+                        continue
+                    candidate = candidate_by_symbol[decision.symbol]
+                    size = decision.size_fraction if decision.size_fraction is not None else candidate.size_fraction
+                    kelly = fractional_kelly(self.cfg)
+                    per_symbol = float(risk.get("max_fraction_per_symbol", risk["max_fraction_per_trade"]))
+                    size = min(size, candidate.size_fraction, float(risk["max_fraction_per_trade"]), per_symbol)
+                    if kelly is not None:
+                        size = min(size, kelly)
+                    room = float(risk["max_gross_exposure"]) - view.gross_exposure
+                    size = min(size, room)
+                    if size <= 0:
+                        rejected.append({"symbol": decision.symbol, "reason": "no exposure room"})
+                        continue
+                    actions.append(
+                        Action(
+                            symbol=decision.symbol,
+                            side="BUY",
+                            order_type="LIMIT",
+                            size_fraction=size,
+                            reason=decision.rationale or candidate.setup,
+                            source=agent.source,
+                            price_direction="down",
+                            aggressive=False,
+                        )
+                    )
+                    entries_this_hour += 1
+                    # one new entry per cycle, even if the cap allows more
+                    break
 
         return RiskResult(view=view, actions=actions, rejected=rejected)
 
@@ -345,6 +348,34 @@ class RiskManager:
         if entries_this_hour >= entry_cap or entries_this_hour >= order_cap:
             return {"symbol": symbol, "reason": "hourly order cap reached"}
         return None
+
+
+def _entry_decisions(agent: AgentDecision, candidates: list[Candidate]) -> list[ParsedDecision]:
+    """Quant candidates are the trigger. The model only confirms, cuts, or vetoes.
+
+    An explicit BUY is a confirmation of that symbol and does not fall through
+    to a different name. An empty decision list, or only HOLD, is an abstention:
+    the highest-scoring candidate is allowed through. veto_all and a hostile
+    regime are handled by the caller.
+    """
+    explicit = [item for item in agent.decisions if item.action == "BUY" and not item.veto]
+    if explicit:
+        return explicit
+    vetoed = {item.symbol for item in agent.decisions if item.veto}
+    pool = [item for item in candidates if item.symbol not in vetoed]
+    if not pool:
+        return []
+    top = pool[0]
+    return [
+        ParsedDecision(
+            action="BUY",
+            symbol=top.symbol,
+            size_fraction=None,
+            confidence=0.55,
+            veto=False,
+            rationale="quant trigger; the model abstained",
+        )
+    ]
 
 
 def roll_day(day: str, now: datetime, equity: float) -> tuple[str, float]:

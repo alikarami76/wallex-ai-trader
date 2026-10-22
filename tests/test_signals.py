@@ -56,8 +56,20 @@ class SignalTests(unittest.TestCase):
         self.assertEqual(build_candidates([row], costly), [])
 
     def test_round_trip_uses_taker_entry_and_maker_exit(self):
-        cost = round_trip_cost(base_cfg(), 0.0025, 0.003)
-        self.assertAlmostEqual(cost, 0.003 + 0.0025 + 0.0003)
+        cost = round_trip_cost(base_cfg(), 0.0025, 0.003, spread_bps=10)
+        half = 10 / 2 / 10_000
+        self.assertAlmostEqual(cost, 0.003 + 0.0025 + half + 0.0003)
+
+    def test_slow_momentum_blocks_a_three_day_decline(self):
+        bars = rising_then_dip()
+        # The short fixture has no 72-hour window, so the slow filter must refuse it.
+        slow = base_cfg(slow_bars=72, slow_roc_min=0.0)
+        row = evaluate_symbol(
+            "BTCTMN", bars, slow, spread_bps=10, imbalance=0.2, micro_return=0.0,
+            maker_fee=0.0025, taker_fee=0.003,
+        )
+        self.assertFalse(row.signal)
+        self.assertTrue(any("warmup" in item or "slow" in item for item in row.blockers))
 
     def test_setup_can_pass_when_trend_pullback_and_cost_line_up(self):
         bars = rising_then_dip()

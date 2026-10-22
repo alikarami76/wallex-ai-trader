@@ -77,15 +77,20 @@ class OrderBook:
             return None
         return (self.best_ask - self.best_bid) / mid * 10_000
 
-    def imbalance(self, levels: int = 5) -> float | None:
+    def imbalance(self, levels: int = 1) -> float | None:
+        """Cont, Kukanov and Stoikov (2014) book imbalance at the touch.
+
+        (bid quantity - ask quantity) / (bid quantity + ask quantity) on the
+        best `levels` prices. The default is the best price only.
+        """
         bids = self.bids[:levels]
         asks = self.asks[:levels]
-        bid_notional = sum(l.price * l.quantity for l in bids)
-        ask_notional = sum(l.price * l.quantity for l in asks)
-        total = bid_notional + ask_notional
+        bid_qty = sum(level.quantity for level in bids)
+        ask_qty = sum(level.quantity for level in asks)
+        total = bid_qty + ask_qty
         if total <= 0:
             return None
-        return (bid_notional - ask_notional) / total
+        return (bid_qty - ask_qty) / total
 
 
 @dataclass

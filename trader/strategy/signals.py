@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from trader.strategy.indicators import atr_percent, clip, ema, finite, roc, rsi
+from trader.strategy.quotes import execution_cost, half_spread
 from trader.types import Bar
 
 
@@ -56,6 +57,7 @@ class SymbolFeatures:
             "micro_return": n(self.micro_return),
             "expected_gross": n(self.expected_gross),
             "round_trip_cost": n(self.round_trip_cost),
+            "half_spread": n(half_spread(self.spread_bps)),
             "signal": self.signal,
             "score": round(self.score, 3),
             "blockers": self.blockers,
@@ -90,11 +92,9 @@ class Candidate:
         }
 
 
-def round_trip_cost(cfg: dict, maker: float, taker: float) -> float:
-    entry = taker if cfg["execution"]["entry"] == "marketable_limit" else maker
-    exit_fee = maker if cfg["execution"]["exit"] == "limit_maker" else taker
-    slippage = float(cfg["fees"]["slippage_bps"]) / 10_000
-    return entry + exit_fee + slippage
+def round_trip_cost(cfg: dict, maker: float, taker: float, spread_bps: float | None = None) -> float:
+    """Almgren-Chriss cost: fees + half-spread + slippage."""
+    return execution_cost(cfg, maker, taker, spread_bps)
 
 
 def evaluate_symbol(
@@ -125,10 +125,16 @@ def evaluate_symbol(
         imbalance=imbalance,
         micro_return=micro_return,
         expected_gross=float(strategy["expected_gross"]),
-        round_trip_cost=round_trip_cost(cfg, maker_fee, taker_fee),
+        round_trip_cost=round_trip_cost(cfg, maker_fee, taker_fee, spread_bps),
         signal=False,
     )
-    need = max(int(strategy["ema_slow"]), int(strategy["trend_bars"]), int(strategy["atr_period"])) + 2
+    slow_bars = int(strategy.get("slow_bars") or 0)
+    need = max(
+        int(strategy["ema_slow"]),
+        int(strategy["trend_bars"]),
+        int(strategy["atr_period"]),
+        slow_bars,
+    ) + 2
     if len(bars) < need:
         features.blockers.append(f"warmup {len(bars)}/{need}")
         return features
@@ -159,6 +165,13 @@ def evaluate_symbol(
             blockers.append("trend structure off")
         if trend < float(strategy["trend_roc_min"]):
             blockers.append(f"24h return {trend:.2%} below {float(strategy['trend_roc_min']):.2%}")
+        if slow_bars:
+            slow = roc(closes, slow_bars)
+            minimum = float(strategy.get("slow_roc_min", 0.0))
+            if slow is None:
+                blockers.append("slow momentum not ready")
+            elif slow < minimum:
+                blockers.append(f"slow momentum {slow:.2%} below {minimum:.2%}")
         if pull > float(strategy["pullback_roc_max"]):
             blockers.append(f"4h pullback {pull:.2%} is shallower than {float(strategy['pullback_roc_max']):.2%}")
         if pull < float(strategy["pullback_roc_min"]):

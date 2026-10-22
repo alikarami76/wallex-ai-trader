@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from trader.config import load_config
-from trader.engine.backtest import run_backtest
+from trader.engine.backtest import run_backtest, run_walk_forward
 from trader.engine.runtime import check_order, run_runtime
 from trader.engine.universe import select_universe
 from trader.report import build_report
@@ -84,9 +84,16 @@ def _run_backtest(cfg: dict, out: Path) -> None:
         candles[symbol] = client.get_ohlcv(symbol, "1h", start, end)
         logging.info("%s bars=%s", symbol, len(candles[symbol]))
     out.mkdir(parents=True, exist_ok=True)
+    for name in ("decisions.jsonl", "trades.csv", "equity.csv", "report.md", "summary.json", "walk_forward.json"):
+        stale = out / name
+        if stale.exists():
+            stale.unlink()
     _write_candles(out / "candles", candles)
     _aggregation_check(client, out)
     summary = run_backtest(cfg, candles, rules, unavailable, out)
+    walk = run_walk_forward(cfg, candles, rules, unavailable)
+    walk["full_sample"] = summary.get("deflated_sharpe")
+    (out / "walk_forward.json").write_text(json.dumps(walk, indent=2), encoding="utf-8")
     report = build_report(out, out, title="Wallex backtest")
     (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))

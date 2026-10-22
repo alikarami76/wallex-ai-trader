@@ -49,6 +49,10 @@ strategy:
   pullback_roc_min: -0.025
   trend_bars: 24
   trend_roc_min: 0.01
+  # Moskowitz, Ooi and Pedersen time-series momentum, on a 3-day window.
+  # A prior floor of zero, not a fitted threshold.
+  slow_bars: 72
+  slow_roc_min: 0.0
   rsi_period: 14
   atr_period: 14
   max_atr_pct: 0.03
@@ -60,15 +64,20 @@ strategy:
   imbalance_block: -0.55
 
 execution:
-  # Limit at the ask so the fill matches the signal price. Fee is taker.
-  # The exit rests as a maker limit. Stops use MARKET when the symbol allows it.
-  entry: marketable_limit
+  # Join the bid (maker). A marketable limit is the old taker entry and is off.
+  # Stops still cross the spread. quote_gamma is the Avellaneda-Stoikov inventory weight.
+  entry: limit_maker
   exit: limit_maker
   stop_slippage_bps: 5
+  quote_gamma: 0.5
 
 risk:
   max_fraction_per_trade: 0.12
   max_fraction_per_symbol: 0.12
+  # Quarter-Kelly. p and payoff are priors (Kelly 1956; Thorp). The 12% caps still bind.
+  kelly_fraction: 0.25
+  kelly_win_prob: 0.55
+  kelly_payoff: 1.0
   max_gross_exposure: 0.30
   max_positions: 2
   stop_loss_pct: 0.045
@@ -119,3 +128,10 @@ runtime:
   loop_interval_seconds: 60
   candle_refresh_seconds: 300
   history_days: 29
+
+validation:
+  # Families inspected before this rule was locked: breakout, continuation,
+  # cross-sectional momentum, dip reversal, tight-stop pullback, this one.
+  folds: 3
+  n_trials: 6
+  warmup_bars: 80

@@ -83,12 +83,20 @@ def _stats(equity: list[dict], trades: list[dict], decisions: list[dict]) -> dic
             pass
     sources = {}
     errors = 0
+    latencies = []
     for row in decisions:
         source = ((row.get("agent") or {}).get("source")) if isinstance(row.get("agent"), dict) else None
         if source:
             sources[source] = sources.get(source, 0) + 1
         if row.get("event") == "error" or row.get("error"):
             errors += 1
+        if row.get("latency_ms") is not None:
+            try:
+                latencies.append(float(row["latency_ms"]))
+            except (TypeError, ValueError):
+                pass
+    latencies.sort()
+    realized = sum(pnls)
     return {
         "points": len(series),
         "start": start,
@@ -104,6 +112,10 @@ def _stats(equity: list[dict], trades: list[dict], decisions: list[dict]) -> dic
         "cycles": len(decisions),
         "agent_sources": sources,
         "errors": errors,
+        "realized_pnl": realized,
+        "latency_median_ms": latencies[len(latencies) // 2] if latencies else None,
+        "latency_p95_ms": latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))] if latencies else None,
+        "latency_samples": len(latencies),
     }
 
 
@@ -159,20 +171,72 @@ def _charts(equity: list[dict], out_dir: Path) -> None:
     plt.close(fig)
 
 
+def _latency(stats: dict) -> str:
+    if stats.get("latency_median_ms") is None:
+        return "n/a"
+    return (
+        f"median {stats['latency_median_ms']:.0f} ms, "
+        f"p95 {stats['latency_p95_ms']:.0f} ms "
+        f"({stats['latency_samples']} cycles)"
+    )
+
+
+def _walk_forward(out_dir: Path) -> str:
+    path = out_dir / "walk_forward.json"
+    if not path.exists():
+        return ""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    lines = ["", "## Walk-forward and deflated Sharpe", ""]
+    full = payload.get("full_sample") or {}
+    if full.get("ok"):
+        lines.append(
+            f"Full sample: per-bar Sharpe {full.get('sharpe_per_bar')}, "
+            f"selection hurdle {full.get('hurdle_sharpe')} at N={full.get('n_trials')}, "
+            f"deflated Sharpe probability {full.get('deflated_sharpe_probability')}."
+        )
+        lines.append("")
+    lines.append("| Fold | Return | Realized PnL | Fees | Fold DSR |")
+    lines.append("| --- | --- | --- | --- | --- |")
+    for row in payload.get("folds_result") or []:
+        lines.append(
+            f"| {row.get('fold')} | {row.get('return_pct')}% | {row.get('realized_pnl')} | "
+            f"{row.get('fees_paid')} | {row.get('deflated_sharpe_probability')} |"
+        )
+    lines.append("")
+    lines.append(
+        "Folds use the same frozen parameters and a fresh 5,000,000 TMN. "
+        "The deflated Sharpe probability is Bailey and López de Prado (2014): "
+        "the chance the observed per-bar Sharpe beats the expected maximum of N null trials, "
+        "after skew and kurtosis. It is not an annualized Sharpe."
+    )
+    return "\n".join(lines)
+
+
 def _markdown(title: str, stats: dict, out_dir: Path) -> str:
     sharpe = "n/a" if stats["sharpe"] is None else f"{stats['sharpe']:.2f}"
     sources = ", ".join(f"{key}={value}" for key, value in sorted(stats["agent_sources"].items())) or "none"
+    mtm = stats["end"] - stats["start"]
+    walk = _walk_forward(out_dir)
     return f"""# {title}
+
+## Desk metrics
 
 | Metric | Value |
 | --- | --- |
+| PnL after fees (mark-to-market) | {mtm:,.0f} TMN ({stats['return_pct']:.3f}%) |
+| PnL after fees (realized) | {stats['realized_pnl']:,.0f} TMN |
+| Sharpe (annualized from the equity spacing) | {sharpe} |
+| Max drawdown | {stats['max_drawdown_pct']:.3f}% |
+| Hit rate | {stats['win_rate_pct']:.1f}% ({stats['round_trips']} closed trades) |
+| Decision latency | {_latency(stats)} |
+
+| Other | Value |
+| --- | --- |
 | Starting equity | {stats['start']:,.0f} TMN |
 | Ending equity | {stats['end']:,.0f} TMN |
-| Net return | {stats['return_pct']:.3f}% |
-| Max drawdown | {stats['max_drawdown_pct']:.3f}% |
-| Sharpe (annualized from the equity spacing) | {sharpe} |
-| Round trips | {stats['round_trips']} |
-| Win rate | {stats['win_rate_pct']:.1f}% |
 | Average closed-trade PnL | {stats['avg_pnl']:,.0f} TMN |
 | Fees paid | {stats['fees']:,.0f} TMN |
 | Fills | {stats['fills']} |
@@ -186,5 +250,6 @@ Equity samples: {stats['points']}.
 
 ![Drawdown](drawdown.png)
 
-The return is mark-to-market in toman, including fees. A closed trade wins when its realized toman PnL is positive. Sharpe uses the median spacing of the equity samples, so an hourly backtest and a 45-second shadow run are not on the same scale.
+The return is mark-to-market in toman, including fees. Hit rate counts a closed trade as a win when its realized toman PnL is positive. Sharpe uses the median spacing of the equity samples, so an hourly backtest and a short shadow run are not on the same scale. Latency is the decision cycle, from the book fetch through the risk plan.
+{walk}
 """

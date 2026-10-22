@@ -226,12 +226,19 @@ class WallexClient:
 
     def get_depth(self, symbol: str) -> OrderBook:
         payload = self._request("GET", "/v1/depth", params={"symbol": symbol})
+        return _book(symbol, payload.get("result") or {})
+
+    def get_depth_all(self) -> dict[str, OrderBook]:
+        """Every market's book. Prefer this over one /v1/depth call per symbol."""
+        payload = self._request("GET", "/v2/depth/all")
         result = payload.get("result") or {}
-        return OrderBook(
-            symbol=symbol,
-            bids=[_level(row) for row in result.get("bid") or []],
-            asks=[_level(row) for row in result.get("ask") or []],
-        )
+        books: dict[str, OrderBook] = {}
+        if not isinstance(result, dict):
+            return books
+        for symbol, row in result.items():
+            if isinstance(row, dict):
+                books[str(symbol).upper()] = _book(str(symbol).upper(), row)
+        return books
 
     def get_trades(self, symbol: str) -> list[dict]:
         payload = self._request("GET", "/v1/trades", params={"symbol": symbol})
@@ -476,6 +483,12 @@ def _num(value) -> float | None:
 
 def _level(row: dict) -> BookLevel:
     return BookLevel(price=float(row.get("price") or 0), quantity=float(row.get("quantity") or 0))
+
+
+def _book(symbol: str, result: dict) -> OrderBook:
+    bids = sorted((_level(row) for row in result.get("bid") or []), key=lambda level: level.price, reverse=True)
+    asks = sorted((_level(row) for row in result.get("ask") or []), key=lambda level: level.price)
+    return OrderBook(symbol=symbol, bids=bids, asks=asks)
 
 
 def _dedupe(bars: list[Bar]) -> list[Bar]:

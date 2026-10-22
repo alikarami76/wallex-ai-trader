@@ -8,10 +8,10 @@ Long-only TMN spot. The bot buys an uptrend that has pulled back, holds about 24
 flowchart TD
   public["Wallex public REST<br/>markets, package bans, depth, UDF candles"]
   private["Wallex private REST<br/>balances, orders, fees"]
-  quant["Quant layer<br/>EMA, 24h trend, 4h pullback, ATR, spread, book"]
-  agent["BoxAPI agent<br/>one JSON call per cycle, or cache, or fallback"]
-  risk["Risk manager<br/>size, exposure, stops, kill switch, liquidation"]
-  exec["Execution<br/>marketable limit entry, maker exit, market stop"]
+  quant["Quant layer<br/>72h momentum, 24h trend, 4h pullback, book imbalance"]
+  agent["BoxAPI regime filter<br/>veto or downsize, one call per cycle"]
+  risk["Risk manager<br/>quarter-Kelly, stops, daily max-loss, liquidation"]
+  exec["Execution<br/>maker bid with inventory skew, market stop"]
   journal["JSONL decisions, trades CSV, equity CSV, state.json"]
 
   public --> quant
@@ -29,31 +29,27 @@ Backtest, shadow, and live call `evaluate_symbol`, `TradingAgent.decide`, and `R
 
 A symbol is a candidate only when every gate passes on the last closed hourly bar:
 
+- 72-hour return ≥ 0. This is the slow time-series momentum filter (Moskowitz, Ooi and Pedersen, 2012). The floor is zero. It was not fitted.
 - EMA(8) > EMA(24) and close > EMA(24).
 - 24-hour return ≥ +1%.
 - 4-hour return between −2.5% and −0.4% (a pullback, not a crash).
 - Hourly ATR ≤ 3% of price.
 - Spread ≤ 22 bps. Missing spread blocks the name.
-- Top-of-book imbalance is not worse than −0.55 when a book is available.
-- Last closed 15-minute return ≥ −0.4% in shadow and live. Backtest passes this as unknown so it does not filter history the 15-minute feed cannot reconstruct honestly.
-- Researched gross edge of 0.9% is greater than 1.2 × the round trip the order will pay.
+- Best-level order-book imbalance is not worse than −0.55 when a book is available. Imbalance is `(bid qty − ask qty) / (bid qty + ask qty)` at the touch, from `GET /v2/depth/all` (Cont, Kukanov and Stoikov, 2014). The backtest has no historical book, so this gate is live and shadow only.
+- Last closed 15-minute return ≥ −0.4% in shadow and live. Backtest passes this as unknown.
+- Researched gross edge of 0.9% is greater than 1.2 × the execution cost.
 
-Round trip = taker entry 0.30% + maker time-exit 0.25% + 3 bps slippage = 0.58%. The 0.9% figure is a prior from the last month of hourly majors, not a forecast the model is allowed to inflate.
+Execution cost, in the sense of Almgren and Chriss (2000), is entry fee + exit fee + half the spread + 3 bps of slippage. With maker entry and maker exit that is 0.25% + 0.25% + half-spread + 0.03%. The 1.2 multiple is a fixed buffer on top of that sum, not a second spread. The 0.9% figure is a prior, not a number the model is allowed to inflate.
 
-The quant score is `0.40 × trend + 0.30 × pullback depth + 0.20 × spread + 0.10 × book`. The fallback buys the highest score, one name, size 12% of equity, and writes `DETERMINISTIC_FALLBACK` into the rationale.
+The quant score is `0.40 × trend + 0.30 × pullback depth + 0.20 × spread + 0.10 × book`. The quant layer is the only trade trigger. Size is quarter-Kelly from a prior win probability of 0.55 and a payoff of 1.0, which is 2.5% of equity, and it cannot exceed the 12% per-trade cap.
 
 ## What the model does
 
 One BoxAPI `POST /chat/completions` per decision cycle. Every candidate and open position goes in one compact JSON prompt. The reply is one JSON object: regime, optional `veto_all`, and decisions with action, symbol, size fraction, confidence, and rationale.
 
-The model may:
+This is a meta-label, not a signal (López de Prado, 2018): the primary model proposes the bet, and the secondary model only accepts, rejects, or shrinks it. If the model abstains, the top quant candidate is still eligible. `regime: hostile` or `veto_all: true` blocks every new entry. An explicit BUY confirms that symbol only and does not fall through to a different name. A per-symbol `veto: true` drops that name.
 
-- rank the candidates and pick at most one BUY,
-- cut the size below the quant proposal,
-- veto every new entry,
-- close a held name only when close is below the slow EMA and the 24-hour return has turned negative.
-
-It may not invent a symbol, raise size, loosen a stop, or override the kill switch. Confidence below 0.55 or a missing rationale is dropped. `temperature` and `response_format` are omitted. `gpt-5-mini` rejects temperature; both flags default to false in `config/default.yaml`.
+The model may also close a held name when close is below the slow EMA and the 24-hour return has turned negative. It may not invent a symbol, raise size, loosen a stop, or override the kill switch. A BUY confirmation with confidence below 0.55 is dropped. `temperature` and `response_format` are omitted. `gpt-5-mini` rejects temperature; both flags default to false in `config/default.yaml`.
 
 Budget, because the whole competition is $3:
 
@@ -71,7 +67,7 @@ Wallex MCP (`wallex_basic_candle_history`) is an optional note in the prompt. Tw
 
 - Disaster stop at −4.5% from the fill. MARKET when the symbol allows market orders, otherwise an aggressive limit through the bid. Extra 5 bps of slippage is charged in the backtest. A stop starts a 6-hour cooldown on that symbol.
 - Trailing stop arms after +2.5% and sells 1.2% off the peak.
-- Time exit after 24 hours, as a maker limit at the bid side of the close.
+- Time exit after 24 hours rests as a maker offer. The offer is the ask, pulled toward the mid by the inventory skew, and it never crosses the bid. The backtest gives that quote one bar: a fill if the next high reaches it, otherwise a taker at the next close.
 - No fixed take-profit. On this fee tier a tight target converted the 24-hour drift into a loss.
 - The model may request an early close under the rule above. The risk layer still checks that a position exists.
 
@@ -81,14 +77,14 @@ The risk manager runs after the model and can only shrink a buy.
 
 | Rule | Value |
 | --- | --- |
-| Per trade and per symbol | 12% of equity |
+| Per trade and per symbol | quarter-Kelly from the prior, hard-capped at 12% of equity |
 | Gross exposure | 30% (never all-in) |
 | Open positions | 2 |
 | New entries per cycle | 1 |
 | Entries per hour | 2 |
 | Orders per hour | 8 |
 | Minimum notional | 50,000 TMN |
-| Daily drawdown kill | 1.5% from the Tehran-day start |
+| Daily max-loss kill | 1.5% below the Tehran-day starting equity. Flattens and blocks new buys. |
 | Global drawdown kill | 3% from peak equity |
 
 Either kill switch flattens and blocks new buys until the process is restarted with `--fresh` or the state file is cleared. The flag is persisted in `state.json`.
@@ -105,7 +101,11 @@ Deadline `2026-10-23T23:50:00+03:30`. Flat-by target `2026-10-23T23:30:00+03:30`
 
 ## Execution assumptions
 
-Entry is a limit at the ask. It is still a LIMIT order, and it pays the taker fee, because a passive bid fill only happens when price keeps falling. The backtest fills that entry at `close × (1 + half spread)`, rounds price up and quantity down to the market's decimals, and charges the taker fee in the base asset. The time exit is modeled at the close minus 3 bps with the maker fee in TMN. Stops use the low of the bar.
+Entry joins the bid. The price is the Avellaneda and Stoikov (2008) reservation shift applied to the touch: `bid × (1 − q γ σ² τ)`, with `q` the current gross exposure, `γ = 0.5`, `σ` the hourly ATR, and `τ` the 24-hour hold. A flat book does not move the quote. The order is rounded down to the tick and is not allowed to cross the ask, so it pays the maker fee. The same skew pulls a long inventory's offer toward the mid without crossing the bid.
+
+The backtest does not assume the bid is filled. The quote rests for the next hourly bar and fills only if that bar's low trades to the limit. That is the adverse-selection case, and it is the one the fill model uses. A missed quote is cancelled rather than chased. Stops still use the low of the bar and pay the taker fee. Walk-forward folds flatten leftovers as a taker so each fold's PnL is realized.
+
+Live and shadow read every book from `GET /v2/depth/all` once per cycle (per-symbol `/v1/depth` is only the fallback). A maker order that is not filled stays working for 10 minutes and is then cancelled. Shadow marks a paper fill only after the touch trades through the quote.
 
 Buy fees reduce base quantity. Sell fees reduce TMN proceeds. Equity is mark-to-market in TMN.
 
@@ -124,7 +124,25 @@ Shadow:
 python3 -m trader --mode shadow --config config/default.yaml --duration 900 --interval 45 --fresh --out results/shadow
 ```
 
+## Literature
+
+| Piece | Source | What the bot uses |
+| --- | --- | --- |
+| Cost gate | Almgren and Chriss (2000), *Journal of Risk* 3(2) | Trade only when the prior edge exceeds fees + half-spread + slippage, with a fixed 1.2 buffer. |
+| Book imbalance | Cont, Kukanov and Stoikov (2014), *Journal of Financial Econometrics* 12(1) | Best-bid versus best-ask quantity from `/v2/depth/all`. A strongly offered book blocks the entry. |
+| Inventory quotes | Avellaneda and Stoikov (2008), *Quantitative Finance* 8(3) | Reservation-price skew. The arrival-intensity spread is not fitted. |
+| Slow momentum | Moskowitz, Ooi and Pedersen (2012), *Journal of Financial Economics* 104(2) | 72-hour return must be non-negative before the faster pullback can arm. |
+| Regime filter | López de Prado (2018), *Advances in Financial Machine Learning*, meta-labeling | The LLM vetoes or downsizes. It does not create the trade. |
+| Sizing | Kelly (1956), *Bell System Technical Journal* 35(4); Thorp (2006) on fractional Kelly | Quarter-Kelly from a stated prior, capped by the fixed 12% fraction. |
+| Overfitting check | Bailey and López de Prado (2014), *Journal of Portfolio Management* 40(5) | Deflated Sharpe with N = 6 families that were looked at before this rule was locked. Three walk-forward folds, no refit. |
+
+N = 6 counts breakout, continuation, cross-sectional momentum, dip reversal, tight-stop pullback, and this slow-momentum pullback. It is not a grid on the equity curve below. Parameters were not searched again after the walk-forward numbers were computed.
+
+The report's desk block is PnL after fees (mark-to-market and realized), annualized Sharpe, max drawdown, hit rate, and decision latency (median and p95 of the cycle, from the book fetch through the risk plan).
+
 ## Result recorded on 2026-10-22
+
+The table below is the run from before the maker-fill, quarter-Kelly, and 72-hour filter. The regenerated report, walk-forward folds, and deflated Sharpe are in `results/backtest/` after `python3 -m trader --mode backtest`.
 
 `python3 -m trader --mode backtest --config config/default.yaml` on the live hourly history (695 bars, about 29 days) selected USDTTMN, BTCTMN, ETHTMN, XAUTTMN, XRPTMN, and DOGETMN. SOL and BNB were outside the 22 bp snapshot. The deterministic agent ran on every bar.
 
