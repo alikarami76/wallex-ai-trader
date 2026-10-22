@@ -124,6 +124,20 @@ class OrderGuardTests(unittest.TestCase):
             self.assertFalse(verdict.ok, overrides)
             self.assertTrue(verdict.reason)
 
+    def test_entry_is_blocked_when_a_normal_stop_would_leave_it_unsellable(self):
+        stranded = assess(_intent(qty=500, price=100, stop_loss_pct=0.045, entry_fee_rate=0.0025))
+        self.assertFalse(stranded.ok)
+        self.assertIn("unsellable", stranded.reason)
+        held = assess(_intent(qty=1250, price=100, stop_loss_pct=0.045, entry_fee_rate=0.0025))
+        self.assertTrue(held.ok, held.reason)
+        sell = assess(_intent(
+            side="SELL", order_type="MARKET", post_only=False, ops_state="KILLED",
+            qty=1, held_qty=1, price=None, mark=100_000,
+            symbol_notional_tmn=100_000, gross_notional_tmn=100_000,
+            stop_loss_pct=0.045, entry_fee_rate=0.0025,
+        ))
+        self.assertTrue(sell.ok, sell.reason)
+
     def test_a_full_sell_outside_live_armed_can_pass(self):
         verdict = assess(_intent(
             side="SELL",

@@ -992,6 +992,8 @@ def _order_guard_reason(
         size_cap=float((cfg.get("risk") or {}).get("max_fraction_per_symbol") or (cfg.get("risk") or {}).get("max_fraction_per_trade") or 0.12),
         gross_cap=float((cfg.get("risk") or {}).get("max_gross_exposure", 0.30)),
         min_notional_tmn=float((cfg.get("risk") or {}).get("min_notional_tmn", 50_000)),
+        stop_loss_pct=(cfg.get("risk") or {}).get("stop_loss_pct"),
+        entry_fee_rate=(cfg.get("fees") or {}).get("maker_rate"),
     )
     verdict = assess(intent)
     if verdict.ok:

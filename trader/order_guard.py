@@ -37,6 +37,8 @@ class OrderIntent:
     size_cap: float
     gross_cap: float
     min_notional_tmn: float = 50_000
+    stop_loss_pct: float | None = None
+    entry_fee_rate: float | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,8 @@ def assess(intent: OrderIntent) -> GuardVerdict:
     notional = _notional(intent)
     if notional + 1e-6 < float(intent.min_notional_tmn):
         failures.append("notional is below 50000 TMN")
+    if side == "BUY" and intent.stop_loss_pct is not None and _stop_would_strand(intent, notional):
+        failures.append("post-fee stop would leave the position unsellable")
 
     equity = float(intent.equity_tmn)
     if equity <= 0:
@@ -92,6 +96,15 @@ def assess(intent: OrderIntent) -> GuardVerdict:
     if failures:
         return GuardVerdict(False, "; ".join(failures))
     return GuardVerdict(True, "")
+
+
+def _stop_would_strand(intent: OrderIntent, notional: float) -> bool:
+    """True when a normal stop, plus a 1% cushion, cannot clear the minimum."""
+    fee = min(max(float(intent.entry_fee_rate or 0), 0.0), 0.05)
+    stop = float(intent.stop_loss_pct or 0)
+    post_fee = float(notional) * (1 - fee)
+    left = post_fee * (1 - stop - 0.01)
+    return left + 1e-6 < float(intent.min_notional_tmn) * 1.2
 
 
 def _endpoint(path: str) -> str:
