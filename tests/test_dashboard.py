@@ -18,9 +18,13 @@ class DashboardTests(unittest.TestCase):
             path = self.root / name
             if path.exists():
                 path.unlink()
-        self.saved = {key: os.environ.get(key) for key in ("DASHBOARD_USER", "DASHBOARD_PASSWORD", "WALLEX_API_KEY")}
+        self.saved = {
+            key: os.environ.get(key)
+            for key in ("DASHBOARD_USER", "DASHBOARD_PASSWORD", "DASHBOARD_USERS", "WALLEX_API_KEY")
+        }
         os.environ["DASHBOARD_USER"] = "desk-operator"
         os.environ["DASHBOARD_PASSWORD"] = "desk-password-not-for-html"
+        os.environ.pop("DASHBOARD_USERS", None)
         os.environ["WALLEX_API_KEY"] = "wallex-secret-value"
         self.client = TestClient(create_app(self.root))
 
@@ -59,6 +63,8 @@ class DashboardTests(unittest.TestCase):
         empty = self.client.get("/", auth=("desk-operator", "desk-password-not-for-html"))
         self.assertEqual(empty.status_code, 200)
         self.assertIn("waiting for the first cycle", empty.text)
+        self.assertIn("logged in as desk-operator", empty.text)
+        self.assertNotIn("desk-password-not-for-html", empty.text)
         self.assertEqual(self.client.get("/").status_code, 401)
         self.assertEqual(self.client.get("/status").status_code, 401)
         wrong = self.client.get("/", auth=("desk-operator", "nope"))
@@ -181,7 +187,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("$2.50", html)
         self.assertNotIn(secret, html)
         self.assertNotIn(password, html)
-        self.assertNotIn("desk-operator", html)
+        self.assertIn("logged in as desk-operator", html)
         self.assertNotIn("do not render this prompt", html)
         self.assertIn("present", html)
         self.assertIn("Equity", html)
@@ -214,6 +220,108 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("half-spread 5", card)
         self.assertIn("0.12 → 0.06", card)
         self.assertNotIn(secret, card)
+
+    def test_hashed_users_and_the_plaintext_pair(self):
+        import bcrypt
+        from trader.dashboard import _new_sha256
+
+        sha_password = "sha-secret-value"
+        bcrypt_password = "bcrypt-secret-value"
+        sha_hash = _new_sha256(sha_password)
+        bcrypt_hash = bcrypt.hashpw(bcrypt_password.encode(), bcrypt.gensalt(rounds=4)).decode()
+        os.environ["DASHBOARD_USERS"] = json.dumps({
+            "sam": sha_hash,
+            "bob": bcrypt_hash,
+            "op<erator>": _new_sha256("angle-secret"),
+        })
+        client = TestClient(create_app(self.root))
+        with self.assertLogs("trader.dashboard", level="INFO") as captured:
+            page = client.get("/", auth=("sam", sha_password))
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("logged in as sam", page.text)
+        self.assertNotIn(sha_password, page.text)
+        self.assertNotIn(sha_hash, page.text)
+        blob = "\n".join(captured.output)
+        self.assertIn("user=sam", blob)
+        self.assertNotIn(sha_password, blob)
+        bob = client.get("/status", auth=("bob", bcrypt_password))
+        self.assertEqual(bob.status_code, 200)
+        self.assertNotIn(bcrypt_password, json.dumps(bob.json()))
+        plain = client.get("/", auth=("desk-operator", "desk-password-not-for-html"))
+        self.assertEqual(plain.status_code, 200)
+        self.assertIn("logged in as desk-operator", plain.text)
+        self.assertEqual(client.get("/", auth=("sam", "nope")).status_code, 401)
+        self.assertEqual(client.get("/", auth=("nobody", sha_password)).status_code, 401)
+        with self.assertNoLogs("trader.dashboard", level="INFO"):
+            self.assertEqual(client.get("/", auth=("sam", "still-wrong")).status_code, 401)
+        escaped = client.get("/", auth=("op<erator>", "angle-secret"))
+        self.assertEqual(escaped.status_code, 200)
+        self.assertIn("logged in as op&lt;erator&gt;", escaped.text)
+        self.assertNotIn("op<erator>", escaped.text)
+
+    def test_closed_when_no_user_is_configured(self):
+        os.environ.pop("DASHBOARD_USER", None)
+        os.environ.pop("DASHBOARD_PASSWORD", None)
+        os.environ["DASHBOARD_USERS"] = "{not-json plaintext-secret-not-logged"
+        client = TestClient(create_app(self.root))
+        with self.assertLogs("trader.dashboard", level="WARNING") as captured:
+            denied = client.get("/", auth=("ada", "plaintext-secret-not-logged"))
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(client.get("/status").status_code, 401)
+        self.assertEqual(client.get("/health").status_code, 200)
+        blob = "\n".join(captured.output)
+        self.assertNotIn("plaintext-secret-not-logged", blob)
+        os.environ["DASHBOARD_USERS"] = "{}"
+        empty = TestClient(create_app(self.root))
+        self.assertEqual(empty.get("/", auth=("desk-operator", "desk-password-not-for-html")).status_code, 401)
+
+    def test_dashboard_hash_reads_stdin(self):
+        import subprocess
+        import sys
+
+        completed = subprocess.run(
+            [sys.executable, "-m", "trader", "dashboard-hash", "ada"],
+            input="cli-password-value\n",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn("cli-password-value", completed.stdout)
+        self.assertNotIn("cli-password-value", completed.stderr)
+        entry = json.loads(completed.stdout)
+        self.assertEqual(set(entry), {"ada"})
+        self.assertTrue(entry["ada"].startswith("$2"))
+        os.environ.pop("DASHBOARD_USER", None)
+        os.environ.pop("DASHBOARD_PASSWORD", None)
+        os.environ["DASHBOARD_USERS"] = completed.stdout.strip()
+        client = TestClient(create_app(self.root))
+        with self.assertLogs("trader.dashboard", level="INFO") as captured:
+            page = client.get("/", auth=("ada", "cli-password-value"))
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("logged in as ada", page.text)
+        self.assertNotIn("cli-password-value", page.text)
+        self.assertNotIn("cli-password-value", "\n".join(captured.output))
+        self.assertEqual(client.get("/", auth=("ada", "other")).status_code, 401)
+        empty = subprocess.run(
+            [sys.executable, "-m", "trader", "dashboard-hash", "ada"],
+            input="\n",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(empty.returncode, 2)
+        self.assertEqual(empty.stdout, "")
+        missing = subprocess.run(
+            [sys.executable, "-m", "trader", "dashboard-hash"],
+            input="secret\n",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(missing.returncode, 2)
+        self.assertNotIn("secret", missing.stdout)
+        self.assertNotIn("secret", missing.stderr)
 
     def _write(self, name: str, rows: list[dict]) -> None:
         text = "".join(json.dumps(row) + "\n" for row in rows)

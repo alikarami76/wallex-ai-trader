@@ -2,8 +2,9 @@
 
 Liara's Docker platform publishes one HTTP port and curls `/health` before it
 sends traffic to a new release. `/health` stays open. `/` is the desk and
-`/status` is the in-memory snapshot; both require `DASHBOARD_USER` and
-`DASHBOARD_PASSWORD`. Nothing on this port can place or cancel an order.
+`/status` is the in-memory snapshot. Both require `DASHBOARD_USERS` or
+`DASHBOARD_USER` and `DASHBOARD_PASSWORD`. Nothing on this port can place
+or cancel an order.
 """
 
 from __future__ import annotations

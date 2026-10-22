@@ -6,9 +6,12 @@ Wallex, the LLM, or anything that can place, cancel, or reconfigure.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import secrets
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,9 +47,15 @@ _SECRET_ENV = (
     "LIARA_API_TOKEN",
     "DASHBOARD_PASSWORD",
     "DASHBOARD_USER",
+    "DASHBOARD_USERS",
 )
 
 _basic = HTTPBasic(auto_error=False)
+log = logging.getLogger("trader.dashboard")
+_DUMMY_SHA = "sha256$" + ("0" * 32) + "$" + ("0" * 64)
+_users_cache_raw: str | None = None
+_users_cache: list[tuple[str, str, str]] = []
+_dummy_bcrypt: dict[int, str] = {}
 
 
 def create_app(data_dir: Path | None = None) -> FastAPI:
@@ -67,8 +76,8 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         return {"ok": True}
 
     @app.get("/", response_class=HTMLResponse)
-    def desk(_user: str = Depends(require_dashboard)) -> HTMLResponse:
-        return HTMLResponse(render_page(load_desk(root)))
+    def desk(user: str = Depends(require_dashboard)) -> HTMLResponse:
+        return HTMLResponse(render_page(load_desk(root), user=user))
 
     @app.get("/status")
     def status(_user: str = Depends(require_dashboard)) -> dict:
@@ -82,16 +91,208 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
 
 
 def require_dashboard(credentials: HTTPBasicCredentials | None = Depends(_basic)) -> str:
-    """Fail closed. Missing env, a missing header, or a mismatch are all 401."""
+    """Fail closed. No configured user, a missing header, or a mismatch are all 401."""
+    accounts = _load_accounts()
+    if not accounts or credentials is None:
+        _unauthorized()
+    matched = _authenticate(accounts, credentials.username, credentials.password)
+    if matched is None:
+        _unauthorized()
+    log.info("dashboard login user=%s", matched)
+    return matched
+
+
+def hash_dashboard_user(argv: list[str]) -> int:
+    """Print one JSON entry for DASHBOARD_USERS. The password is read from stdin."""
+    if len(argv) != 1 or not _username_ok(argv[0]):
+        print("usage: python -m trader dashboard-hash <user>", file=sys.stderr)
+        return 2
+    password = sys.stdin.readline()
+    if password.endswith("\n"):
+        password = password[:-1]
+    if password.endswith("\r"):
+        password = password[:-1]
+    if password == "":
+        print("password is empty", file=sys.stderr)
+        return 2
+    try:
+        hashed = _new_password_hash(password)
+    except ValueError:
+        print("password could not be hashed", file=sys.stderr)
+        return 2
+    print(json.dumps({argv[0]: hashed}, ensure_ascii=False))
+    return 0
+
+
+def _username_ok(name: str) -> bool:
+    if not name or name != name.strip():
+        return False
+    return not any(ord(ch) < 32 or ch == ":" for ch in name)
+
+
+def _new_password_hash(password: str) -> str:
+    try:
+        import bcrypt
+    except ImportError:
+        return _new_sha256(password)
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("ascii")
+
+
+def _new_sha256(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+    return f"sha256${salt}${digest}"
+
+
+def _load_accounts() -> list[tuple[str, str, str]]:
+    """Configured desk users as (username, kind, secret). kind is plain, sha256, or bcrypt."""
+    accounts = list(_hashed_accounts())
     user = os.getenv("DASHBOARD_USER", "")
     password = os.getenv("DASHBOARD_PASSWORD", "")
-    if not user or not password or credentials is None:
-        _unauthorized()
-    user_ok = secrets.compare_digest(credentials.username.encode("utf-8"), user.encode("utf-8"))
-    pass_ok = secrets.compare_digest(credentials.password.encode("utf-8"), password.encode("utf-8"))
-    if not (user_ok and pass_ok):
-        _unauthorized()
-    return credentials.username
+    if user and password:
+        accounts.append((user, "plain", password))
+    return accounts
+
+
+def _hashed_accounts() -> list[tuple[str, str, str]]:
+    global _users_cache_raw, _users_cache
+    raw = os.getenv("DASHBOARD_USERS", "")
+    if not raw.strip():
+        return []
+    if raw == _users_cache_raw:
+        return list(_users_cache)
+    parsed = _parse_users(raw)
+    _users_cache_raw = raw
+    _users_cache = parsed
+    return list(parsed)
+
+
+def _parse_users(raw: str) -> list[tuple[str, str, str]]:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        log.warning("DASHBOARD_USERS is not valid JSON; hashed users are ignored")
+        return []
+    if not isinstance(payload, dict):
+        log.warning("DASHBOARD_USERS must be a JSON object; hashed users are ignored")
+        return []
+    accounts = []
+    for name, secret in payload.items():
+        if not isinstance(name, str) or not name or not isinstance(secret, str):
+            continue
+        kind = _hash_kind(secret)
+        if kind is None:
+            log.warning("DASHBOARD_USERS entry for %s is not a bcrypt or sha256-salted hash", name)
+            continue
+        accounts.append((name, kind, secret))
+    return accounts
+
+
+def _hash_kind(secret: str) -> str | None:
+    if secret.startswith(("$2a$", "$2b$", "$2y$")):
+        if _bcrypt_available():
+            return "bcrypt"
+        log.warning("DASHBOARD_USERS has a bcrypt hash and bcrypt is not installed")
+        return None
+    parts = secret.split("$")
+    if len(parts) == 3 and parts[0] == "sha256" and parts[1] and len(parts[2]) == 64:
+        if all(ch in "0123456789abcdef" for ch in parts[2]):
+            return "sha256"
+    return None
+
+
+def _bcrypt_available() -> bool:
+    try:
+        import bcrypt  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _authenticate(accounts: list[tuple[str, str, str]], username: str, password: str) -> str | None:
+    """Return the configured username, or None. A miss still runs one check of each stored kind."""
+    provided = username.encode("utf-8")
+    matched: str | None = None
+    need = {"plain": False, "sha256": False, "bcrypt": False}
+    saw = {"plain": False, "sha256": False, "bcrypt": False}
+    bcrypt_example = next((secret for _name, kind, secret in accounts if kind == "bcrypt"), None)
+    if bcrypt_example:
+        _ensure_dummy_bcrypt(bcrypt_example)
+    for account_user, kind, secret in accounts:
+        need[kind] = True
+        if not _ct_eq(provided, account_user.encode("utf-8")):
+            continue
+        saw[kind] = True
+        if _secret_ok(kind, secret, password) and matched is None:
+            matched = account_user
+    if need["bcrypt"] and not saw["bcrypt"] and bcrypt_example:
+        _secret_ok("bcrypt", _dummy_bcrypt_for(bcrypt_example), password)
+    if need["sha256"] and not saw["sha256"]:
+        _secret_ok("sha256", _DUMMY_SHA, password)
+    if need["plain"] and not saw["plain"]:
+        _plain_dummy(password)
+    return matched
+
+
+def _secret_ok(kind: str, secret: str, password: str) -> bool:
+    if kind == "plain":
+        return _ct_eq(password.encode("utf-8"), secret.encode("utf-8"))
+    if kind == "sha256":
+        return _sha256_ok(secret, password)
+    if kind == "bcrypt":
+        return _bcrypt_ok(secret, password)
+    return False
+
+
+def _sha256_ok(stored: str, password: str) -> bool:
+    parts = stored.split("$")
+    well_formed = len(parts) == 3 and parts[0] == "sha256" and bool(parts[1]) and len(parts[2]) == 64
+    salt = parts[1] if well_formed else "0" * 32
+    expected = parts[2] if well_formed else "0" * 64
+    got = hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+    return secrets.compare_digest(got, expected) and well_formed
+
+
+def _bcrypt_ok(stored: str, password: str) -> bool:
+    try:
+        import bcrypt
+        return bool(bcrypt.checkpw(password.encode("utf-8"), stored.encode("ascii")))
+    except (ImportError, UnicodeError, ValueError, TypeError):
+        return False
+
+
+def _bcrypt_rounds(stored: str) -> int:
+    try:
+        return int(stored.split("$")[2])
+    except (IndexError, ValueError):
+        return 12
+
+
+def _ensure_dummy_bcrypt(stored: str) -> None:
+    rounds = _bcrypt_rounds(stored)
+    if rounds in _dummy_bcrypt:
+        return
+    import bcrypt
+    _dummy_bcrypt[rounds] = bcrypt.hashpw(secrets.token_bytes(16), bcrypt.gensalt(rounds=rounds)).decode("ascii")
+
+
+def _dummy_bcrypt_for(stored: str) -> str:
+    rounds = _bcrypt_rounds(stored)
+    _ensure_dummy_bcrypt(stored)
+    return _dummy_bcrypt[rounds]
+
+
+def _plain_dummy(password: str) -> None:
+    raw = password.encode("utf-8") or b"\0"
+    secrets.compare_digest(raw, b"\0" * len(raw))
+
+
+def _ct_eq(left: bytes, right: bytes) -> bool:
+    if len(left) != len(right):
+        pad = left or b"\0"
+        secrets.compare_digest(pad, b"\0" * len(pad))
+        return False
+    return secrets.compare_digest(left, right)
 
 
 def _unauthorized() -> None:
@@ -129,7 +330,7 @@ def load_desk(directory: Path) -> dict:
     }
 
 
-def render_page(desk: dict) -> str:
+def render_page(desk: dict, user: str = "") -> str:
     latest = desk["latest"]
     pnl = latest.get("pnl_from_golive_pct")
     spent = _num(latest.get("llm_usd_total"))
@@ -139,7 +340,8 @@ def render_page(desk: dict) -> str:
     parts = [
         _document_start(),
         "<header><p class='kicker'>Wallex · read only</p>",
-        f"<h1>Desk</h1><p class='sub'>{_esc(latest.get('ts_tehran') or 'waiting for the first cycle')}</p></header>",
+        f"<h1>Desk</h1><p class='sub'>{_esc(latest.get('ts_tehran') or 'waiting for the first cycle')}</p>"
+        f"<p class='who'>logged in as {_esc(user)}</p></header>",
         "<main>",
         _state_panel(latest, mismatch, go_live, running),
         _book_panel(latest, desk, pnl),
@@ -195,6 +397,9 @@ def _secret_values() -> list[str]:
         value = os.getenv(name, "")
         if len(value) >= 6:
             found.append(value)
+    for _name, kind, secret in _hashed_accounts():
+        if kind != "plain" and len(secret) >= 6 and secret not in found:
+            found.append(secret)
     return found
 
 
@@ -343,6 +548,7 @@ h2 { font-size: 18px; color: var(--text); }
 .kicker, .sub, .label, th, .meta { color: var(--muted); }
 .kicker { letter-spacing: 0.14em; text-transform: uppercase; font-size: 12px; margin: 0 0 8px; }
 .sub { margin: 6px 0 0; }
+.who { margin: 8px 0 0; }
 .num, .mono, .pill { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
 header { border-bottom: 1px solid var(--rule); padding-bottom: 18px; margin-bottom: 22px; }
 main { display: grid; gap: 14px; }

@@ -68,8 +68,9 @@ liara env set --app wallex-ai-trader --force \
 | `LLM_API_KEY` | BoxAPI bearer token. Empty means the deterministic fallback. |
 | `LLM_MODEL_CHEAP` | Optional. Unset keeps `openai/gpt-6-luna`. |
 | `LLM_MODEL_STRONG` | Optional. Unset keeps `openai/gpt-6-sol` for the stakes tier. |
-| `DASHBOARD_USER` | Basic-auth user for `/` and `/status`. If unset, those routes stay closed. |
-| `DASHBOARD_PASSWORD` | Basic-auth password. Set it with the keys above, not in the image. |
+| `DASHBOARD_USERS` | Optional JSON object of username to a bcrypt (`$2a$`, `$2b$`, `$2y$`) or `sha256$<salt>$<digest>` hash. The digest is hex SHA-256 of `salt:password` in UTF-8. |
+| `DASHBOARD_USER` | One extra basic-auth user for `/` and `/status`, beside `DASHBOARD_USERS`. |
+| `DASHBOARD_PASSWORD` | Password for that one user. Compared in constant time. Leave both unset to use only the hashed map. |
 | `TELEGRAM_ALERT_BOT_TOKEN` | Optional. Alerts stay off unless this and the chat id are both set. |
 | `TELEGRAM_ALERT_CHAT_ID` | Optional chat for a cycle gap, HALT or KILLED, an order reject, or a taker entry fill. |
 | `WATCHDOG_ENABLED` | Optional. Off unless this is `1`, `true`, `yes`, or `on`. The entrypoint then runs the journal sidecar in the same container. It does not place orders or write journals. |
@@ -110,7 +111,15 @@ liara stop --app wallex-ai-trader
 liara start --app wallex-ai-trader
 ```
 
-After deploy, `https://wallex-ai-trader.liara.run/health` returns `{"ok": true}` with no credentials. `/` is one auto-refreshing HTML page. `/status` returns the mode, whether orders are dry-run, equity, open symbols, and the last cycle time. Both require HTTP basic auth from `DASHBOARD_USER` and `DASHBOARD_PASSWORD`. If either variable is missing, those routes return 401 and `/health` still returns 200. The page reads only `cycles.jsonl`, `decisions.jsonl`, `adjustments.jsonl`, and `reviews.jsonl` on the disk. It shows key presence, never key values, and it has no route that places or cancels orders, changes config, flips a flag, or starts or stops trading.
+After deploy, `https://wallex-ai-trader.liara.run/health` returns `{"ok": true}` with no credentials. `/` is one auto-refreshing HTML page. `/status` returns the mode, whether orders are dry-run, equity, open symbols, and the last cycle time. Both require HTTP basic auth. Set `DASHBOARD_USERS`, or `DASHBOARD_USER` and `DASHBOARD_PASSWORD`, or both. The plaintext pair is one additional user next to the hashed map. If neither is configured, those routes return 401 and `/health` still returns 200. A successful login is logged as `dashboard login user=<name>` and the page says `logged in as <name>`. The password is not logged. The page reads only `cycles.jsonl`, `decisions.jsonl`, `adjustments.jsonl`, and `reviews.jsonl` on the disk. It shows key presence, never key values, and it has no route that places or cancels orders, changes config, flips a flag, or starts or stops trading.
+
+Build a hashed entry locally. The password is read from stdin and is not printed:
+
+```bash
+python3 -m trader dashboard-hash ada
+```
+
+The line it prints is one JSON object, `{"ada": "$2b$..."}`. Merge further users into that object and store it as `DASHBOARD_USERS`. A `sha256$<salt>$<digest>` value is accepted too. The helper itself prints a bcrypt hash.
 
 A restart keeps `/data` because that path is the disk. The decision log is `decisions.jsonl`. Positions and the kill switch are `state.json`. Both sit on the disk.
 
@@ -140,7 +149,7 @@ docker run --rm -p 8080:8080 \
   wallex-ai-trader
 ```
 
-Do not pass `WALLEX_API_KEY`. The log contains `WALLEX_API_KEY absent` and `starting shadow dry_run=True`. In another shell, `curl -s http://127.0.0.1:8080/health` is `{"ok": true}`. Without `DASHBOARD_USER` and `DASHBOARD_PASSWORD`, `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/` is `401` and `/health` is still `200`. With both set, the desk is `curl -s -u "$DASHBOARD_USER:$DASHBOARD_PASSWORD" http://127.0.0.1:8080/`. Stop the container with Ctrl-C.
+Do not pass `WALLEX_API_KEY`. The log contains `WALLEX_API_KEY absent` and `starting shadow dry_run=True`. In another shell, `curl -s http://127.0.0.1:8080/health` is `{"ok": true}`. With no `DASHBOARD_USERS` and no `DASHBOARD_USER` / `DASHBOARD_PASSWORD` pair, `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/` is `401` and `/health` is still `200`. With the pair set, the desk is `curl -s -u "$DASHBOARD_USER:$DASHBOARD_PASSWORD" http://127.0.0.1:8080/`. A hashed user is `curl -s -u 'ada:the-password' http://127.0.0.1:8080/`. Stop the container with Ctrl-C.
 
 The same image runs the watchdog beside the trader when the flag is set. It still does not need a Wallex key:
 
