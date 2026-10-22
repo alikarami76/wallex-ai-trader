@@ -184,12 +184,17 @@ def load_desk(directory: Path) -> dict:
     symbols = [row for row in decisions if row.get("record") == "symbol"]
     legacy = [row for row in decisions if row.get("record") != "symbol"]
     latest = cycles[-1] if cycles else {}
+    book = _state_book(directory)
+    if book.get("cash") is not None:
+        latest = {**latest, "free_tmn": book["cash"]}
+    if book.get("go_live_equity") is not None and latest.get("go_live_equity") is None:
+        latest = {**latest, "go_live_equity": book["go_live_equity"]}
     return {
         "latest": latest,
         "cycles": cycles[-240:],
         "symbols": _latest_symbols(symbols, latest.get("cycle_id")),
         "block_counts": _block_counts(symbols[-300:]),
-        "positions": _positions(latest, legacy),
+        "positions": _positions(latest, legacy, book),
         "fills": _fills(symbols[-80:], legacy),
         "rationale": _rationale(legacy),
         "adjustments": adjustments[-12:],
@@ -199,27 +204,37 @@ def load_desk(directory: Path) -> dict:
     }
 
 
-# The prop package endpoint is not readable with an API key. PnL uses this base.
+# The prop package endpoint is not readable with an API key. PnL uses this base
+# only when the cycle and state omit go-live equity.
 LIVE_BASE_TMN = 5_000_000.0
 
 
-def pnl_against_base(equity) -> tuple[float | None, float | None]:
-    """Return (fraction, TMN) versus the 5,000,000 TMN starting base."""
+def pnl_against_base(equity, base: float | None = None) -> tuple[float | None, float | None]:
+    """Return (fraction, TMN) versus go-live equity, or the 5,000,000 TMN fallback."""
     if equity is None:
         return None, None
     try:
         value = float(equity)
+        start = LIVE_BASE_TMN if base is None else float(base)
     except (TypeError, ValueError):
         return None, None
-    return value / LIVE_BASE_TMN - 1, value - LIVE_BASE_TMN
+    if start == 0:
+        return None, None
+    return value / start - 1, value - start
 
 
 def render_page(desk: dict, user: str = "") -> str:
     latest = desk["latest"]
-    pnl, pnl_tmn = pnl_against_base(latest.get("equity_tmn"))
-    if pnl is None:
-        pnl = latest.get("pnl_from_golive_pct")
-        pnl_tmn = latest.get("pnl_from_golive_tmn")
+    pnl = latest.get("pnl_from_golive_pct")
+    pnl_tmn = latest.get("pnl_from_golive_tmn")
+    if pnl is None or pnl_tmn is None:
+        computed, computed_tmn = pnl_against_base(
+            latest.get("equity_tmn"), latest.get("go_live_equity"),
+        )
+        if pnl is None:
+            pnl = computed
+        if pnl_tmn is None:
+            pnl_tmn = computed_tmn
     latest = {**latest, "pnl_from_golive_pct": pnl, "pnl_from_golive_tmn": pnl_tmn}
     spent = _num(latest.get("llm_usd_total"))
     go_live = latest.get("go_live_sha") or ""
@@ -331,28 +346,66 @@ def _block_counts(symbols: list[dict]) -> list[tuple[str, int]]:
     return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:8]
 
 
-def _positions(latest: dict, legacy: list[dict]) -> list:
+def _state_book(directory: Path) -> dict:
+    """Positions and cash from state.json when the file is present and valid."""
+    path = Path(directory) / "state.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    portfolio = payload.get("portfolio") if isinstance(payload.get("portfolio"), dict) else {}
+    raw_positions = portfolio.get("positions") if isinstance(portfolio.get("positions"), dict) else {}
+    positions = []
+    for symbol, row in raw_positions.items():
+        if not isinstance(row, dict):
+            continue
+        positions.append({
+            "symbol": row.get("symbol") or symbol,
+            "qty": row.get("qty"),
+            "entry_price": row.get("entry_price"),
+            "avg_px": row.get("entry_price"),
+        })
+    book: dict = {"positions": positions}
+    if portfolio.get("cash") is not None:
+        book["cash"] = portfolio.get("cash")
+    ops = payload.get("ops") if isinstance(payload.get("ops"), dict) else {}
+    if ops.get("go_live_equity") is not None:
+        book["go_live_equity"] = ops.get("go_live_equity")
+    return scrub(book)
+
+
+def _positions(latest: dict, legacy: list[dict], book: dict | None = None) -> list:
+    """Prefer state.json, then the newest decision that recorded positions (including flat)."""
+    if isinstance(book, dict) and "positions" in book:
+        return list(book.get("positions") or [])
     for row in reversed(legacy):
+        if "positions" not in row:
+            continue
         positions = row.get("positions")
-        if isinstance(positions, list) and positions:
+        if isinstance(positions, list):
             return positions
     named = latest.get("open_positions") or []
     return [{"symbol": symbol} for symbol in named]
 
 
 def _fills(symbols: list[dict], legacy: list[dict]) -> list[dict]:
+    """Prefer the newest decision fills list (including empty) over older symbol rows."""
+    for row in reversed(legacy):
+        if "fills" not in row:
+            continue
+        fills = row.get("fills")
+        if isinstance(fills, list):
+            return [item for item in fills if isinstance(item, dict)][-12:]
     found = []
     for row in symbols:
         order = row.get("order")
         if isinstance(order, dict) and order.get("status") == "filled":
             found.append({"symbol": row.get("symbol"), **order})
-    if found:
-        return found[-12:]
-    for row in reversed(legacy):
-        fills = row.get("fills")
-        if isinstance(fills, list) and fills:
-            return [item for item in fills if isinstance(item, dict)][-12:]
-    return []
+    return found[-12:]
 
 
 def _rationale(legacy: list[dict]) -> dict:
@@ -594,7 +647,7 @@ def _book_panel(latest: dict, desk: dict, pnl) -> str:
     orders = latest.get("open_orders") or []
     order_text = ", ".join(_esc(item) for item in orders) or "none"
     position_rows = "".join(_position_row(item) for item in desk["positions"]) or "<tr><td colspan='3'>none</td></tr>"
-    fill_rows = "".join(_fill_row(item) for item in desk["fills"]) or "<tr><td colspan='4'>none</td></tr>"
+    fill_rows = "".join(_fill_row(item) for item in desk["fills"]) or "<tr><td colspan='5'>none</td></tr>"
     return (
         "<section class='grid'>"
         f"<div class='panel'><div class='label'>Equity TMN</div><div class='stat num'>{_num_text(latest.get('equity_tmn'), 0)}</div></div>"
@@ -606,7 +659,7 @@ def _book_panel(latest: dict, desk: dict, pnl) -> str:
         "</section>"
         "<section class='panel'><h2>Positions</h2><table><thead><tr><th>Symbol</th><th>Qty</th><th>Avg</th></tr></thead>"
         f"<tbody>{position_rows}</tbody></table>"
-        "<h2 style='margin-top:16px'>Fills</h2><table><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Notional</th></tr></thead>"
+        "<h2 style='margin-top:16px'>Fills</h2><table><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Notional</th><th>Fee</th></tr></thead>"
         f"<tbody>{fill_rows}</tbody></table></section>"
     )
 
@@ -866,10 +919,12 @@ def _position_row(item) -> str:
 
 def _fill_row(item: dict) -> str:
     notional = item.get("notional_tmn")
+    fee = item.get("fee_tmn")
     return (
         f"<tr><td>{_esc(item.get('symbol'))}</td><td>{_esc(item.get('side'))}</td>"
         f"<td class='num'>{_num_text(item.get('qty') or item.get('filled_qty'), 6)}</td>"
-        f"<td class='num'>{_num_text(notional)}</td></tr>"
+        f"<td class='num'>{_num_text(notional)}</td>"
+        f"<td class='num'>{_num_text(fee)}</td></tr>"
     )
 
 

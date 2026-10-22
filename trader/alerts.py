@@ -151,6 +151,7 @@ def send_update(
     qty_total,
     pnl,
     client_id: str,
+    fee=None,
     post=None,
 ) -> bool:
     """Fill, partial fill, or cancel. A sell includes realized PnL after fees."""
@@ -158,7 +159,7 @@ def send_update(
         text = _update_text(
             mode=mode, when=when, symbol=symbol, side=side, order_type=order_type,
             status=status, price=price, qty=qty, qty_total=qty_total, pnl=pnl,
-            client_id=client_id,
+            fee=fee, client_id=client_id,
         )
         return post_text(text, post=post)
     except Exception as exc:
@@ -306,6 +307,7 @@ def _decision_text(
 
 def _update_text(
     *, mode, when, symbol, side, order_type, status, price, qty, qty_total, pnl, client_id,
+    fee=None,
 ) -> str:
     label = str(status or "FILL").upper()
     if label not in {"FILL", "PARTIAL", "CANCEL"}:
@@ -315,6 +317,8 @@ def _update_text(
         f"{label} {str(side).upper()} {symbol} {str(order_type).upper()}",
         f"qty {_qty_text(qty)} of {_qty_text(qty_total)} @ {_num_text(price)}",
     ]
+    if label != "CANCEL" and _num(fee) is not None:
+        lines.append(f"fee {_tmn(fee)} TMN")
     if str(side).upper() == "SELL" and label != "CANCEL":
         lines.append(f"pnl {_pnl(pnl)} TMN after fees")
     lines.append(f"id {client_id or '—'}")

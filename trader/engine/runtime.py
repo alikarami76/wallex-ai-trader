@@ -885,6 +885,8 @@ def _cycle(
                     mode, now, action, held, requests[noted_requests:], fills[noted_fills:],
                     feature_by_symbol.get(action.symbol), cfg, hurdle, marks,
                 )
+                for cancelled in state.pop("_telegram_cancels", []):
+                    _relay_cancel(mode, now, cancelled)
                 continue
             try:
                 before_guard = len(guard_blocks)
@@ -934,6 +936,8 @@ def _cycle(
                 mode, now, action, held, requests[noted_requests:], fills[noted_fills:],
                 feature_by_symbol.get(action.symbol), cfg, hurdle, marks,
             )
+            for cancelled in state.pop("_telegram_cancels", []):
+                _relay_cancel(mode, now, cancelled)
 
     protective, _deferred = risk.protective_actions(
         portfolio=portfolio, marks=marks, view=view, now_unix=now_unix, liquidity=liquidity,
@@ -1776,10 +1780,16 @@ def _execute(
                             order_type="LIMIT", fee_rate=fee_paid, when=int(time.time()),
                         )
                         fill = extra or fill
+                    _queue_cancel_note(
+                        state, client_id=client_id, symbol=action.symbol, side="BUY", order_type="LIMIT",
+                    )
             elif maker_entry:
                 state.setdefault("pending", {})[client_id] = meta
             else:
                 _cancel_quiet(client, client_id)
+                _queue_cancel_note(
+                    state, client_id=client_id, symbol=action.symbol, side="BUY", order_type="LIMIT",
+                )
             return fill, request
         fee = taker if not maker_entry else maker
         if maker_entry:
@@ -1985,10 +1995,19 @@ def _relay_fill(mode, fill, meta, order, when=None) -> None:
             mode=mode, when=when or now_tehran(), symbol=fill.symbol, side=fill.side,
             order_type=fill.order_type or (meta or {}).get("order_type") or "",
             status=status, price=fill.price, qty=fill.qty, qty_total=target or fill.qty,
-            pnl=fill.pnl_tmn, client_id=fill.client_id,
+            pnl=fill.pnl_tmn, fee=getattr(fill, "fee_tmn", None), client_id=fill.client_id,
         )
     except Exception as exc:
         log.warning("telegram note failed: %s", type(exc).__name__)
+
+
+def _queue_cancel_note(state: dict, *, client_id: str, symbol, side, order_type) -> None:
+    state.setdefault("_telegram_cancels", []).append({
+        "client_id": client_id,
+        "symbol": symbol,
+        "side": side,
+        "order_type": order_type,
+    })
 
 
 def _relay_cancel(mode, when, row: dict) -> None:
@@ -1996,7 +2015,7 @@ def _relay_cancel(mode, when, row: dict) -> None:
         send_update(
             mode=mode, when=when or now_tehran(), symbol=str(row.get("symbol") or ""),
             side=str(row.get("side") or ""), order_type=str(row.get("order_type") or ""),
-            status="CANCEL", price=None, qty=None, qty_total=None, pnl=None,
+            status="CANCEL", price=None, qty=None, qty_total=None, pnl=None, fee=None,
             client_id=str(row.get("client_id") or ""),
         )
     except Exception as exc:

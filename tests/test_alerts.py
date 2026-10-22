@@ -19,7 +19,8 @@ from trader.alerts import (
     send_skips,
     send_update,
 )
-from trader.engine.runtime import _relay_orders
+from trader.engine.portfolio import Fill
+from trader.engine.runtime import _queue_cancel_note, _relay_cancel, _relay_fill, _relay_orders
 from trader.risk.manager import Action
 
 
@@ -221,6 +222,26 @@ class DecisionPostTests(unittest.TestCase):
         self.assertIn("CANCEL BUY BTCTMN LIMIT", texts[4])
         self.assertNotIn("pnl", texts[4])
 
+    def test_a_fill_post_includes_the_fee_from_the_fill(self):
+        calls, post = self._capture()
+        self._arm()
+        self.assertTrue(send_update(
+            mode="live", when=self.when, symbol="BTCTMN", side="BUY", order_type="LIMIT",
+            status="FILL", price=100_000_000, qty=0.001, qty_total=0.001, pnl=None,
+            fee=300.0, client_id="SCfee", post=post,
+        ))
+        text = calls[0]["text"]
+        self.assertIn("FILL BUY BTCTMN LIMIT", text)
+        self.assertIn("fee 300.00 TMN", text)
+        self.assertIn("id SCfee", text)
+        self.assertNotIn("pnl", text)
+        self.assertTrue(send_update(
+            mode="live", when=self.when, symbol="BTCTMN", side="BUY", order_type="LIMIT",
+            status="CANCEL", price=None, qty=None, qty_total=None, pnl=None,
+            fee=12.0, client_id="SCcnx", post=post,
+        ))
+        self.assertNotIn("fee ", calls[1]["text"])
+
     def test_skipped_entries_wait_half_an_hour(self):
         calls, post = self._capture()
         self._arm()
@@ -288,6 +309,67 @@ class DecisionPostTests(unittest.TestCase):
         self.assertIn("TP 102.5", text)
         self.assertIn("id SCabc", text)
         self.assertNotIn("secret-token", calls[0]["text"])
+        self.assertEqual(calls[0]["chat_id"], "-1003898687684")
+
+    def test_runtime_fill_posts_fee_and_a_failed_send_stays_quiet(self):
+        calls, post = self._capture()
+        self._arm()
+        fill = Fill(
+            symbol="BTCTMN", side="BUY", price=100, qty=0.01, fee_tmn=0.3,
+            fee_rate=0.003, notional_tmn=1.0, pnl_tmn=None, reason="entry",
+            order_type="LIMIT", client_id="SCfee1",
+        )
+        original_update = runtime.send_update
+        original_decision = runtime.send_decision
+        runtime.send_update = lambda **kwargs: original_update(**kwargs, post=post)
+        try:
+            _relay_fill("live", fill, {"qty": 0.01, "order_type": "LIMIT"}, None, when=self.when)
+        finally:
+            runtime.send_update = original_update
+        self.assertEqual(len(calls), 1)
+        self.assertIn("fee 0.30 TMN", calls[0]["text"])
+        self.assertIn("FILL BUY BTCTMN LIMIT", calls[0]["text"])
+
+        def boom(url, body):
+            raise RuntimeError(url)
+
+        runtime.send_update = lambda **kwargs: original_update(**kwargs, post=boom)
+        runtime.send_decision = lambda **kwargs: original_decision(**kwargs, post=boom)
+        try:
+            with self.assertLogs("trader.alerts", level="WARNING"):
+                _relay_fill("live", fill, {"qty": 0.01}, None, when=self.when)
+                _relay_orders(
+                    "live", self.when,
+                    Action(
+                        symbol="BTCTMN", side="BUY", order_type="LIMIT", size_fraction=0.1,
+                        reason="x", source="agent", price_direction="down",
+                    ),
+                    None, [{"body": {
+                        "symbol": "BTCTMN", "side": "BUY", "type": "LIMIT",
+                        "quantity": "0.01", "price": "100", "client_id": "SCboom",
+                    }}], [fill], None, {"risk": {"stop_loss_pct": 0.045, "trail_arm_pct": 0.025}},
+                    0.0072, {"BTCTMN": 100},
+                )
+        finally:
+            runtime.send_update = original_update
+            runtime.send_decision = original_decision
+
+    def test_partial_buy_cancel_is_queued_for_the_trades_channel(self):
+        calls, post = self._capture()
+        self._arm()
+        state = {}
+        _queue_cancel_note(state, client_id="SCpart", symbol="BTCTMN", side="BUY", order_type="LIMIT")
+        self.assertEqual(state["_telegram_cancels"][0]["client_id"], "SCpart")
+        original = runtime.send_update
+        runtime.send_update = lambda **kwargs: original(**kwargs, post=post)
+        try:
+            for row in state.pop("_telegram_cancels", []):
+                _relay_cancel("live", self.when, row)
+        finally:
+            runtime.send_update = original
+        self.assertEqual(len(calls), 1)
+        self.assertIn("CANCEL BUY BTCTMN LIMIT", calls[0]["text"])
+        self.assertIn("id SCpart", calls[0]["text"])
         self.assertEqual(calls[0]["chat_id"], "-1003898687684")
 
     def test_the_alert_group_does_not_receive_the_trade_log(self):
