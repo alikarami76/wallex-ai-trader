@@ -16,7 +16,8 @@ spend per Tehran day, and total spend. Near the cap the router steps down to
 a cheaper tier, and at the cap it stops calling. The running total is logged
 against the $3 competition budget. /key and /credits are a shared upstream
 account, so the ledger is the balance. Cache hits, cap hits, timeouts, and
-bad JSON use the deterministic fallback.
+transport failures use the deterministic fallback. Once the ledger reaches
+$2.25 the model is not called. Invalid JSON is a veto and does not buy.
 
 Shadow and live also pass a menu of actions the risk layer already accepted.
 The model then returns one id. Invalid menu output is HOLD and does not fall
@@ -30,6 +31,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -44,6 +46,9 @@ from trader.timeutil import TEHRAN
 from trader.wallex.mcp import WallexMcp
 
 log = logging.getLogger("trader.agent")
+
+# Below the $2.50 hard cap. At this ledger total the model is not called.
+SPEND_GUARD_USD = 2.25
 
 SYSTEM_PROMPT = """You are the regime filter of a Wallex TMN spot trading system, not the trade trigger.
 The quantitative layer already proposed candidates from a slow uptrend plus a 4-hour pullback.
@@ -280,7 +285,7 @@ class LlmClient:
             "Content-Type": "application/json",
         }
         timeout = float(spec.get("timeout") or self.timeout)
-        content, usage, error = self._send(url, headers, body, timeout)
+        content, usage, error = self._complete_within(url, headers, body, timeout)
         if content is None:
             log.warning("LLM request failed: %s", error)
             return None, {
@@ -297,6 +302,27 @@ class LlmClient:
         usage["downgraded"] = bool(spec.get("downgraded"))
         usage["reasoning_effort"] = body.get("reasoning_effort", "omitted")
         return content, usage
+
+    def _complete_within(self, url: str, headers: dict, body: dict, timeout: float) -> tuple[str | None, dict, str]:
+        """Run one send on a daemon thread and stop waiting when the timeout fires.
+
+        The socket timeout inside _send is not enough: a mock or a stalled
+        peer can ignore it, and the retry loop would keep the stop path waiting.
+        """
+        holder: dict = {}
+
+        def _call() -> None:
+            try:
+                holder["result"] = self._send(url, headers, body, timeout)
+            except Exception as exc:
+                holder["result"] = (None, {}, str(exc))
+
+        worker = threading.Thread(target=_call, name="llm-complete", daemon=True)
+        worker.start()
+        worker.join(timeout if timeout > 0 else 0)
+        if worker.is_alive() or "result" not in holder:
+            return None, {}, "hard timeout"
+        return holder["result"]
 
     def _send(self, url: str, headers: dict, body: dict, timeout: float) -> tuple[str | None, dict, str]:
         """Pace, then retry 429/5xx. A 400 that names reasoning_effort is retried once without it."""
@@ -536,6 +562,17 @@ class TradingAgent:
             "cap_usd": float(self.settings.get("max_spend_usd", 2.5)),
         }
 
+    def _spend_guard_decision(self, candidates: list[Candidate]) -> AgentDecision | None:
+        """Deterministic fallback once the ledger reaches $2.25. No model call."""
+        spent = self.budget.spent_usd()
+        if spent < SPEND_GUARD_USD:
+            return None
+        log.info("LLM fallback: llm_usd_total %.4f >= 2.25", spent)
+        decision = fallback_decision(candidates)
+        decision.comment = f"LLM fallback: llm_usd_total {spent:.4f} >= 2.25. " + decision.comment
+        decision.usage = {"skipped": "spend guard 2.25", **self._budget_note()}
+        return decision
+
     def decide(
         self,
         features: list[SymbolFeatures],
@@ -552,6 +589,9 @@ class TradingAgent:
             decision = fallback_decision(candidates)
             decision.comment = "LLM disabled for this mode. " + decision.comment
             return decision
+        guarded = self._spend_guard_decision(candidates)
+        if guarded is not None:
+            return guarded
         if not candidates and not positions:
             decision = fallback_decision(candidates)
             decision.usage = {"skipped": "nothing to rank", "tier": "routine"}
@@ -626,6 +666,10 @@ class TradingAgent:
             decision.usage = {"skipped": "menu is hold only", "tier": "routine"}
             decision.menu = rows
             return decision
+        guarded = self._spend_guard_decision(candidates)
+        if guarded is not None:
+            guarded.menu = rows
+            return guarded
         task = "stakes" if "BUY" in kinds and high_stakes(risk_state, self.settings) else ("trade" if "BUY" in kinds else "signal")
         spec = choose_tier(task, self.settings, self.budget.spent_usd(), self.budget.spent_today(now))
         user = self._menu_prompt(features, positions, risk_state, menu)
@@ -685,6 +729,7 @@ class TradingAgent:
         if note:
             decision = self._menu_decision(menu, next((item for item in menu if item.kind == "HOLD"), None), note, raw)
             decision.error = note
+            decision.veto_all = True
             return decision
         return self._menu_decision(menu, chosen, "", raw)
 
@@ -795,6 +840,10 @@ class TradingAgent:
             }]
         if not allow_network or not self.llm.configured():
             return []
+        if self.budget.spent_usd() >= SPEND_GUARD_USD:
+            spent = self.budget.spent_usd()
+            log.info("LLM fallback: llm_usd_total %.4f >= 2.25", spent)
+            return [{"skipped": "spend guard 2.25", "tier": "routine", "spent_usd": round(spent, 8)}]
         allowed, reason = self.budget.allow(now)
         if not allowed:
             return [{"skipped": reason, "tier": "routine", "spent_usd": round(self.budget.spent_usd(), 6)}]
@@ -815,11 +864,16 @@ class TradingAgent:
         try:
             parsed = parse_agent_output(raw)
         except (ValueError, json.JSONDecodeError, TypeError) as exc:
-            log.warning("LLM output rejected (%s); using fallback", exc)
-            decision = fallback_decision(candidates)
-            decision.error = str(exc)
-            decision.raw = raw[:2000]
-            return decision
+            log.warning("LLM output rejected (%s); veto", exc)
+            return AgentDecision(
+                source="fallback",
+                veto_all=True,
+                regime="invalid",
+                comment="invalid model output",
+                decisions=[],
+                raw=raw[:2000],
+                error=str(exc),
+            )
         parsed.raw = raw[:2000]
         if parsed.veto_all:
             parsed.decisions = [item for item in parsed.decisions if item.action in {"SELL", "CLOSE", "HOLD"}]

@@ -52,6 +52,7 @@ from trader.engine.ops import (
 from trader.risk.manager import Action, RiskManager, roll_day
 from trader.sentiment import SentimentFeed
 from trader.strategy.agent import TradingAgent
+from trader.strategy.menu import hold_action
 from trader.strategy.quotes import execution_cost, inventory_skew, maker_buy_limit, maker_sell_limit
 from trader.strategy.signals import build_candidates, evaluate_symbol
 from trader.timeutil import iso, now_tehran
@@ -618,7 +619,7 @@ def _cycle(
         view.entries_blocked = True
         view.block_reason = view.block_reason or cutoff_reason
     liquidity = {row.symbol: row.liquidity for row in features if row.liquidity is not None}
-    menu = risk.legal_menu(
+    menu_kwargs = dict(
         portfolio=portfolio,
         candidates=candidates,
         marks=marks,
@@ -633,6 +634,119 @@ def _cycle(
         features=features,
         pending=state.get("pending") or {},
     )
+    # The menu is fixed before any exit. A stop that frees a slot cannot add a buy
+    # the model was not already allowed to take. Gross exposure on `view` is also
+    # left stale so a same-cycle entry can only shrink.
+    menu_before = risk.legal_menu(**menu_kwargs)
+    fills = []
+    requests = []
+    residuals = []
+    order_errors = []
+    order_rejects = 0
+    entry_taker_fills = 0
+    cancel_errors = 0
+    b9_skips = 0
+    guard_blocks: list[dict] = []
+    pending_symbols = {row.get("symbol") for row in state.get("pending", {}).values()}
+    early_rejected: list[dict] = []
+
+    def _run_actions(actions, rejected) -> None:
+        nonlocal order_rejects, entry_taker_fills, cancel_errors
+        for action in actions:
+            if action.source == "cancel":
+                cancelled = _cancel_resting(client, state, action, send_orders)
+                if cancelled is None:
+                    rejected.append({"symbol": action.symbol, "reason": "cancel ignored; order is not working"})
+                else:
+                    requests.append(cancelled)
+                    if cancelled.get("error"):
+                        cancel_errors += 1
+                        rejected.append({"symbol": action.symbol, "reason": cancelled["error"]})
+                continue
+            if action.symbol in pending_symbols:
+                rejected.append({"symbol": action.symbol, "reason": "an order for this symbol is already working"})
+                continue
+            dust = _try_dust_flatten(
+                cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees, unavailable,
+                ops_state=ops["state"], guard_blocks=guard_blocks,
+            )
+            if dust is not None:
+                dust_fills, dust_requests, residual = dust
+                requests.extend(dust_requests)
+                if residual:
+                    residuals.append(residual)
+                    rejected.append({"symbol": action.symbol, "reason": residual["reason"]})
+                    log.warning(
+                        "residual %s qty=%s mark_tmn=%s %s",
+                        residual.get("symbol"), residual.get("qty"), residual.get("mark_tmn"), residual.get("reason"),
+                    )
+                for fill in dust_fills:
+                    fills.append(fill)
+                    state["order_times"].append(now_unix)
+                    journal.trade(_trade_row(fill, now, mode))
+                continue
+            try:
+                before_guard = len(guard_blocks)
+                fill, request = _execute(
+                    cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees,
+                    feature_by_symbol.get(action.symbol), unavailable,
+                    ops_state=ops["state"], guard_blocks=guard_blocks,
+                )
+                if len(guard_blocks) > before_guard:
+                    rejected.append({
+                        "symbol": action.symbol,
+                        "reason": f"order_guard: {guard_blocks[-1]['reason']}",
+                    })
+                    continue
+            except (WallexError, OrderRejected) as exc:
+                order_rejects += 1
+                order_errors.append({
+                    "endpoint": "/v1/account/orders",
+                    "http_status": getattr(exc, "status", None),
+                    "client_id": action.client_order_id or None,
+                    "message": str(exc),
+                })
+                rejected.append({"symbol": action.symbol, "reason": str(exc)})
+                continue
+            if request:
+                requests.append(request)
+            if fill:
+                fills.append(fill)
+                state["order_times"].append(now_unix)
+                journal.trade(_trade_row(fill, now, mode))
+                if fill.side == "SELL" and action.source == "stop":
+                    state["cooldowns"][action.symbol] = now_unix + float(cfg["risk"]["cooldown_after_stop_seconds"])
+                if fill.side == "BUY" and (action.order_type == "MARKET" or action.aggressive):
+                    entry_taker_fills += 1
+
+    protective, _deferred = risk.protective_actions(
+        portfolio=portfolio, marks=marks, view=view, now_unix=now_unix, liquidity=liquidity,
+    )
+    for symbol in facts.unprotected:
+        if any(item.symbol == symbol and item.side == "SELL" for item in protective):
+            continue
+        if symbol not in portfolio.positions:
+            continue
+        protective.append(Action(
+            symbol=symbol,
+            side="SELL",
+            order_type="MARKET",
+            size_fraction=1.0,
+            reason="B10 no working stop and position is at or below -2%",
+            source="b10",
+            price_direction="down",
+            aggressive=True,
+        ))
+    # Stops, trails, and flattens are sent before the model is asked anything.
+    _run_actions(protective, early_rejected)
+    dispatched = {(action.symbol, action.source) for action in protective}
+    pending_symbols = {row.get("symbol") for row in state.get("pending", {}).values()}
+    menu_kwargs["pending"] = state.get("pending") or {}
+    menu_after = risk.legal_menu(**menu_kwargs)
+    already = {item.id for item in menu_before}
+    menu = [item for item in menu_after if item.id in already]
+    if not any(item.kind == "HOLD" for item in menu):
+        menu = [hold_action(), *menu]
     decision = agent.decide(
         features, candidates,
         [p.to_dict() for p in portfolio.positions.values()],
@@ -654,11 +768,20 @@ def _cycle(
         liquidity=liquidity,
         features=features,
     )
+    planned.rejected.extend(early_rejected)
+    legal_buys = {item.symbol for item in menu_before if item.kind == "BUY"}
+    kept_actions = []
     min_notional = float(cfg["risk"]["min_notional_tmn"])
     multiplier = float(ops.get("size_multiplier") or 1.0)
-    kept_actions = []
-    b9_skips = 0
     for action in planned.actions:
+        if (action.symbol, action.source) in dispatched:
+            continue
+        if action.side == "BUY" and action.symbol not in legal_buys:
+            planned.rejected.append({
+                "symbol": action.symbol,
+                "reason": "entry held; the pre-stop menu did not include this buy",
+            })
+            continue
         if action.side == "BUY":
             action.size_fraction = float(action.size_fraction) * multiplier
             notional = float(action.size_fraction) * float(view.equity)
@@ -667,97 +790,8 @@ def _cycle(
                 b9_skips += 1
                 continue
         kept_actions.append(action)
-    planned.actions = kept_actions
-    for symbol in facts.unprotected:
-        if any(item.symbol == symbol and item.side == "SELL" for item in planned.actions):
-            continue
-        if symbol not in portfolio.positions:
-            continue
-        planned.actions.append(Action(
-            symbol=symbol,
-            side="SELL",
-            order_type="MARKET",
-            size_fraction=1.0,
-            reason="B10 no working stop and position is at or below -2%",
-            source="b10",
-            price_direction="down",
-            aggressive=True,
-        ))
-    fills = []
-    requests = []
-    residuals = []
-    order_errors = []
-    order_rejects = 0
-    entry_taker_fills = 0
-    cancel_errors = 0
-    pending_symbols = {row.get("symbol") for row in state.get("pending", {}).values()}
-    guard_blocks: list[dict] = []
-    for action in planned.actions:
-        if action.source == "cancel":
-            cancelled = _cancel_resting(client, state, action, send_orders)
-            if cancelled is None:
-                planned.rejected.append({"symbol": action.symbol, "reason": "cancel ignored; order is not working"})
-            else:
-                requests.append(cancelled)
-                if cancelled.get("error"):
-                    cancel_errors += 1
-                    planned.rejected.append({"symbol": action.symbol, "reason": cancelled["error"]})
-            continue
-        if action.symbol in pending_symbols:
-            planned.rejected.append({"symbol": action.symbol, "reason": "an order for this symbol is already working"})
-            continue
-        dust = _try_dust_flatten(
-            cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees, unavailable,
-            ops_state=ops["state"], guard_blocks=guard_blocks,
-        )
-        if dust is not None:
-            dust_fills, dust_requests, residual = dust
-            requests.extend(dust_requests)
-            if residual:
-                residuals.append(residual)
-                planned.rejected.append({"symbol": action.symbol, "reason": residual["reason"]})
-                log.warning(
-                    "residual %s qty=%s mark_tmn=%s %s",
-                    residual.get("symbol"), residual.get("qty"), residual.get("mark_tmn"), residual.get("reason"),
-                )
-            for fill in dust_fills:
-                fills.append(fill)
-                state["order_times"].append(now_unix)
-                journal.trade(_trade_row(fill, now, mode))
-            continue
-        try:
-            before_guard = len(guard_blocks)
-            fill, request = _execute(
-                cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees,
-                feature_by_symbol.get(action.symbol), unavailable,
-                ops_state=ops["state"], guard_blocks=guard_blocks,
-            )
-            if len(guard_blocks) > before_guard:
-                planned.rejected.append({
-                    "symbol": action.symbol,
-                    "reason": f"order_guard: {guard_blocks[-1]['reason']}",
-                })
-                continue
-        except (WallexError, OrderRejected) as exc:
-            order_rejects += 1
-            order_errors.append({
-                "endpoint": "/v1/account/orders",
-                "http_status": getattr(exc, "status", None),
-                "client_id": action.client_order_id or None,
-                "message": str(exc),
-            })
-            planned.rejected.append({"symbol": action.symbol, "reason": str(exc)})
-            continue
-        if request:
-            requests.append(request)
-        if fill:
-            fills.append(fill)
-            state["order_times"].append(now_unix)
-            journal.trade(_trade_row(fill, now, mode))
-            if fill.side == "SELL" and action.source == "stop":
-                state["cooldowns"][action.symbol] = now_unix + float(cfg["risk"]["cooldown_after_stop_seconds"])
-            if fill.side == "BUY" and (action.order_type == "MARKET" or action.aggressive):
-                entry_taker_fills += 1
+    _run_actions(kept_actions, planned.rejected)
+    planned.actions = list(protective) + kept_actions
     equity = portfolio.equity(marks) if marks else portfolio.cash
     state["peak_equity"] = max(state["peak_equity"], equity)
     journal.equity({

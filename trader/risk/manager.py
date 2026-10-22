@@ -151,26 +151,23 @@ class RiskManager:
             kill_reason=new_reason,
         )
 
-    def plan(
+    def protective_actions(
         self,
         *,
         portfolio: Portfolio,
-        agent: AgentDecision,
-        candidates: list[Candidate],
         marks: dict[str, float],
-        rules: dict[str, MarketRule],
-        unavailable: set[str],
-        now: datetime,
         view: RiskView,
-        order_times: list[float],
-        cooldowns: dict[str, float],
         now_unix: float,
         liquidity: dict[str, Liquidity] | None = None,
-        features: list | None = None,
-    ) -> RiskResult:
+    ) -> tuple[list[Action], list[dict]]:
+        """Stops, trails, time stops, and flatten orders. No model call.
+
+        The live loop dispatches this before the LLM so a hung request cannot
+        delay an exit. plan() still starts here, so a backtest that only calls
+        plan() keeps the same action list.
+        """
         actions: list[Action] = []
         rejected: list[dict] = []
-        risk = self.cfg["risk"]
         held = set(portfolio.positions)
 
         for symbol, position in list(portfolio.positions.items()):
@@ -194,6 +191,31 @@ class RiskManager:
                     rejected.append({"symbol": symbol, "reason": "liquidation deferred until the book is liquid"})
                     continue
                 actions.append(flatten)
+        return actions, rejected
+
+    def plan(
+        self,
+        *,
+        portfolio: Portfolio,
+        agent: AgentDecision,
+        candidates: list[Candidate],
+        marks: dict[str, float],
+        rules: dict[str, MarketRule],
+        unavailable: set[str],
+        now: datetime,
+        view: RiskView,
+        order_times: list[float],
+        cooldowns: dict[str, float],
+        now_unix: float,
+        liquidity: dict[str, Liquidity] | None = None,
+        features: list | None = None,
+    ) -> RiskResult:
+        actions, rejected = self.protective_actions(
+            portfolio=portfolio, marks=marks, view=view, now_unix=now_unix, liquidity=liquidity,
+        )
+        risk = self.cfg["risk"]
+        held = set(portfolio.positions)
+        forced_symbols = {action.symbol for action in actions if action.source in {"stop", "trail", "time"}}
 
         candidate_by_symbol = {item.symbol: item for item in candidates}
         entries_this_hour = _count_since(order_times, now_unix, 3600)

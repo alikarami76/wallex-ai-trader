@@ -274,9 +274,12 @@ class RouterTests(unittest.TestCase):
 
         agent = self._agent(post, max_spend_usd=2.50, max_llm_calls_per_hour=10, max_spend_usd_per_day=3)
         agent.budget.calls.append({"ts": 1_700_000_000, "usd": 2.50})
+        allowed, reason = agent.budget.allow(1_700_000_100)
+        self.assertFalse(allowed)
+        self.assertIn("cap", reason)
         decision = agent.decide([_feature()], [_candidate()], [], {"equity": 1}, 1_700_000_100)
         self.assertEqual(decision.source, "fallback")
-        self.assertIn("cap", decision.usage["skipped"])
+        self.assertEqual(decision.usage["skipped"], "spend guard 2.25")
         self.assertIn("DETERMINISTIC_FALLBACK", decision.decisions[0].rationale)
         self.assertAlmostEqual(decision.usage["spent_usd"], 2.50)
         self.assertEqual(decision.usage["budget_usd"], 3.0)
