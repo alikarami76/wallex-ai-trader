@@ -71,7 +71,7 @@ BoxAPI `POST /chat/completions` goes through one router. The quant layer is stil
 
 Shadow and live hand the model a compact state and a menu. The menu is built by the same checks that size an order: HOLD, BUY at the maker bid with the post-Kelly post-liquidity size, SELL or REDUCE when close is under the slow EMA and the 24-hour return is negative, and CANCEL for a resting maker order. Stops, the kill switch, and liquidation are applied by the risk layer and are not on the menu. A kill or a liquidation phase leaves the menu as HOLD, and that cycle does not call the model.
 
-The reply is one JSON object, `{"action_id", "rationale"}`. The id has to be on the menu. Bad JSON, an unknown id, or an empty rationale is HOLD. That HOLD does not fall through to the quant candidate. A missing key, a spend cap, or a failed request still uses the deterministic fallback, so the bot keeps trading. `plan()` sizes the pick again and can veto it. The decision log stores the menu, `picked_id`, and `menu_bound`.
+The reply is one JSON object, `{"action_id", "rationale"}`. The id has to be on the menu. Bad JSON, an unknown id, or an empty rationale is HOLD. That HOLD does not fall through to the quant candidate. A missing key, a timeout, or the $2.25 budget stop still uses the deterministic fallback, which may still buy. The model can only veto or shrink. `plan()` sizes the pick again and can veto it. The decision log stores the menu, `picked_id`, and `menu_bound`.
 
 The shape of this loop — code proposes the legal actions, the model classifies, risk can still refuse — is the open-source pattern in [beebots](https://github.com/imikerussell/beebots) and [jev-loop](https://github.com/snafu4/jev-loop). The model on this bot is the BoxAPI router above.
 
@@ -90,7 +90,7 @@ List price per 1M tokens on 2026-10-22: luna $0.10 / $0.50, sol and gpt-6.1-sol 
 - `max_llm_calls_per_hour: 8`, `max_llm_calls_total: 160`, at least 1 second between calls, and exponential backoff on HTTP 429 and 5xx,
 - each paid call logs model, tier, tokens, reasoning tokens, that call's USD, and `spent/3.00` next to the $2.50 cap,
 - model, tier, token counts, USD, `spent_usd`, and `budget_usd` are stored on the decision (`agent.usage` and `llm_calls`) and in `data/llm_usage.json`,
-- timeout, HTTP error, bad JSON, a missing key, or a cap all fall back to the deterministic ranking. The source field is `llm`, `llm_cache`, or `fallback`.
+- a timeout or the $2.25 budget stop falls back to the deterministic ranking, which may still buy. The model can only veto or shrink. Bad JSON, an unknown id, or a missing rationale stays HOLD and does not buy. A missing key or an HTTP error also uses that deterministic ranking. The source field is `llm`, `llm_cache`, or `fallback`.
 
 Backtest sets `use_llm=False`. A key in the environment cannot spend money during a historical run.
 

@@ -108,7 +108,7 @@ A refusal is not sent, does not advance the client-id sequence, and does not cha
 
 Stop, trail, and flatten actions run before `agent.decide`. That prefix does not wait on BoxAPI, so a hung completion cannot delay a protective exit. A buy that was not already on the menu from before those exits is dropped, so a stop that frees a slot cannot open a new entry in the same cycle.
 
-A hard timeout returns the deterministic fallback and stores `llm_source=fallback`. Output that fails the JSON schema is a veto: no decisions and no quant buy. Once `llm_usd_total` reaches $2.25 the client skips the call, logs the fallback, and uses that same deterministic path. The $2.00 tier step-down and the $2.50 hard cap still apply underneath. A menu that is only HOLD still skips the model. Invalid menu JSON stays HOLD.
+A hard timeout returns the deterministic fallback and stores `llm_source=fallback`. That fallback may still buy: it is the quant ranking, and the model is not required for the entry. Output that fails the JSON schema is a veto: no decisions and no quant buy. Once `llm_usd_total` reaches $2.25 the client skips the call, logs the fallback, and uses that same deterministic path, which may still buy. The model can only veto or shrink a candidate the rules already ranked. The $2.00 tier step-down and the $2.50 hard cap still apply underneath. A menu that is only HOLD still skips the model. Invalid menu JSON stays HOLD.
 
 ### Sealed scorecard
 
