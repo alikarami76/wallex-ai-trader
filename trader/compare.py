@@ -79,6 +79,10 @@ def _git_text(sha: str, path: str) -> str:
     )
 
 
+def _rev_parse(sha: str) -> str:
+    return subprocess.check_output(["git", "rev-parse", sha], text=True, stderr=subprocess.DEVNULL).strip()
+
+
 def _rows(text: str) -> list[dict]:
     return list(csv.DictReader(io.StringIO(text)))
 
@@ -114,21 +118,32 @@ def _pnl(summary: dict) -> dict:
     }
 
 
-def compare_backtest(cfg: dict, base_sha: str, backtest_dir: Path, dest: Path) -> dict:
-    """Replay HEAD on stored candles and diff it against `base_sha`'s trade list."""
+def compare_backtest(cfg: dict, sha_a: str, sha_b: str, backtest_dir: Path, dest: Path) -> dict:
+    """Diff trade lists at two commits. HEAD replays the working tree on stored candles."""
     backtest_dir = Path(backtest_dir)
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
-    head_dir = dest / "head"
-    if head_dir.exists():
-        for child in head_dir.iterdir():
-            if child.is_file():
-                child.unlink()
-    summary = replay(cfg, backtest_dir, head_dir)
-    base_trades = _git_text(base_sha, "results/backtest/trades.csv")
-    base_summary = json.loads(_git_text(base_sha, "results/backtest/summary.json"))
-    head_trades = (head_dir / "trades.csv").read_text(encoding="utf-8")
+    resolved_a = _rev_parse(sha_a)
+    resolved_b = _rev_parse(sha_b)
+    replay_b = sha_b == "HEAD" or resolved_b == _rev_parse("HEAD")
+    base_trades = _git_text(resolved_a, "results/backtest/trades.csv")
+    base_summary = json.loads(_git_text(resolved_a, "results/backtest/summary.json"))
+    summary = None
+    if replay_b:
+        head_dir = dest / "head"
+        if head_dir.exists():
+            for child in head_dir.iterdir():
+                if child.is_file():
+                    child.unlink()
+        summary = replay(cfg, backtest_dir, head_dir)
+        head_trades = (head_dir / "trades.csv").read_text(encoding="utf-8")
+        head_summary = summary
+    else:
+        head_trades = _git_text(resolved_b, "results/backtest/trades.csv")
+        head_summary = json.loads(_git_text(resolved_b, "results/backtest/summary.json"))
     trades = diff_trades(base_trades, head_trades)
+    if summary is None:
+        summary = replay(cfg, backtest_dir, None)
     sensitivity = [{**_pnl(summary), "fee_multiple": 1.0, "extra_slippage_bps": 0.0}]
     for multiple, extra in ((1.5, 0.0), (1.0, 5.0), (1.5, 5.0)):
         scaled = scale_fees(cfg, multiple, extra)
@@ -137,12 +152,15 @@ def compare_backtest(cfg: dict, base_sha: str, backtest_dir: Path, dest: Path) -
         row["extra_slippage_bps"] = extra
         sensitivity.append(row)
     report = {
-        "base_sha": base_sha,
-        "head_sha": git_sha(),
+        "sha_a": resolved_a,
+        "sha_b": resolved_b,
+        "replayed_b": replay_b,
+        "base_sha": resolved_a,
+        "head_sha": resolved_b,
         "config_hash": config_hash(cfg),
         "identical": trades["identical"],
         "base": _pnl(base_summary),
-        "head": _pnl(summary),
+        "head": _pnl(head_summary),
         "trades": trades,
         "sensitivity": sensitivity,
     }
@@ -158,15 +176,20 @@ def _markdown(report: dict) -> str:
     lines = [
         "# Backtest compare",
         "",
-        f"Base `{report['base_sha']}` versus HEAD `{report['head_sha']}`.",
+        f"`{report['sha_a']}` versus `{report['sha_b']}`.",
         f"Config hash `{report['config_hash']}`.",
+        (
+            "The second ref is HEAD, so its trade list is a replay of the stored candles."
+            if report.get("replayed_b")
+            else "Both trade lists are the files committed at those SHAs."
+        ),
         "",
         f"Trades and PnL: **{verdict}**.",
         "",
         "| | return | closed trades | ending equity | realized PnL | fees |",
         "| --- | ---: | ---: | ---: | ---: | ---: |",
-        f"| base | {base.get('return_pct')}% | {base.get('closed_trades')} | {base.get('ending_equity')} | {base.get('realized_pnl')} | {base.get('fees_paid')} |",
-        f"| HEAD | {head.get('return_pct')}% | {head.get('closed_trades')} | {head.get('ending_equity')} | {head.get('realized_pnl')} | {head.get('fees_paid')} |",
+        f"| sha_a | {base.get('return_pct')}% | {base.get('closed_trades')} | {base.get('ending_equity')} | {base.get('realized_pnl')} | {base.get('fees_paid')} |",
+        f"| sha_b | {head.get('return_pct')}% | {head.get('closed_trades')} | {head.get('ending_equity')} | {head.get('realized_pnl')} | {head.get('fees_paid')} |",
         "",
         "## Sensitivity",
         "",

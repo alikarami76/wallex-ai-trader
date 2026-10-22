@@ -54,9 +54,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--compare",
         nargs=2,
-        metavar=("BASE", "HEAD"),
+        metavar=("SHA_A", "SHA_B"),
         default=None,
-        help="diff a stored backtest at BASE against a HEAD replay of those candles",
+        help="diff backtest trade lists at two commits; SHA_B=HEAD replays stored candles",
     )
     parser.add_argument("--checkpoint", choices=["C0", "C1", "C2", "C3", "C4"], default=None)
     parser.add_argument("--operator-action", default=None)
@@ -107,11 +107,9 @@ def main(argv: list[str] | None = None) -> None:
             *(["--once"] if args.once else []),
         ]))
     if args.mode == "backtest" and args.compare:
-        base, head = args.compare
-        if head != "HEAD":
-            raise SystemExit("the second compare ref must be HEAD")
+        sha_a, sha_b = args.compare
         dest = Path(args.out or "results/compare")
-        report = compare_backtest(cfg, base, Path("results/backtest"), dest)
+        report = compare_backtest(cfg, sha_a, sha_b, Path("results/backtest"), dest)
         print(dest / "compare.md")
         print(json.dumps({
             "identical": report["identical"],
