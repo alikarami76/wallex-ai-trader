@@ -12,17 +12,18 @@ from pathlib import Path
 
 from trader.config import load_config, runtime_dirs
 from trader.engine.backtest import run_backtest, run_walk_forward, sentiment_ablation
-from trader.engine.ops import replay_offline, write_checkpoint
+from trader.engine.ops import config_hash, replay_offline, write_checkpoint
 from trader.sentiment import SentimentFeed
 from trader.engine.runtime import check_order, run_runtime
 from trader.engine.universe import select_universe
+from trader.audit import audit_summary, build_audit
 from trader.compare import compare_backtest
 from trader.report import build_report
 from trader.scorecard import write_scorecard
 from trader.wallex.client import WallexClient, aggregate_bars, median_spacing
 
 
-_MODES = {"backtest", "shadow", "live", "report", "check-order", "replay", "scorecard"}
+_MODES = {"backtest", "shadow", "live", "report", "check-order", "replay", "scorecard", "audit"}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -49,6 +50,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--out", default=None, help="output directory")
     parser.add_argument("--log-dir", default=None, help="journal directory for report, replay, and scorecard")
     parser.add_argument("--candles", default=None, help="stored candle directory for the offline scorecard")
+    parser.add_argument("--wallex-snapshot", default=None, help="optional balances file for the offline audit")
     parser.add_argument(
         "--compare",
         nargs=2,
@@ -77,6 +79,26 @@ def main(argv: list[str] | None = None) -> None:
         report = write_scorecard(log_dir, candles, cfg, dest)
         print(dest / "scorecard.md")
         print(json.dumps({key: report[key] for key in ("rows", "shadow_rows", "signals", "rules_pnl_tmn", "taken_pnl_tmn", "gap_tmn")}, indent=2))
+        return
+    if args.mode == "audit":
+        from trader.audit import write_audit
+        log_dir = Path(args.log_dir or "results/shadow")
+        dest = Path(args.out or "results")
+        report = write_audit(
+            log_dir,
+            dest,
+            starting_cash=float(cfg["account"]["initial_equity_tmn"]),
+            config_hash=config_hash(cfg),
+            wallex_snapshot=Path(args.wallex_snapshot) if args.wallex_snapshot else None,
+        )
+        print(dest / "audit.md")
+        print(json.dumps({
+            "ok": report["ok"],
+            "failures": report["failures"],
+            "max_drift_tmn": report["max_drift_tmn"],
+            "fee_bill_tmn": report["fee_bill_tmn"],
+            "secret_hits": len(report["secret_hits"]),
+        }, indent=2))
         return
     if args.mode == "backtest" and args.compare:
         base, head = args.compare
@@ -113,6 +135,12 @@ def main(argv: list[str] | None = None) -> None:
             note=args.note,
         )
         print(path)
+        audited = build_audit(
+            source,
+            starting_cash=float(cfg["account"]["initial_equity_tmn"]),
+            config_hash=config_hash(cfg),
+        )
+        path.write_text(path.read_text(encoding="utf-8") + audit_summary(audited), encoding="utf-8")
         return
     if args.mode == "report":
         source = Path(args.log_dir or args.out or "results/backtest")
