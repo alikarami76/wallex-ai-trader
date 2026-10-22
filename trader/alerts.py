@@ -21,8 +21,12 @@ log = logging.getLogger("trader.alerts")
 MIN_INTERVAL_SECONDS = 300.0
 # Skipped-entry summaries are quieter than live orders.
 SKIP_INTERVAL_SECONDS = 1800.0
+# Identical holds repeat at most this often. A new reason posts immediately.
+HOLD_REPEAT_SECONDS = 900.0
+_GATES = ("ema", "return_24h", "pullback_4h", "spread", "zscore", "ev")
 _last_sent: dict[str, float] = {}
 _skip_sent: float | None = None
+_hold_notice = {"key": None, "cycles": 0, "last_sent": None}
 
 
 def configured() -> bool:
@@ -162,6 +166,104 @@ def send_update(
         return False
 
 
+def reset_hold_notice() -> None:
+    _hold_notice.update(key=None, cycles=0, last_sent=None)
+
+
+def classify_hold(
+    *,
+    features,
+    candidates,
+    zscore_n: int,
+    zscore_min: int,
+    entries_allowed: bool,
+    entries_blocked: bool,
+    block_reason: str,
+    cutoff_reason: str,
+    decision=None,
+    rejected=None,
+) -> tuple[str, list[str]]:
+    """Why this cycle did not trade, plus the candidate symbols."""
+    names = sorted({
+        str(getattr(item, "symbol", "") or "")
+        for item in candidates or []
+        if getattr(item, "symbol", None)
+    })
+    try:
+        have = int(zscore_n)
+        need = int(zscore_min)
+    except (TypeError, ValueError):
+        have, need = 0, 18
+    if have < need or str(cutoff_reason or "") == "zscore_warmup":
+        return f"warm-up not complete ({have}/{need})", names
+    hard = _hard_block(entries_allowed, entries_blocked, block_reason, cutoff_reason)
+    if hard:
+        return hard, names
+    if not names:
+        return _filter_reason(features), names
+    for row in rejected or []:
+        text = str((row or {}).get("reason") or "").strip()
+        if text:
+            return f"risk/cutoff blocking entry: {text[:300]}", names
+    return _llm_hold(decision), names
+
+
+def send_hold(
+    *,
+    mode: str,
+    ops_state: str,
+    when,
+    reason: str,
+    candidates,
+    cash,
+    positions,
+    post=None,
+    now: float | None = None,
+) -> bool:
+    """One HOLD note. Identical reason and candidates stay quiet for 15 minutes."""
+    try:
+        token, chat = _trade_credentials()
+        if not token or not chat:
+            return False
+        names = tuple(sorted(str(item) for item in candidates or [] if item))
+        key = (str(reason or "").strip(), names)
+        moment = time.monotonic() if now is None else float(now)
+        if _hold_notice["key"] == key:
+            _hold_notice["cycles"] = int(_hold_notice["cycles"]) + 1
+            last = _hold_notice["last_sent"]
+            if last is not None and moment - float(last) < HOLD_REPEAT_SECONDS:
+                return False
+            body = format_hold(
+                when=when, ops_state=ops_state, reason=reason, cash=cash,
+                positions=positions, repeat_cycles=_hold_notice["cycles"],
+            )
+        else:
+            _hold_notice["key"] = key
+            _hold_notice["cycles"] = 1
+            body = format_hold(
+                when=when, ops_state=ops_state, reason=reason, cash=cash, positions=positions,
+            )
+        _hold_notice["last_sent"] = moment
+        prefix = mode
+        if str(ops_state or "").upper() == "SHADOW":
+            prefix = "shadow"
+        return post_text(_with_mode(prefix, body), post=post, limit=900)
+    except Exception as exc:
+        log.warning("telegram hold failed: %s", type(exc).__name__)
+        return False
+
+
+def format_hold(*, when, ops_state: str, reason: str, cash, positions, repeat_cycles: int | None = None) -> str:
+    lines = [_clock(when), str(ops_state or "SHADOW")]
+    if repeat_cycles:
+        lines.append(f"still holding ({int(repeat_cycles)} cycles), same reason")
+    else:
+        lines.append("HOLD")
+        lines.append(str(reason or "hold").strip() or "hold")
+    lines.append(_book_line(cash, positions))
+    return "\n".join(lines)
+
+
 def send_skips(*, mode: str, when, rows: list[tuple[str, str]], post=None, now: float | None = None) -> bool:
     """One skipped-entry summary per half hour. Empty input sends nothing."""
     global _skip_sent
@@ -217,6 +319,113 @@ def _update_text(
         lines.append(f"pnl {_pnl(pnl)} TMN after fees")
     lines.append(f"id {client_id or '—'}")
     return _with_mode(mode, "\n".join(lines))
+
+
+def _hard_block(entries_allowed: bool, entries_blocked: bool, block_reason: str, cutoff_reason: str) -> str:
+    if entries_allowed and not entries_blocked:
+        return ""
+    text = str(block_reason or "").strip()
+    if text.lower() == "shadow":
+        text = ""
+    labels = {
+        "entry_cutoff": "entry cutoff",
+        "flatten": "flatten",
+        "halt": "halt",
+        "killed": "killed",
+        "size_zero": "size cut to zero",
+    }
+    if text in labels:
+        text = labels[text]
+    code = str(cutoff_reason or "").strip()
+    if code in {"shadow", "zscore_warmup"}:
+        code = ""
+    if code in labels and not text:
+        text = labels[code]
+    elif code and not text:
+        text = code
+    if not text:
+        return ""
+    return f"risk/cutoff blocking entry: {text[:300]}"
+
+
+def _filter_reason(features) -> str:
+    counts = {name: 0 for name in _GATES}
+    seen_symbols = 0
+    for row in features or []:
+        seen_symbols += 1
+        blockers = getattr(row, "blockers", None)
+        if blockers is None and isinstance(row, dict):
+            blockers = row.get("blockers") or []
+        hit = set()
+        for blocker in blockers or []:
+            gate = _gate_for(str(blocker))
+            if gate:
+                hit.add(gate)
+        for gate in hit:
+            counts[gate] += 1
+    main = ""
+    best = 0
+    for name in _GATES:
+        if counts[name] > best:
+            best = counts[name]
+            main = name
+    detail = " · ".join(f"{name} {counts[name]}" for name in _GATES)
+    if best <= 0:
+        return f"no candidates passed the filters ({seen_symbols} symbols)"
+    others = [counts[name] for name in _GATES if name != "ev"]
+    if main == "ev" and counts["ev"] > max(others or [0]):
+        return f"EV below the fee hurdle ({seen_symbols} symbols, ev {counts['ev']})\n{detail}"
+    return (
+        f"no candidates passed the filters ({seen_symbols} symbols, main filter {main} {counts[main]})\n"
+        f"{detail}"
+    )
+
+
+def _gate_for(blocker: str) -> str | None:
+    text = blocker.lower()
+    if "trend structure" in text:
+        return "ema"
+    if "24h return" in text:
+        return "return_24h"
+    if "4h pullback" in text or "4h drop" in text:
+        return "pullback_4h"
+    if "does not clear cost" in text or "fee hurdle" in text:
+        return "ev"
+    if any(phrase in text for phrase in ("depth thinned", "spread widened", "volume dried", "z-score", "zscore")):
+        return "zscore"
+    if "spread" in text:
+        return "spread"
+    return None
+
+
+def _llm_hold(decision) -> str:
+    lines = []
+    for item in getattr(decision, "decisions", []) or []:
+        action = str(getattr(item, "action", "") or "HOLD").upper()
+        if action != "HOLD":
+            continue
+        text = str(getattr(item, "rationale", "") or "").strip()
+        if text:
+            lines.append(text)
+    if not lines:
+        lines.append(str(getattr(decision, "comment", "") or "").strip())
+    blob = " ".join(line for line in lines if line).strip() or "LLM hold"
+    return blob[:300].rstrip()
+
+
+def _book_line(cash, positions) -> str:
+    held = []
+    for item in positions or []:
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            symbol, qty = item[0], item[1]
+        else:
+            symbol = getattr(item, "symbol", "")
+            qty = getattr(item, "qty", None)
+        if not symbol:
+            continue
+        held.append(f"{symbol} {_qty_text(qty)}")
+    book = "flat" if not held else ", ".join(held)
+    return f"cash {_tmn(cash)} TMN · {book}"
 
 
 def _with_mode(mode: str, text: str) -> str:

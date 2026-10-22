@@ -73,7 +73,7 @@ liara env set --app wallex-ai-trader --force \
 | `DASHBOARD_PASSWORD` | Password for that fallback user. Compared in constant time. |
 | `TELEGRAM_ALERT_BOT_TOKEN` | Optional. Shared by alerts and the trade log. Alerts stay off unless this and `TELEGRAM_ALERT_CHAT_ID` are both set. |
 | `TELEGRAM_ALERT_CHAT_ID` | Optional group for a cycle gap, HALT or KILLED, an order reject, or a taker entry fill. |
-| `TELEGRAM_TRADES_CHAT_ID` | Optional channel for each BUY/SELL, fill, partial, and cancel. Gordon Trades is `-1003898687684`. Unset means the trade log sends nothing. |
+| `TELEGRAM_TRADES_CHAT_ID` | Optional channel for each BUY/SELL, fill, partial, cancel, and HOLD. Gordon Trades is `-1003898687684`. Unset means the trade log sends nothing. |
 | `WATCHDOG_ENABLED` | Optional. Off unless this is `1`, `true`, `yes`, or `on`. The entrypoint then runs the journal sidecar in the same container. It does not place orders or write journals. |
 | `TRADER_LIVE_AUTHORIZED` | `1` arms live orders. Leave it unset in the image. The running lock keeps the value already stored in `/data/state.json`. |
 | `TRADER_EV_OVERRIDE` | `1` keeps the locked cost-gate override on. A re-freeze does not clear it. Leave it set across the redeploy. |
