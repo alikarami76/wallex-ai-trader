@@ -13,6 +13,7 @@ from trader.risk.manager import RiskManager, roll_day
 from trader.strategy.agent import TradingAgent
 from trader.strategy.indicators import atr_percent
 from trader.strategy.quotes import half_spread, inventory_skew
+from trader.sentiment import fear_greed_at
 from trader.strategy.signals import build_candidates, evaluate_symbol
 from trader.timeutil import TEHRAN, iso
 from trader.types import Bar, MarketRule
@@ -45,6 +46,7 @@ def run_backtest(
     trade_after: int | None = None,
     trade_before: int | None = None,
     realize_open: bool = False,
+    fear_greed: list[tuple[int, float, str]] | None = None,
 ) -> dict:
     spreads = spreads or {}
     symbols = [symbol for symbol in candles if symbol not in unavailable and symbol in rules]
@@ -89,6 +91,7 @@ def run_backtest(
             if stamp not in indexed[symbol]:
                 continue
             maker, taker = _fees(cfg, rules[symbol])
+            fg, fg_change, _label = fear_greed_at(fear_greed, stamp)
             features.append(
                 evaluate_symbol(
                     symbol,
@@ -99,6 +102,8 @@ def run_backtest(
                     micro_return=None,
                     maker_fee=maker,
                     taker_fee=taker,
+                    fear_greed=fg,
+                    fear_greed_change=fg_change,
                 )
             )
         candidates = build_candidates(features, cfg)
@@ -192,12 +197,22 @@ def run_backtest(
         if prev:
             bar_returns.append(equity_curve[i] / prev - 1)
     trials = int((cfg.get("validation") or {}).get("n_trials", 6))
+    start_equity = float(cfg["account"]["initial_equity_tmn"])
+    peak = start_equity
+    max_dd = 0.0
+    for value in equity_curve:
+        peak = max(peak, value)
+        if peak:
+            max_dd = max(max_dd, (peak - value) / peak)
     summary = {
         "ending_equity": ending,
         "fees_paid": portfolio.fees_paid,
         "realized_pnl": portfolio.realized_pnl,
         "bars": len(timeline),
         "symbols": symbols,
+        "return_pct": round((ending / start_equity - 1) * 100, 3) if start_equity else 0.0,
+        "max_drawdown_pct": round(max_dd * 100, 3),
+        "closed_trades": portfolio.closed_trades,
         "deflated_sharpe": deflated_sharpe(bar_returns, trials),
     }
     log.info("backtest finished: %s", {k: summary[k] for k in ("ending_equity", "fees_paid", "realized_pnl", "bars")})
@@ -444,7 +459,7 @@ def _realize_open(cfg, portfolio, indexed, stamp, rules, state, journal, spreads
             _record_fill(journal, fill, stamp, state)
 
 
-def run_walk_forward(cfg, candles, rules, unavailable, spreads=None) -> dict:
+def run_walk_forward(cfg, candles, rules, unavailable, spreads=None, fear_greed=None) -> dict:
     """Three sequential folds, same frozen parameters, fresh cash each fold."""
     timeline = sorted({bar.time for bars in candles.values() for bar in bars})
     validation = cfg.get("validation") or {}
@@ -461,6 +476,7 @@ def run_walk_forward(cfg, candles, rules, unavailable, spreads=None) -> dict:
         summary = run_backtest(
             cfg, candles, rules, unavailable, None,
             spreads=spreads, trade_after=start, trade_before=end, realize_open=True,
+            fear_greed=fear_greed,
         )
         start_equity = float(cfg["account"]["initial_equity_tmn"])
         rows.append({
@@ -474,6 +490,45 @@ def run_walk_forward(cfg, candles, rules, unavailable, spreads=None) -> dict:
             "deflated_sharpe_probability": (summary.get("deflated_sharpe") or {}).get("deflated_sharpe_probability"),
         })
     return {"ok": True, "folds": folds, "warmup_bars": warmup, "folds_result": rows}
+
+
+def sentiment_ablation(cfg, candles, rules, unavailable, fear_greed) -> dict:
+    """One pre-specified comparison: block entries when Fear & Greed is at least 80.
+
+    The gate helps only when it raises return by 0.05 percentage points, does
+    not worsen max drawdown by more than 0.10 points, and still closes at
+    least 8 trades. That rule was fixed before reading the result.
+    """
+    import copy
+
+    without = copy.deepcopy(cfg)
+    with_gate = copy.deepcopy(cfg)
+    without.setdefault("sentiment", {})["block_extreme_greed"] = False
+    with_gate.setdefault("sentiment", {})["block_extreme_greed"] = True
+    with_gate["sentiment"]["extreme_greed"] = 80
+    off = run_backtest(without, candles, rules, unavailable, None, fear_greed=fear_greed)
+    on = run_backtest(with_gate, candles, rules, unavailable, None, fear_greed=fear_greed)
+    helps = (
+        on["return_pct"] >= off["return_pct"] + 0.05
+        and on["max_drawdown_pct"] <= off["max_drawdown_pct"] + 0.10
+        and on["closed_trades"] >= 8
+    )
+    def pack(summary):
+        return {
+            "ending_equity": round(summary["ending_equity"], 2),
+            "return_pct": summary["return_pct"],
+            "max_drawdown_pct": summary["max_drawdown_pct"],
+            "realized_pnl": round(summary["realized_pnl"], 2),
+            "fees_paid": round(summary["fees_paid"], 2),
+            "closed_trades": summary["closed_trades"],
+        }
+    return {
+        "hypothesis": "block new entries when lagged Fear & Greed is >= 80",
+        "without_gate": pack(off),
+        "with_gate": pack(on),
+        "gate_helps": helps,
+        "decision_rule": "keep the gate only if return rises by >= 0.05pp, drawdown is not worse by > 0.10pp, and closed trades stay >= 8",
+    }
 
 
 def _last_closes(indexed, stamp, portfolio) -> dict[str, float]:

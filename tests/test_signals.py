@@ -60,6 +60,23 @@ class SignalTests(unittest.TestCase):
         half = 10 / 2 / 10_000
         self.assertAlmostEqual(cost, 0.003 + 0.0025 + half + 0.0003)
 
+    def test_extreme_greed_blocks_only_when_the_gate_is_on(self):
+        bars = rising_then_dip()
+        kwargs = dict(
+            spread_bps=10, imbalance=0.2, micro_return=0.0, maker_fee=0.0025, taker_fee=0.003,
+            fear_greed=85, fear_greed_change=4,
+        )
+        gated = base_cfg()
+        gated["sentiment"] = {"block_extreme_greed": True, "extreme_greed": 80}
+        blocked = evaluate_symbol("BTCTMN", bars, gated, **kwargs)
+        self.assertFalse(blocked.signal)
+        self.assertTrue(any("extreme greed" in item for item in blocked.blockers))
+        open_gate = base_cfg()
+        open_gate["sentiment"] = {"block_extreme_greed": False}
+        allowed = evaluate_symbol("BTCTMN", bars, open_gate, **kwargs)
+        self.assertTrue(allowed.signal)
+        self.assertEqual(allowed.fear_greed, 85)
+
     def test_slow_momentum_blocks_a_three_day_decline(self):
         bars = rising_then_dip()
         # The short fixture has no 72-hour window, so the slow filter must refuse it.

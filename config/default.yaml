@@ -101,8 +101,9 @@ liquidation:
 
 llm:
   # BoxAPI (OpenAI-compatible). The key stays in LLM_API_KEY.
-  # Allowed models: gpt-5-mini (default), gpt-5.4-mini, gpt-5.6-sol, gpt-6-sol, gpt-6.1-sol.
-  # gpt-5-mini rejects `temperature`, so it is not sent unless send_temperature is true.
+  # Default model is gpt-6-luna. Also allowed: gpt-5-mini, gpt-5.4-mini, gpt-5.6-sol, gpt-6-sol, gpt-6.1-sol.
+  # Temperature is omitted unless send_temperature is true. Spend uses usage.cost when present.
+  model: gpt-6-luna
   enabled: true
   timeout_seconds: 20
   send_temperature: false
@@ -128,6 +129,17 @@ runtime:
   loop_interval_seconds: 60
   candle_refresh_seconds: 300
   history_days: 29
+
+sentiment:
+  enabled: true
+  fear_greed_url: https://api.alternative.me/fng/
+  # Turned on only when the ablation in results/backtest/sentiment_ablation.json says it helps.
+  block_extreme_greed: false
+  extreme_greed: 80
+  cache_seconds: 900
+  history_cache_seconds: 21600
+  cache_path: data/sentiment_cache.json
+  timeout_seconds: 8
 
 validation:
   # Families inspected before this rule was locked: breakout, continuation,

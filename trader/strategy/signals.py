@@ -33,6 +33,11 @@ class SymbolFeatures:
     expected_gross: float
     round_trip_cost: float
     signal: bool
+    fear_greed: float | None = None
+    fear_greed_change: float | None = None
+    news_score: float | None = None
+    news_change: float | None = None
+    news_headlines: list[str] = field(default_factory=list)
     blockers: list[str] = field(default_factory=list)
     score: float = 0.0
 
@@ -58,6 +63,11 @@ class SymbolFeatures:
             "expected_gross": n(self.expected_gross),
             "round_trip_cost": n(self.round_trip_cost),
             "half_spread": n(half_spread(self.spread_bps)),
+            "fear_greed": n(self.fear_greed, 1),
+            "fear_greed_change": n(self.fear_greed_change, 1),
+            "news_score": n(self.news_score, 3),
+            "news_change": n(self.news_change, 3),
+            "news_headlines": self.news_headlines[:2],
             "signal": self.signal,
             "score": round(self.score, 3),
             "blockers": self.blockers,
@@ -107,6 +117,11 @@ def evaluate_symbol(
     micro_return: float | None,
     maker_fee: float,
     taker_fee: float,
+    fear_greed: float | None = None,
+    fear_greed_change: float | None = None,
+    news_score: float | None = None,
+    news_change: float | None = None,
+    news_headlines: list[str] | None = None,
 ) -> SymbolFeatures:
     strategy = cfg["strategy"]
     closes = [bar.close for bar in bars]
@@ -127,6 +142,11 @@ def evaluate_symbol(
         expected_gross=float(strategy["expected_gross"]),
         round_trip_cost=round_trip_cost(cfg, maker_fee, taker_fee, spread_bps),
         signal=False,
+        fear_greed=fear_greed,
+        fear_greed_change=fear_greed_change,
+        news_score=news_score,
+        news_change=news_change,
+        news_headlines=list(news_headlines or []),
     )
     slow_bars = int(strategy.get("slow_bars") or 0)
     need = max(
@@ -190,6 +210,10 @@ def evaluate_symbol(
     edge = features.expected_gross
     if edge <= cost * float(strategy["edge_multiple"]):
         blockers.append(f"edge {edge:.2%} does not clear cost {cost:.2%}")
+    sentiment = cfg.get("sentiment") or {}
+    greed_cap = float(sentiment.get("extreme_greed", 80))
+    if sentiment.get("block_extreme_greed") and fear_greed is not None and fear_greed >= greed_cap:
+        blockers.append(f"fear and greed {fear_greed:.0f} is extreme greed")
 
     features.blockers = blockers
     features.signal = not blockers

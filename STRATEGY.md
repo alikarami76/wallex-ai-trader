@@ -124,6 +124,17 @@ Shadow:
 python3 -m trader --mode shadow --config config/default.yaml --duration 900 --interval 45 --fresh --out results/shadow
 ```
 
+## Sentiment
+
+Two inputs, both optional. A failed source is logged and skipped. The decision cycle still runs.
+
+- **Fear & Greed** (alternative.me). Level 0–100 and the one-day change. In the backtest the value is the latest point whose timestamp is at least one day before the bar, so the bot does not read an index that was not published yet. Live uses the newest published point.
+- **Headlines.** CoinDesk and Cointelegraph RSS, plus CryptoPanic and Reddit when those public endpoints answer. Titles are matched to the coin (`bitcoin` for BTCTMN, and the same for the other TMN names) and scored with a fixed positive/negative word list. The score is in [−1, 1]. The change is versus the previous cached score. Headlines are not in the backtest, because the feeds are not a point-in-time archive. The lexicon does not call BoxAPI, so it does not spend the $3 budget.
+
+Both the level and the change are fields on each symbol's feature payload, so the regime filter can see them. A missing field is not itself a veto.
+
+The only hard rule that was tested is pre-specified: block a new entry when lagged Fear & Greed is at least 80 (extreme greed), on the view that a pullback in a crowded market is more likely to become a larger decline. It is kept only if the with-gate backtest beats the without-gate backtest by at least 0.05 percentage points of return, does not worsen max drawdown by more than 0.10 points, and still closes at least 8 trades. Otherwise the number stays an input and the gate stays off. The comparison is `results/backtest/sentiment_ablation.json`. Thresholds were not searched.
+
 ## Literature
 
 | Piece | Source | What the bot uses |
@@ -132,7 +143,8 @@ python3 -m trader --mode shadow --config config/default.yaml --duration 900 --in
 | Book imbalance | Cont, Kukanov and Stoikov (2014), *Journal of Financial Econometrics* 12(1) | Best-bid versus best-ask quantity from `/v2/depth/all`. A strongly offered book blocks the entry. |
 | Inventory quotes | Avellaneda and Stoikov (2008), *Quantitative Finance* 8(3) | Reservation-price skew. The arrival-intensity spread is not fitted. |
 | Slow momentum | Moskowitz, Ooi and Pedersen (2012), *Journal of Financial Economics* 104(2) | 72-hour return must be non-negative before the faster pullback can arm. |
-| Regime filter | López de Prado (2018), *Advances in Financial Machine Learning*, meta-labeling | The LLM vetoes or downsizes. It does not create the trade. |
+| Regime filter | López de Prado (2018), *Advances in Financial Machine Learning*, meta-labeling | The LLM vetoes or downsizes. It does not create the trade. Fear & Greed and the headline score are inputs to that veto. |
+| Sentiment | alternative.me Crypto Fear & Greed; a fixed headline lexicon | Level and daily change. Extreme greed is the only gated test, and only if the ablation says it helps. |
 | Sizing | Kelly (1956), *Bell System Technical Journal* 35(4); Thorp (2006) on fractional Kelly | Quarter-Kelly from a stated prior, capped by the fixed 12% fraction. |
 | Overfitting check | Bailey and López de Prado (2014), *Journal of Portfolio Management* 40(5) | Deflated Sharpe with N = 6 families that were looked at before this rule was locked. Three walk-forward folds, no refit. |
 

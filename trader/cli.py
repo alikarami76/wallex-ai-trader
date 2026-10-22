@@ -9,7 +9,8 @@ import time
 from pathlib import Path
 
 from trader.config import load_config
-from trader.engine.backtest import run_backtest, run_walk_forward
+from trader.engine.backtest import run_backtest, run_walk_forward, sentiment_ablation
+from trader.sentiment import SentimentFeed
 from trader.engine.runtime import check_order, run_runtime
 from trader.engine.universe import select_universe
 from trader.report import build_report
@@ -90,8 +91,23 @@ def _run_backtest(cfg: dict, out: Path) -> None:
             stale.unlink()
     _write_candles(out / "candles", candles)
     _aggregation_check(client, out)
-    summary = run_backtest(cfg, candles, rules, unavailable, out)
-    walk = run_walk_forward(cfg, candles, rules, unavailable)
+    feed = SentimentFeed(cfg)
+    fear_greed = feed.load_history()
+    (out / "fear_greed.json").write_text(
+        json.dumps([{"t": t, "v": v, "label": label} for t, v, label in fear_greed]),
+        encoding="utf-8",
+    )
+    ablation = sentiment_ablation(cfg, candles, rules, unavailable, fear_greed)
+    (out / "sentiment_ablation.json").write_text(json.dumps(ablation, indent=2), encoding="utf-8")
+    if ablation.get("gate_helps"):
+        cfg.setdefault("sentiment", {})["block_extreme_greed"] = True
+        cfg.setdefault("validation", {})["n_trials"] = int((cfg.get("validation") or {}).get("n_trials", 6)) + 1
+        logging.info("fear & greed gate kept: the pre-specified ablation rule passed")
+    else:
+        cfg.setdefault("sentiment", {})["block_extreme_greed"] = False
+        logging.info("fear & greed gate left off: the ablation did not clear the pre-specified bar")
+    summary = run_backtest(cfg, candles, rules, unavailable, out, fear_greed=fear_greed)
+    walk = run_walk_forward(cfg, candles, rules, unavailable, fear_greed=fear_greed)
     walk["full_sample"] = summary.get("deflated_sharpe")
     (out / "walk_forward.json").write_text(json.dumps(walk, indent=2), encoding="utf-8")
     report = build_report(out, out, title="Wallex backtest")

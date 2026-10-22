@@ -19,9 +19,9 @@ cp .env.example .env
 | `WALLEX_SUBACCOUNT_ID` | optional | Sent as `sub-account-client-id` when the credit sub-account key needs it. |
 | `LLM_BASE_URL` | live/shadow AI | Default `https://ai.boxapi.ir/ai/v1`. |
 | `LLM_API_KEY` | live/shadow AI | BoxAPI bearer token. Empty means the deterministic fallback. |
-| `LLM_MODEL` | live/shadow AI | Default `gpt-5-mini`. Also allowed: `gpt-5.4-mini`, `gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol`. |
+| `LLM_MODEL` | live/shadow AI | Default `gpt-6-luna`. Also allowed: `gpt-5-mini`, `gpt-5.4-mini`, `gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol`. |
 
-`gpt-5-mini` rejects `temperature`. The client omits it unless `llm.send_temperature: true` in the YAML. Call and spend caps are in `config/default.yaml` (`max_llm_calls_per_hour: 2`, `max_llm_calls_total: 24`, `max_spend_usd: 2.50`). The competition budget is $3.
+The client omits `temperature` unless `llm.send_temperature: true` in the YAML. Spend uses the response field `usage.cost` when BoxAPI sends it. Call caps are in `config/default.yaml` (`max_llm_calls_per_hour: 2`, `max_llm_calls_total: 24`, `max_spend_usd: 2.50`). The competition budget is $3.
 
 ## Commands
 

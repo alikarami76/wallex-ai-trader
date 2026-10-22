@@ -21,6 +21,7 @@ def load_config(path: str | Path) -> dict:
     payload["exchange"].setdefault("timeout_seconds", 20)
     payload["exchange"].setdefault("max_retries", 4)
     llm = payload.setdefault("llm", {})
+    llm.setdefault("model", "gpt-6-luna")
     llm.setdefault("enabled", True)
     llm.setdefault("timeout_seconds", 20)
     llm.setdefault("send_temperature", False)

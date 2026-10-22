@@ -46,6 +46,7 @@ class Portfolio:
         self.positions: dict[str, Position] = {}
         self.realized_pnl = 0.0
         self.fees_paid = 0.0
+        self.closed_trades = 0
 
     def equity(self, marks: dict[str, float]) -> float:
         total = self.cash
@@ -140,6 +141,7 @@ class Portfolio:
         position.cost_tmn -= cost
         if position.qty <= 1e-10:
             del self.positions[symbol]
+            self.closed_trades += 1
         return Fill(
             symbol=symbol,
             side="SELL",

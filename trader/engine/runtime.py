@@ -20,6 +20,7 @@ from trader.engine.portfolio import Portfolio
 from trader.engine.state import load_state, save_state
 from trader.engine.universe import explain_universe, select_universe
 from trader.risk.manager import RiskManager, roll_day
+from trader.sentiment import SentimentFeed
 from trader.strategy.agent import TradingAgent
 from trader.strategy.quotes import inventory_skew, maker_buy_limit, maker_sell_limit
 from trader.strategy.signals import build_candidates, evaluate_symbol
@@ -73,6 +74,7 @@ def run_runtime(
             timeout=float(cfg["mcp"].get("timeout_seconds", 8)),
         )
     agent = TradingAgent(cfg, mcp=mcp)
+    sentiment = SentimentFeed(cfg)
     loop_seconds = float(interval if interval is not None else cfg["runtime"]["loop_interval_seconds"])
     deadline = time.time() + duration if duration else None
 
@@ -130,7 +132,7 @@ def run_runtime(
             _cycle(
                 cfg, mode, client, agent, risk, journal, state, state_path,
                 rules, unavailable, account_fees, universe, spreads, hourly, micro,
-                send_orders=send_orders,
+                send_orders=send_orders, sentiment=sentiment,
             )
             backoff = 1.0
         except KeyboardInterrupt:
@@ -160,7 +162,7 @@ def run_runtime(
 def _cycle(
     cfg, mode, client, agent, risk, journal, state, state_path,
     rules, unavailable, account_fees, universe, spreads, hourly, micro,
-    send_orders: bool,
+    send_orders: bool, sentiment: SentimentFeed | None = None,
 ) -> None:
     started = time.perf_counter()
     books = _books_for(client, universe)
@@ -187,6 +189,7 @@ def _cycle(
     if not state["day_key"]:
         state["day_key"], state["day_start_equity"] = roll_day("", now, equity_now)
 
+    mood = sentiment.snapshot(universe) if sentiment is not None else None
     feature_by_symbol = {}
     features = []
     for symbol in universe:
@@ -205,6 +208,11 @@ def _cycle(
                 micro_return=_micro_return(micro.get(symbol) or []),
                 maker_fee=maker,
                 taker_fee=taker,
+                fear_greed=None if mood is None else mood.fear_greed,
+                fear_greed_change=None if mood is None else mood.fear_greed_change,
+                news_score=None if mood is None else mood.news_score.get(symbol),
+                news_change=None if mood is None else mood.news_change.get(symbol),
+                news_headlines=None if mood is None else mood.headlines.get(symbol),
             )
         )
         feature_by_symbol[symbol] = features[-1]
@@ -276,6 +284,7 @@ def _cycle(
         "mode": mode,
         "dry_run": not send_orders,
         "latency_ms": round(latency_ms, 1),
+        "sentiment": None if mood is None else mood.public(),
         "equity_tmn": round(equity, 2),
         "positions": [p.to_dict() for p in portfolio.positions.values()],
         "features": [row.compact() for row in features],

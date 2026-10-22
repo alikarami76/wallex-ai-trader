@@ -1,7 +1,8 @@
 """LLM decision layer.
 
 One BoxAPI chat completion per cycle, with every symbol in that prompt.
-Temperature is omitted unless the config asks for it (gpt-5-mini rejects it).
+Temperature is omitted unless the config asks for it (some models reject it).
+The default model is gpt-6-luna. Spend uses usage.cost when BoxAPI sends it.
 A disk ledger caps calls per hour, calls for the whole run, and estimated
 spend. Cache hits, cap hits, timeouts, and bad JSON all use the deterministic
 fallback so the bot keeps trading inside the $3 budget.
@@ -34,7 +35,8 @@ Rules:
 - HOLD means abstain, not a veto. Use veto true on a symbol to reject that name only.
 - confidence is from 0 to 1. Below 0.55 a BUY confirmation is dropped.
 - You may CLOSE an existing position only when close is below ema_slow and roc_24h has turned negative.
-- Cite the numbers you used (slow return, 24h return, 4h pullback, half-spread, imbalance, cost) in rationale.
+- Cite the numbers you used (slow return, 24h return, 4h pullback, half-spread, imbalance, cost, fear_greed, news_score) in rationale.
+- fear_greed is 0-100. A missing sentiment field is not a reason to veto. Extreme greed (80 or above) or a sharply negative news_score is a reason to veto or cut size.
 - Never tell the engine to ignore a stop, the daily max-loss, or the liquidation window.
 
 Schema:
@@ -57,6 +59,7 @@ def llm_settings(cfg: dict) -> dict:
     raw.setdefault("cache_seconds", 3600)
     raw.setdefault("usage_path", "data/llm_usage.json")
     raw.setdefault("enabled", True)
+    raw.setdefault("model", "gpt-6-luna")
     return raw
 
 
@@ -137,14 +140,18 @@ class LlmClient:
         self.timeout = float(settings["timeout_seconds"])
         self._post = post or self._http
 
+    def model_name(self) -> str:
+        chosen = (os.getenv("LLM_MODEL") or "").strip()
+        return chosen or str(self.settings.get("model") or "gpt-6-luna")
+
     def configured(self) -> bool:
-        return bool(os.getenv("LLM_BASE_URL") and os.getenv("LLM_API_KEY") and os.getenv("LLM_MODEL"))
+        return bool(os.getenv("LLM_BASE_URL") and os.getenv("LLM_API_KEY") and self.model_name())
 
     def complete(self, system: str, user: str) -> tuple[str | None, dict]:
         """One request. Returns (content, usage). Never raises."""
         if not self.configured():
             return None, {"skipped": "llm env not set"}
-        model = os.environ["LLM_MODEL"]
+        model = self.model_name()
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         body = request_body(model, messages, self.settings)
         base = os.environ["LLM_BASE_URL"].rstrip("/")
@@ -160,11 +167,12 @@ class LlmClient:
             return None, {"error": str(exc), "model": model}
         usage = _price(usage, self.settings, model)
         log.info(
-            "llm call model=%s prompt_tokens=%s completion_tokens=%s est_usd=%.5f",
+            "llm call model=%s prompt_tokens=%s completion_tokens=%s usd=%.8f source=%s",
             model,
             usage.get("prompt_tokens"),
             usage.get("completion_tokens"),
             usage.get("usd") or 0,
+            usage.get("cost_source"),
         )
         return content, usage
 
@@ -181,6 +189,7 @@ class LlmClient:
         return choice, {
             "prompt_tokens": int(raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens") or 0),
             "completion_tokens": int(raw_usage.get("completion_tokens") or raw_usage.get("output_tokens") or 0),
+            "cost": raw_usage.get("cost"),
             "model": body.get("model"),
         }
 
@@ -197,20 +206,28 @@ def _cycle_key(features, candidates, positions, now: float) -> str:
 
 
 def _price(usage: dict, settings: dict, model: str) -> dict:
+    """Prefer BoxAPI usage.cost. Fall back to the token estimate only when it is absent."""
     prompt = int(usage.get("prompt_tokens") or 0)
     completion = int(usage.get("completion_tokens") or 0)
-    if prompt or completion:
+    cost = usage.get("cost")
+    if cost is not None and cost != "":
+        usd = float(cost)
+        source = "usage.cost"
+    elif prompt or completion:
         usd = (
             prompt / 1_000_000 * float(settings["assumed_input_usd_per_million"])
             + completion / 1_000_000 * float(settings["assumed_output_usd_per_million"])
         )
+        source = "estimated_tokens"
     else:
         usd = float(settings["assumed_usd_per_call_if_usage_missing"])
+        source = "flat_fallback"
     return {
         "model": usage.get("model") or model,
         "prompt_tokens": prompt,
         "completion_tokens": completion,
-        "usd": round(usd, 6),
+        "usd": round(usd, 8),
+        "cost_source": source,
     }
 
 
