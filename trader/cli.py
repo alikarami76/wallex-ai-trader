@@ -17,10 +17,11 @@ from trader.sentiment import SentimentFeed
 from trader.engine.runtime import check_order, run_runtime
 from trader.engine.universe import select_universe
 from trader.report import build_report
+from trader.scorecard import write_scorecard
 from trader.wallex.client import WallexClient, aggregate_bars, median_spacing
 
 
-_MODES = {"backtest", "shadow", "live", "report", "check-order", "replay"}
+_MODES = {"backtest", "shadow", "live", "report", "check-order", "replay", "scorecard"}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -45,7 +46,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--interval", type=float, default=None, help="seconds between decision cycles")
     parser.add_argument("--fresh", action="store_true", help="ignore saved shadow/live state")
     parser.add_argument("--out", default=None, help="output directory")
-    parser.add_argument("--log-dir", default=None, help="journal directory for report and replay")
+    parser.add_argument("--log-dir", default=None, help="journal directory for report, replay, and scorecard")
+    parser.add_argument("--candles", default=None, help="stored candle directory for the offline scorecard")
     parser.add_argument("--checkpoint", choices=["C0", "C1", "C2", "C3", "C4"], default=None)
     parser.add_argument("--operator-action", default=None)
     parser.add_argument("--operator-rule", default=None)
@@ -60,6 +62,14 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     cfg = load_config(args.config)
+    if args.mode == "scorecard":
+        log_dir = Path(args.log_dir or "results/shadow")
+        candles = Path(args.candles or "results/backtest/candles")
+        dest = Path(args.out or "results")
+        report = write_scorecard(log_dir, candles, cfg, dest)
+        print(dest / "scorecard.md")
+        print(json.dumps({key: report[key] for key in ("rows", "shadow_rows", "signals", "rules_pnl_tmn", "taken_pnl_tmn", "gap_tmn")}, indent=2))
+        return
     if args.mode == "backtest":
         out = Path(args.out or "results/backtest")
         _run_backtest(cfg, out)

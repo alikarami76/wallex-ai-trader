@@ -59,6 +59,7 @@ from trader.timeutil import iso, now_tehran
 from trader.types import Bar, MarketRule
 from trader.alerts import report_cycle
 from trader.order_guard import OrderIntent, assess
+from trader.scorecard import seal_signals
 from trader.wallex.client import SPOT_ORDER_PATH, WallexClient, WallexError
 from trader.wallex.mcp import WallexMcp
 from trader.wallex.precision import OrderRejected, round_price, round_qty
@@ -253,6 +254,7 @@ def _emit_contract(
     view, universe, unavailable, features, decision, planned, requests, fills, residuals,
     latency_ms, allowed, cutoff_reason, adjustment_rows, order_errors, order_rejects,
     entry_taker_fills, cancel_errors, b9_skips, maker_rate, taker_rate, hurdle, guard_blocks=None,
+    seals=None,
 ) -> None:
     """Append the contract logs. Rows are stamped and secrets are presence-only."""
     ops["cycle_seq"] = int(ops.get("cycle_seq") or 0) + 1
@@ -321,11 +323,17 @@ def _emit_contract(
         position = portfolio.positions.get(row.symbol)
         fill = next((item for item in fills if item.symbol == row.symbol), None)
         reject = next((item for item in planned.rejected if item.get("symbol") == row.symbol), None)
-        replay = getattr(decision, "replay", None) or {}
+        seal = next((item for item in (seals or []) if item.get("symbol") == row.symbol), None) or {}
         symbol_rows.append({
             "record": "symbol",
             "cycle_id": cycle_id,
             "symbol": row.symbol,
+            "prompt_hash": seal.get("prompt_hash"),
+            "response_hash": seal.get("response_hash"),
+            "action": seal.get("action"),
+            "size_mult": seal.get("size_mult"),
+            "disposition": seal.get("disposition"),
+            "signal": seal.get("signal"),
             "gate_trace": trace,
             "first_block": blocked,
             "cost_gate": cost_gate_view(row, cfg, maker=maker_rate, taker=taker_rate),
@@ -334,19 +342,20 @@ def _emit_contract(
                 "model": usage.get("model"),
                 "source": llm_source,
                 "confidence": next((item.confidence for item in decision.decisions if item.symbol == row.symbol), None),
-                "action": next((item.action for item in decision.decisions if item.symbol == row.symbol), None),
-                "size_mult": ops.get("size_multiplier"),
-                "veto": veto,
-                "prompt_hash": text_hash(replay.get("prompt") or "") if replay else None,
-                "response_hash": text_hash(replay.get("response") or "") if replay else None,
+                "action": seal.get("action"),
+                "size_mult": seal.get("size_mult"),
+                "veto": veto or seal.get("disposition") == "vetoed",
+                "prompt_hash": seal.get("prompt_hash"),
+                "response_hash": seal.get("response_hash"),
                 "tokens_in": usage.get("prompt_tokens"),
                 "tokens_out": usage.get("completion_tokens"),
                 "usage_cost_usd": usage.get("usd"),
+                "rationale": next((item.rationale for item in decision.decisions if item.symbol == row.symbol), decision.comment),
             },
             "risk": {
                 "verdict": "reject" if reject else "pass",
-                "size_before": None,
-                "size_after": ops.get("size_multiplier"),
+                "size_before": seal.get("size_before"),
+                "size_after": seal.get("size_after"),
                 "reason_codes": [reject["reason"]] if reject else [],
             },
             "liquidity": {
@@ -796,6 +805,13 @@ def _cycle(
     _run_actions(kept_actions, planned.rejected)
     planned.actions = list(protective) + kept_actions
     equity = portfolio.equity(marks) if marks else portfolio.cash
+    replay = getattr(decision, "replay", None) or {}
+    seals = seal_signals(
+        features, decision, planned, candidates, equity,
+        prompt=replay.get("prompt") or "",
+        response=replay.get("response") or "",
+        mode=mode,
+    )
     state["peak_equity"] = max(state["peak_equity"], equity)
     journal.equity({
         "timestamp": iso(now),
@@ -825,6 +841,7 @@ def _cycle(
         view, universe, unavailable, features, decision, planned, requests, fills, residuals,
         latency_ms, allowed, cutoff_reason, pre_rows + post_rows, order_errors, order_rejects,
         entry_taker_fills, cancel_errors, b9_skips, maker_rate, taker_rate, hurdle, guard_blocks,
+        seals,
     )
     journal.decision({
         "timestamp": iso(now),
@@ -837,6 +854,7 @@ def _cycle(
         "features": [row.compact() for row in features],
         "candidates": [row.compact() for row in candidates],
         "agent": decision.as_log(),
+        "sealed": seals,
         "llm_calls": [*sentiment_calls, decision.usage] if decision.usage else list(sentiment_calls),
         "risk": {
             "rejected": planned.rejected,
