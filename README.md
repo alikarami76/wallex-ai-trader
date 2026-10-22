@@ -24,9 +24,9 @@ cp .env.example .env
 | `LLM_MODEL` | unused | Ignored. It does not pin every tier. |
 | `LLM_MODEL_CHEAP` | optional | Overrides routine, signal, and trade. Default `openai/gpt-6-luna`. |
 | `LLM_MODEL_STRONG` | optional | Overrides the rare high-stakes tier. Default `openai/gpt-6-sol`. |
-| `DASHBOARD_USERS` | optional | JSON object of username to a bcrypt or sha256-salted password hash for the desk. |
-| `DASHBOARD_USER` | desk only | One extra HTTP basic user, beside `DASHBOARD_USERS`. |
-| `DASHBOARD_PASSWORD` | desk only | Password for that user. The page stays closed when no user is configured. |
+| `DASHBOARD_USERS` | optional | JSON object `{"username": "password"}` for several desk users. Compared in constant time. |
+| `DASHBOARD_USER` | desk only | Fallback HTTP basic user when `DASHBOARD_USERS` is unset. |
+| `DASHBOARD_PASSWORD` | desk only | Password for that fallback user. The page stays closed when no user is configured. |
 | `TELEGRAM_ALERT_BOT_TOKEN` | optional | Alert bot token. Alerts stay off unless this and the chat id are both set. |
 | `TELEGRAM_ALERT_CHAT_ID` | optional | Chat that receives alerts. The token is not written to the journal. |
 
@@ -85,7 +85,7 @@ python3 -m trader audit --log-dir results/shadow
 
 `./scripts/run.sh shadow --duration 900 --fresh` loads `.env` and calls the same CLI.
 
-Liara deployment is in [deploy/LIARA.md](deploy/LIARA.md). The image listens on port 8080. `/health` is open for the platform check. `/` is a read-only desk and `/status` is the latest cycle snapshot. Both accept `DASHBOARD_USERS` and, in addition, `DASHBOARD_USER` / `DASHBOARD_PASSWORD`. `python3 -m trader dashboard-hash <user>` reads a password from stdin and prints one JSON entry. The desk tails `cycles.jsonl`, `decisions.jsonl`, `adjustments.jsonl`, and `reviews.jsonl` on `TRADER_DATA_DIR`. It has no route that places or cancels orders, changes config, or starts or stops the loop. Secrets stay in `liara env set`.
+Liara deployment is in [deploy/LIARA.md](deploy/LIARA.md). The image listens on port 8080. `/health` is open for the platform check. `/` is a read-only desk and `/status` is the latest cycle snapshot. Both accept `DASHBOARD_USERS` (`{"username": "password"}`) and the `DASHBOARD_USER` / `DASHBOARD_PASSWORD` fallback. The desk tails `cycles.jsonl`, `decisions.jsonl`, `adjustments.jsonl`, and `reviews.jsonl` on `TRADER_DATA_DIR`. It has no route that places or cancels orders, changes config, or starts or stops the loop. Secrets stay in `liara env set`.
 
 ## Safety architecture
 

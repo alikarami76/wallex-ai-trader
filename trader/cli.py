@@ -31,9 +31,6 @@ def main(argv: list[str] | None = None) -> None:
         argv = sys.argv[1:]
     else:
         argv = list(argv)
-    if argv and argv[0] == "dashboard-hash":
-        from trader.dashboard import hash_dashboard_user
-        raise SystemExit(hash_dashboard_user(argv[1:]))
     if argv and argv[0] in _MODES:
         argv = ["--mode", *argv]
     parser = argparse.ArgumentParser(description="Wallex fee-aware AI trader")
