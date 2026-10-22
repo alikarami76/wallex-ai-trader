@@ -1,0 +1,597 @@
+"""Shadow and live loop.
+
+Shadow uses live public data and a paper portfolio. Live sends orders unless
+`--dry-run` is set, in which case the request is built and logged only.
+Both modes call the same signal, agent, and risk code as the backtest.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+
+from trader.config import wallex_credentials
+from trader.engine.backtest import _trade_row
+from trader.engine.journal import Journal
+from trader.engine.portfolio import Portfolio
+from trader.engine.state import load_state, save_state
+from trader.engine.universe import explain_universe, select_universe
+from trader.risk.manager import RiskManager, roll_day
+from trader.strategy.agent import TradingAgent
+from trader.strategy.signals import build_candidates, evaluate_symbol
+from trader.timeutil import iso, now_tehran
+from trader.types import Bar, MarketRule
+from trader.wallex.client import WallexClient, WallexError
+from trader.wallex.mcp import WallexMcp
+from trader.wallex.precision import OrderRejected, round_price, round_qty
+
+log = logging.getLogger("trader.runtime")
+
+
+def run_runtime(
+    cfg: dict,
+    *,
+    mode: str,
+    out_dir: Path,
+    duration: float | None,
+    once: bool,
+    dry_run: bool,
+    interval: float | None,
+    fresh: bool,
+) -> None:
+    if mode not in {"shadow", "live"}:
+        raise ValueError(mode)
+    api_key, subaccount = wallex_credentials()
+    send_orders = mode == "live" and not dry_run
+    if send_orders and not api_key:
+        raise SystemExit("live mode needs WALLEX_API_KEY. Use --dry-run to build requests without sending.")
+
+    client = WallexClient(
+        base_url=cfg["exchange"]["base_url"],
+        api_key=api_key,
+        subaccount_id=subaccount,
+        timeout=float(cfg["exchange"]["timeout_seconds"]),
+        max_retries=int(cfg["exchange"]["max_retries"]),
+        dry_run=not send_orders,
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    state_path = out_dir / "state.json"
+    if fresh and state_path.exists():
+        state_path.unlink()
+    state = load_state(state_path, float(cfg["account"]["initial_equity_tmn"]))
+    journal = Journal(out_dir)
+    risk = RiskManager(cfg)
+    mcp = None
+    if cfg.get("mcp", {}).get("enabled", False):
+        mcp = WallexMcp(
+            url=cfg["mcp"].get("url", "https://api.wallex.ir/mcp"),
+            api_key=api_key,
+            timeout=float(cfg["mcp"].get("timeout_seconds", 8)),
+        )
+    agent = TradingAgent(cfg, mcp=mcp)
+    loop_seconds = float(interval if interval is not None else cfg["runtime"]["loop_interval_seconds"])
+    deadline = time.time() + duration if duration else None
+
+    rules = _load_rules(client)
+    unavailable = _load_bans(client, int(cfg["exchange"]["package_id"]))
+    account_fees: dict[str, tuple[float, float]] = {}
+    if send_orders:
+        try:
+            account_fees = client.get_fees()
+            log.info("loaded account fees for %s symbols", len(account_fees))
+        except WallexError as exc:
+            log.warning("account fee endpoint unavailable, using config fees: %s", exc)
+        _reconcile(client, state, rules)
+
+    universe, spreads = _refresh_universe(client, cfg, rules, unavailable)
+    log.info("universe: %s", universe)
+    journal.decision({
+        "timestamp": iso(),
+        "mode": mode,
+        "event": "startup",
+        "dry_run": not send_orders,
+        "universe": universe,
+        "universe_audit": explain_universe(cfg, rules, unavailable, spreads),
+        "banned_count": len(unavailable),
+        "subaccount_header": bool(subaccount),
+    })
+    if mcp is not None and universe:
+        probe = mcp.call_tool(
+            "wallex_basic_candle_history",
+            {"symbol": universe[0], "resolution": "60", "from": int(time.time()) - 6 * 3600, "to": int(time.time())},
+        )
+        journal.decision({
+            "timestamp": iso(),
+            "mode": mode,
+            "event": "mcp_probe",
+            "tool": "wallex_basic_candle_history",
+            "ok": bool(probe),
+            "excerpt": (probe or "")[:400],
+        })
+    hourly, micro = _load_history(client, universe, cfg)
+    markets_at = time.time()
+    candles_at = time.time()
+    backoff = 1.0
+
+    while True:
+        try:
+            if time.time() - markets_at > 300:
+                rules = _load_rules(client)
+                unavailable = _load_bans(client, int(cfg["exchange"]["package_id"]))
+                universe, spreads = _refresh_universe(client, cfg, rules, unavailable)
+                markets_at = time.time()
+            if time.time() - candles_at > float(cfg["runtime"]["candle_refresh_seconds"]):
+                hourly, micro = _load_history(client, universe, cfg, previous=hourly)
+                candles_at = time.time()
+            _cycle(
+                cfg, mode, client, agent, risk, journal, state, state_path,
+                rules, unavailable, account_fees, universe, spreads, hourly, micro,
+                send_orders=send_orders,
+            )
+            backoff = 1.0
+        except KeyboardInterrupt:
+            log.info("stopped by user")
+            save_state(state_path, state)
+            break
+        except Exception as exc:
+            log.exception("cycle failed")
+            journal.decision({
+                "timestamp": iso(),
+                "mode": mode,
+                "event": "error",
+                "error": str(exc),
+                "traceback": traceback.format_exc()[-2000:],
+            })
+            save_state(state_path, state)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+        if once:
+            break
+        if deadline is not None and time.time() >= deadline:
+            break
+        time.sleep(loop_seconds)
+    journal.close()
+
+
+def _cycle(
+    cfg, mode, client, agent, risk, journal, state, state_path,
+    rules, unavailable, account_fees, universe, spreads, hourly, micro,
+    send_orders: bool,
+) -> None:
+    books = {}
+    for symbol in universe:
+        try:
+            books[symbol] = client.get_depth(symbol)
+        except WallexError as exc:
+            log.warning("depth %s failed: %s", symbol, exc)
+    marks = {}
+    for symbol in universe:
+        book = books.get(symbol)
+        if book and book.mid:
+            marks[symbol] = book.mid
+        elif hourly.get(symbol):
+            marks[symbol] = hourly[symbol][-1].close
+    for symbol, position in state["portfolio"].positions.items():
+        marks.setdefault(symbol, position.entry_price)
+    portfolio: Portfolio = state["portfolio"]
+    if state.get("pending"):
+        _sync_pending(client, portfolio, state)
+    portfolio.mark_peaks(marks)
+    now = now_tehran()
+    now_unix = time.time()
+    equity_now = portfolio.equity(marks) if marks else portfolio.cash
+    state["day_key"], state["day_start_equity"] = roll_day(state["day_key"], now, equity_now)
+    if not state["day_key"]:
+        state["day_key"], state["day_start_equity"] = roll_day("", now, equity_now)
+
+    features = []
+    for symbol in universe:
+        bars = _closed(hourly.get(symbol) or [], 3600)
+        if not bars:
+            continue
+        book = books.get(symbol)
+        maker, taker = _fee_pair(cfg, rules.get(symbol), account_fees.get(symbol))
+        features.append(
+            evaluate_symbol(
+                symbol,
+                bars,
+                cfg,
+                spread_bps=book.spread_bps if book else spreads.get(symbol),
+                imbalance=book.imbalance() if book else None,
+                micro_return=_micro_return(micro.get(symbol) or []),
+                maker_fee=maker,
+                taker_fee=taker,
+            )
+        )
+    candidates = build_candidates(features, cfg)
+    view = risk.view(
+        portfolio, marks, now,
+        peak_equity=state["peak_equity"],
+        day_start_equity=state["day_start_equity"],
+        kill_switch=state["kill_switch"],
+        kill_reason=state["kill_reason"],
+    )
+    state["peak_equity"] = view.peak_equity
+    state["kill_switch"] = view.kill_switch
+    state["kill_reason"] = view.kill_reason
+    decision = agent.decide(
+        features, candidates,
+        [p.to_dict() for p in portfolio.positions.values()],
+        view.compact(), now_unix,
+    )
+    planned = risk.plan(
+        portfolio=portfolio,
+        agent=decision,
+        candidates=candidates,
+        marks=marks,
+        rules=rules,
+        unavailable=unavailable,
+        now=now,
+        view=view,
+        order_times=state["order_times"],
+        cooldowns={k: float(v) for k, v in state["cooldowns"].items()},
+        now_unix=now_unix,
+    )
+    fills = []
+    requests = []
+    pending_symbols = {row.get("symbol") for row in state.get("pending", {}).values()}
+    for action in planned.actions:
+        if action.symbol in pending_symbols:
+            planned.rejected.append({"symbol": action.symbol, "reason": "an order for this symbol is already working"})
+            continue
+        try:
+            fill, request = _execute(
+                cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees,
+            )
+        except (WallexError, OrderRejected) as exc:
+            planned.rejected.append({"symbol": action.symbol, "reason": str(exc)})
+            continue
+        if request:
+            requests.append(request)
+        if fill:
+            fills.append(fill)
+            state["order_times"].append(now_unix)
+            journal.trade(_trade_row(fill, now, mode))
+            if fill.side == "SELL" and action.source == "stop":
+                state["cooldowns"][action.symbol] = now_unix + float(cfg["risk"]["cooldown_after_stop_seconds"])
+    equity = portfolio.equity(marks) if marks else portfolio.cash
+    state["peak_equity"] = max(state["peak_equity"], equity)
+    journal.equity({
+        "timestamp": iso(now),
+        "equity_tmn": round(equity, 2),
+        "cash_tmn": round(portfolio.cash, 2),
+        "exposure": round(portfolio.exposure(marks) if marks else 0, 4),
+        "drawdown": round(view.drawdown, 5),
+        "peak_tmn": round(state["peak_equity"], 2),
+    })
+    journal.decision({
+        "timestamp": iso(now),
+        "mode": mode,
+        "dry_run": not send_orders,
+        "equity_tmn": round(equity, 2),
+        "positions": [p.to_dict() for p in portfolio.positions.values()],
+        "features": [row.compact() for row in features],
+        "candidates": [row.compact() for row in candidates],
+        "agent": decision.as_log(),
+        "risk": {
+            "rejected": planned.rejected,
+            "actions": [a.__dict__ for a in planned.actions],
+            "view": planned.view.compact(),
+        },
+        "requests": requests,
+        "fills": [f.__dict__ for f in fills],
+    })
+    save_state(state_path, state)
+    log.info(
+        "%s equity=%.0f exposure=%.1f%% phase=%s candidates=%s actions=%s source=%s",
+        mode, equity, view.gross_exposure * 100, view.phase, len(candidates),
+        len(planned.actions), decision.source,
+    )
+
+
+def _execute(cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees):
+    rule: MarketRule | None = rules.get(action.symbol)
+    if rule is None:
+        raise OrderRejected(f"no market rules for {action.symbol}")
+    book = books.get(action.symbol)
+    mark = marks.get(action.symbol) or rule.last_price
+    maker, taker = _fee_pair(cfg, rule, account_fees.get(action.symbol))
+    client_id = _next_id(state)
+    if action.side == "BUY":
+        ask = book.best_ask if book and book.best_ask else mark
+        direction = "up"
+        raw_price = ask
+        price = float(round_price(raw_price, rule.price_decimals, direction))
+        notional = portfolio.equity(marks) * action.size_fraction
+        qty = float(round_qty(notional / price, rule.qty_decimals))
+        prepared = client.prepare_order(
+            symbol=action.symbol, side="BUY", order_type="LIMIT", quantity=qty, price=price,
+            client_id=client_id, rule=rule, price_direction=direction,
+        )
+        request = prepared.redacted()
+        if send_orders:
+            client.place_order(
+                symbol=action.symbol, side="BUY", order_type="LIMIT", quantity=qty, price=price,
+                client_id=client_id, rule=rule, price_direction=direction,
+            )
+            filled = _consume_live_order(client, client_id)
+            fill = None
+            if filled and filled.executed_qty > 0:
+                fill_price = filled.executed_price or price
+                fill = portfolio.buy(
+                    symbol=action.symbol, price=fill_price, qty=filled.executed_qty, fee_rate=taker,
+                    time=int(time.time()),
+                    stop_price=fill_price * (1 - float(cfg["risk"]["stop_loss_pct"])),
+                    setup="uptrend_pullback", reason=action.reason, client_id=client_id, order_type="LIMIT",
+                )
+            else:
+                try:
+                    client.cancel_order(client_id)
+                except WallexError as exc:
+                    log.warning("cancel unfilled buy %s failed: %s", client_id, exc)
+            return fill, request
+        fee = taker if cfg["execution"]["entry"] == "marketable_limit" else maker
+        fill = portfolio.buy(
+            symbol=action.symbol, price=price, qty=qty, fee_rate=fee, time=int(time.time()),
+            stop_price=price * (1 - float(cfg["risk"]["stop_loss_pct"])),
+            setup="uptrend_pullback", reason=action.reason, client_id=client_id, order_type="LIMIT",
+        )
+        return fill, request
+
+    position = portfolio.positions.get(action.symbol)
+    if position is None:
+        return None, None
+    aggressive = action.aggressive or action.order_type == "MARKET"
+    use_market = aggressive and rule.market_orders_enabled and action.order_type == "MARKET"
+    if use_market:
+        prepared = client.prepare_order(
+            symbol=action.symbol, side="SELL", order_type="MARKET", quantity=position.qty,
+            price=None, client_id=client_id, rule=rule, price_direction="down",
+        )
+        request = prepared.redacted()
+        price = (book.best_bid if book and book.best_bid else mark) * (1 - float(cfg["execution"]["stop_slippage_bps"]) / 10_000)
+        fee = taker
+        order_type = "MARKET"
+    else:
+        if aggressive:
+            raw = (book.best_bid if book and book.best_bid else mark) * (1 - 0.003)
+            direction = "down"
+        else:
+            raw = book.best_ask if book and book.best_ask else mark
+            direction = "up"
+        price = float(round_price(raw, rule.price_decimals, direction))
+        prepared = client.prepare_order(
+            symbol=action.symbol, side="SELL", order_type="LIMIT", quantity=position.qty,
+            price=price, client_id=client_id, rule=rule, price_direction=direction,
+        )
+        request = prepared.redacted()
+        fee = taker if aggressive else maker
+        order_type = "LIMIT"
+        if send_orders:
+            client.place_order(
+                symbol=action.symbol, side="SELL", order_type=order_type,
+                quantity=position.qty, price=None if use_market else price,
+                client_id=client_id, rule=rule, price_direction="down" if aggressive else "up",
+            )
+            filled = _consume_live_order(client, client_id)
+            fill = None
+            if filled and filled.executed_qty > 0 and action.symbol in portfolio.positions:
+                fill = portfolio.sell(
+                    symbol=action.symbol, price=filled.executed_price or price, fee_rate=fee,
+                    reason=action.reason, client_id=client_id, order_type=order_type,
+                    qty=min(filled.executed_qty, portfolio.positions[action.symbol].qty),
+                )
+            elif not aggressive:
+                state["pending"][client_id] = {
+                    "symbol": action.symbol, "side": "SELL", "price": price, "fee": fee,
+                    "reason": action.reason, "order_type": order_type, "created": time.time(),
+                }
+            return fill, request
+    fill = portfolio.sell(
+        symbol=action.symbol, price=price, fee_rate=fee, reason=action.reason,
+        client_id=client_id, order_type=order_type,
+    )
+    return fill, request
+
+
+def _sync_pending(client: WallexClient, portfolio: Portfolio, state: dict) -> None:
+    """Apply fills for resting exits and cancel them once they are done or stale."""
+    for client_id, meta in list(state.get("pending", {}).items()):
+        order = _consume_live_order(client, client_id)
+        if order is None:
+            continue
+        position = portfolio.positions.get(meta["symbol"])
+        if order.executed_qty > 0 and position is not None:
+            portfolio.sell(
+                symbol=meta["symbol"],
+                price=order.executed_price or float(meta.get("price") or position.entry_price),
+                fee_rate=float(meta.get("fee") or 0),
+                reason=meta.get("reason") or "resting order fill",
+                client_id=client_id,
+                order_type=order.order_type or meta.get("order_type") or "LIMIT",
+                qty=min(order.executed_qty, position.qty),
+            )
+        age = time.time() - float(meta.get("created") or time.time())
+        if not order.active or age > 600:
+            if order.active:
+                try:
+                    client.cancel_order(client_id)
+                except WallexError as exc:
+                    log.warning("cancel %s failed: %s", client_id, exc)
+            state["pending"].pop(client_id, None)
+
+
+def _consume_live_order(client: WallexClient, client_id: str):
+    try:
+        return client.get_order(client_id)
+    except WallexError as exc:
+        log.warning("could not read order %s: %s", client_id, exc)
+        return None
+
+
+def _reconcile(client: WallexClient, state: dict, rules: dict[str, MarketRule]) -> None:
+    balances = client.get_balances()
+    portfolio: Portfolio = state["portfolio"]
+    tmn = balances.get("TMN")
+    if tmn is not None:
+        portfolio.cash = tmn.available
+    seen = set()
+    for asset, balance in balances.items():
+        if asset == "TMN" or balance.available <= 0:
+            continue
+        symbol = asset if asset.endswith("TMN") else f"{asset}TMN"
+        seen.add(symbol)
+        if symbol in portfolio.positions:
+            portfolio.positions[symbol].qty = balance.available
+            continue
+        rule = rules.get(symbol)
+        last = rule.last_price if rule else 0
+        if last <= 0:
+            continue
+        portfolio.positions[symbol] = portfolio.positions.get(symbol) or _adopt(symbol, balance.available, last)
+    for symbol in list(portfolio.positions):
+        if symbol not in seen:
+            log.info("reconcile dropped %s; exchange balance is zero", symbol)
+            del portfolio.positions[symbol]
+    try:
+        open_orders = client.get_open_orders()
+    except WallexError as exc:
+        log.warning("open orders reconcile failed: %s", exc)
+        open_orders = []
+    state["pending"] = {
+        order.client_order_id: {"symbol": order.symbol, "side": order.side, "status": order.status}
+        for order in open_orders
+    }
+    log.info("reconciled cash=%s positions=%s open_orders=%s", portfolio.cash, list(portfolio.positions), len(open_orders))
+
+
+def _adopt(symbol: str, qty: float, last: float):
+    from trader.engine.portfolio import Position
+
+    return Position(
+        symbol=symbol, qty=qty, entry_price=last, entry_time=int(time.time()),
+        cost_tmn=qty * last, stop_price=last * 0.955, peak_price=last,
+        setup="reconcile", reason="adopted from exchange balance on startup",
+    )
+
+
+def _load_rules(client: WallexClient) -> dict[str, MarketRule]:
+    rules = client.get_markets()
+    if not rules:
+        raise WallexError("market list was empty")
+    return rules
+
+
+def _load_bans(client: WallexClient, package_id: int) -> set[str]:
+    last_error: Exception | None = None
+    for _ in range(3):
+        try:
+            return client.get_unavailable_markets(package_id)
+        except WallexError as exc:
+            last_error = exc
+            time.sleep(1)
+    raise SystemExit(f"refusing to trade without the credit-plan ban list: {last_error}")
+
+
+def _refresh_universe(client, cfg, rules, unavailable):
+    preliminary = []
+    for symbol in cfg["universe"]["candidates"]:
+        rule = rules.get(symbol.upper())
+        if rule and symbol.upper() not in unavailable and rule.quote_asset == "TMN":
+            preliminary.append(symbol.upper())
+    spreads = {}
+    for symbol in preliminary:
+        try:
+            book = client.get_depth(symbol)
+        except WallexError:
+            continue
+        if book.spread_bps is not None:
+            spreads[symbol] = book.spread_bps
+    universe = select_universe(cfg, rules, unavailable, spreads)
+    return universe, spreads
+
+
+def _load_history(client, universe, cfg, previous: dict | None = None) -> tuple[dict, dict]:
+    end = int(time.time())
+    start = end - int(float(cfg["runtime"]["history_days"]) * 86400)
+    micro_start = end - 36 * 3600
+    hourly: dict[str, list[Bar]] = {}
+    micro: dict[str, list[Bar]] = {}
+    for symbol in universe:
+        try:
+            hourly[symbol] = client.get_ohlcv(symbol, "1h", start, end)
+        except WallexError as exc:
+            log.warning("hourly history %s failed: %s", symbol, exc)
+            hourly[symbol] = (previous or {}).get(symbol) or []
+        try:
+            micro[symbol] = client.get_ohlcv(symbol, "15m", micro_start, end)
+        except WallexError as exc:
+            log.warning("15m history %s failed: %s", symbol, exc)
+            micro[symbol] = []
+    return hourly, micro
+
+
+def _closed(bars: list[Bar], bucket: int) -> list[Bar]:
+    now = int(time.time())
+    return [bar for bar in bars if bar.time + bucket <= now]
+
+
+def _micro_return(bars: list[Bar]) -> float | None:
+    closed = _closed(bars, 900)
+    if len(closed) < 2 or closed[-2].close == 0:
+        return None
+    return closed[-1].close / closed[-2].close - 1
+
+
+def _fee_pair(cfg, rule, account) -> tuple[float, float]:
+    if rule is not None and rule.is_zero_fee:
+        return 0.0, 0.0
+    if account:
+        return account
+    return float(cfg["fees"]["maker_rate"]), float(cfg["fees"]["taker_rate"])
+
+
+def _next_id(state) -> str:
+    state["client_seq"] = int(state.get("client_seq") or 0) + 1
+    return f"SC{int(time.time())}{state['client_seq']}"
+
+
+def _public_response(response: dict) -> dict:
+    result = response.get("result") or {}
+    return {
+        "clientOrderId": result.get("clientOrderId"),
+        "status": result.get("status"),
+        "executedQty": result.get("executedQty"),
+        "dry_run": response.get("dry_run", False),
+    }
+
+
+def check_order(cfg: dict, symbol: str, side: str, notional: float) -> dict:
+    """Build one order body from live market rules and do not send it."""
+    api_key, subaccount = wallex_credentials()
+    client = WallexClient(
+        base_url=cfg["exchange"]["base_url"],
+        api_key=api_key,
+        subaccount_id=subaccount,
+        dry_run=True,
+    )
+    rules = client.get_markets()
+    unavailable = client.get_unavailable_markets(int(cfg["exchange"]["package_id"]))
+    symbol = symbol.upper()
+    if symbol in unavailable:
+        raise SystemExit(f"{symbol} is on the credit-plan banned list")
+    rule = rules[symbol]
+    book = client.get_depth(symbol)
+    price = book.best_ask if side.upper() == "BUY" else book.best_bid
+    if not price:
+        raise SystemExit(f"no top of book for {symbol}")
+    direction = "up" if side.upper() == "BUY" else "down"
+    qty = notional / price
+    prepared = client.prepare_order(
+        symbol=symbol, side=side.upper(), order_type="LIMIT", quantity=qty, price=price,
+        client_id=f"SCCHECK{int(time.time())}", rule=rule, price_direction=direction,
+    )
+    return prepared.redacted()
