@@ -35,6 +35,7 @@ from trader.engine.ops import (
     apply_frozen_cost_gate,
     attach_evidence,
     cost_gate_view,
+    clock_status,
     entries_allowed,
     emit_cycle_logs,
     first_block,
@@ -138,6 +139,7 @@ def run_runtime(
         state_path=str(state_path),
         started_at=iso(),
         positions=[row.symbol for row in state["portfolio"].positions.values()],
+        **clock_status(cfg),
     )
     log.info("starting %s dry_run=%s data=%s", mode, not send_orders, out_dir)
     warning = llm_override_warning()
@@ -1066,6 +1068,7 @@ def _cycle(
         ],
         residuals=residuals,
         last_error="",
+        **clock_status(cfg),
     )
     log.info(
         "%s state=%s equity=%.0f exposure=%.1f%% phase=%s candidates=%s actions=%s source=%s tier=%s pick=%s",

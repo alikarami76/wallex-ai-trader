@@ -147,6 +147,14 @@ def entry_cutoff(cfg: dict) -> datetime:
     return parse_ts(str(raw))
 
 
+def clock_status(cfg: dict) -> dict:
+    """Configured entry cutoff and max hold. max_hold is risk.time_stop_hours."""
+    return {
+        "entry_cutoff": entry_cutoff(cfg).isoformat(),
+        "max_hold": (cfg.get("risk") or {}).get("time_stop_hours"),
+    }
+
+
 def git_sha() -> str:
     global _GIT_SHA
     if _GIT_SHA:

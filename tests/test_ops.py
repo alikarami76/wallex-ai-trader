@@ -239,6 +239,16 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(CHECKPOINT_START["C3"], "2026-10-23T21:00:00+03:30")
         self.assertEqual(CHECKPOINT_END["C3"], "2026-10-23T22:30:00+03:30")
         self.assertEqual(CHECKPOINT_END["C4"], "2026-10-23T08:00:00+03:30")
+        from trader.engine.ops import clock_status, config_file_hash
+
+        self.assertEqual(
+            config_file_hash("config/default.yaml"),
+            "a589f0d17499650c8b281b9b079def4215bc7f5d66fb3c88d6c2637adef1e1cc",
+        )
+        self.assertEqual(clock_status(loaded), {
+            "entry_cutoff": "2026-10-23T21:00:00+03:30",
+            "max_hold": 6,
+        })
 
     def test_approved_config_hash_refreezes_without_clearing_ev_override(self):
         from trader.engine.ops import git_sha

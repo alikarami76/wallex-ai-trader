@@ -141,7 +141,7 @@ liquidation:
   start_before_minutes: 60
   aggressive_before_minutes: 30
   flat_by: "2026-10-23T23:30:00+03:30"
-  # 23:30 flat minus the Fri 21:00 entry cutoff. A longer gap would close entries early.
+  # 23:30 flat minus the Fri 21:00 entry cutoff. A shorter gap would close entries early.
   min_hours_to_enter: 2.5
 
 ops:

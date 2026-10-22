@@ -85,7 +85,7 @@ python3 -m trader audit --log-dir results/shadow
 
 `./scripts/run.sh shadow --duration 900 --fresh` loads `.env` and calls the same CLI.
 
-Liara deployment is in [deploy/LIARA.md](deploy/LIARA.md). The image listens on port 8080. `/health` is open for the platform check. `/` is a read-only desk and `/status` is the latest cycle snapshot. Both accept `DASHBOARD_USERS` (`{"username": "password"}`) and the `DASHBOARD_USER` / `DASHBOARD_PASSWORD` fallback. The desk tails `cycles.jsonl`, `decisions.jsonl`, `adjustments.jsonl`, and `reviews.jsonl` on `TRADER_DATA_DIR`. It has no route that places or cancels orders, changes config, or starts or stops the loop. Secrets stay in `liara env set`.
+Liara deployment is in [deploy/LIARA.md](deploy/LIARA.md). The image listens on port 8080. `/health` is open for the platform check. `/` is a read-only desk and `/status` is the latest cycle snapshot, including `entry_cutoff` and `max_hold`. Both accept `DASHBOARD_USERS` (`{"username": "password"}`) and the `DASHBOARD_USER` / `DASHBOARD_PASSWORD` fallback. The desk tails `cycles.jsonl`, `decisions.jsonl`, `adjustments.jsonl`, and `reviews.jsonl` on `TRADER_DATA_DIR`. It has no route that places or cancels orders, changes config, or starts or stops the loop. Secrets stay in `liara env set`.
 
 ## Safety architecture
 

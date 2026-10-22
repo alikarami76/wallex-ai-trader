@@ -115,7 +115,7 @@ liara stop --app wallex-ai-trader
 liara start --app wallex-ai-trader
 ```
 
-After deploy, `https://wallex-ai-trader.liara.run/health` returns `{"ok": true}` with no credentials. `/` is one auto-refreshing HTML page. `/status` returns the mode, whether orders are dry-run, equity, open symbols, and the last cycle time. Both require HTTP basic auth. `DASHBOARD_USERS` is a JSON object of username to password, for example `{"ada":"...","ben":"..."}`. Each password is compared with `hmac.compare_digest`. `DASHBOARD_USER` and `DASHBOARD_PASSWORD` remain the single-user fallback, and they still work when the JSON map is also set. If neither is configured, those routes return 401 and `/health` still returns 200. Each successful access logs `dashboard login user=<name>` and the page says `logged in as <name>`. The password is not logged. The page reads only `cycles.jsonl`, `decisions.jsonl`, `adjustments.jsonl`, and `reviews.jsonl` on the disk. It shows key presence, never key values, and it has no route that places or cancels orders, changes config, flips a flag, or starts or stops trading.
+After deploy, `https://wallex-ai-trader.liara.run/health` returns `{"ok": true}` with no credentials. `/` is one auto-refreshing HTML page. `/status` returns the mode, whether orders are dry-run, equity, open symbols, the last cycle time, `entry_cutoff`, and `max_hold` (the configured `time_stop_hours`). The desk shows the same cutoff and hold. Both require HTTP basic auth. `DASHBOARD_USERS` is a JSON object of username to password, for example `{"ada":"...","ben":"..."}`. Each password is compared with `hmac.compare_digest`. `DASHBOARD_USER` and `DASHBOARD_PASSWORD` remain the single-user fallback, and they still work when the JSON map is also set. If neither is configured, those routes return 401 and `/health` still returns 200. Each successful access logs `dashboard login user=<name>` and the page says `logged in as <name>`. The password is not logged. The page reads only `cycles.jsonl`, `decisions.jsonl`, `adjustments.jsonl`, and `reviews.jsonl` on the disk. It shows key presence, never key values, and it has no route that places or cancels orders, changes config, flips a flag, or starts or stops trading.
 
 A restart keeps `/data` because that path is the disk. The decision log is `decisions.jsonl`. Positions and the kill switch are `state.json`. Both sit on the disk. `state.json` `ops` also stores `go_live_sha`, `config_hash`, and `ev_override`.
 
@@ -126,13 +126,13 @@ The live book is already locked. A new image whose `config/default.yaml` hash di
 ```bash
 sha256sum config/default.yaml
 liara env set --app wallex-ai-trader --force \
-  TRADER_APPROVED_CONFIG_HASH=f363d1f6cc5a78a4daa857672eb5ce2cbc76e2d3b2b2901f9f1f1d467b0ebacc \
+  TRADER_APPROVED_CONFIG_HASH=a589f0d17499650c8b281b9b079def4215bc7f5d66fb3c88d6c2637adef1e1cc \
   TRADER_GIT_SHA="<deployed commit>" \
   TRADER_EV_OVERRIDE=1 \
   TRADER_LIVE_AUTHORIZED=1
 ```
 
-`f363d1f6cc5a78a4daa857672eb5ce2cbc76e2d3b2b2901f9f1f1d467b0ebacc` is the SHA-256 of this image's `config/default.yaml`. Recompute it if the file changes. `TRADER_GIT_SHA` is the commit you deploy.
+`a589f0d17499650c8b281b9b079def4215bc7f5d66fb3c88d6c2637adef1e1cc` is the SHA-256 of this image's `config/default.yaml`. It is the file that was hot-deployed with the Fri 21:00 cutoff and `min_hours_to_enter: 2.5`. Recompute it if the file changes. `TRADER_GIT_SHA` is the commit you deploy.
 
 The image has no git metadata. Without `TRADER_GIT_SHA` the lock stores `unknown`. Set that variable to the commit being deployed before the new process starts, and do not wipe `/data/state.json`.
 

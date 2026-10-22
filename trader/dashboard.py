@@ -82,6 +82,10 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
 
         payload = scrub(snapshot())
         payload["ok"] = True
+        clock = _shown_clock()
+        for key in ("entry_cutoff", "max_hold"):
+            if payload.get(key) in (None, ""):
+                payload[key] = clock.get(key)
         return payload
 
     return app
@@ -227,7 +231,7 @@ def render_page(desk: dict, user: str = "") -> str:
         f"<h1>Desk</h1><p class='sub'>{_esc(latest.get('ts_tehran') or 'waiting for the first cycle')}</p>"
         f"<p class='who'>logged in as {_esc(user)}</p></header>",
         "<main>",
-        _state_panel(latest, mismatch, go_live, running),
+        _state_panel(latest, mismatch, go_live, running, _shown_clock()),
         _book_panel(latest, desk, pnl),
         _curve_panel(desk["cycles"]),
         _feed_panel(desk),
@@ -506,7 +510,28 @@ def _refresh_script() -> str:
 """
 
 
-def _state_panel(latest: dict, mismatch: bool, go_live: str, running: str) -> str:
+def _shown_clock() -> dict:
+    """Prefer the running snapshot, then the config file on disk."""
+    from trader.health import snapshot
+    from trader.config import load_config
+    from trader.engine.ops import clock_status
+
+    current = snapshot()
+    path = os.getenv("TRADER_CONFIG", "config/default.yaml")
+    try:
+        configured = clock_status(load_config(path))
+    except (OSError, ValueError):
+        configured = {"entry_cutoff": None, "max_hold": None}
+    hold = current.get("max_hold")
+    if hold is None:
+        hold = configured.get("max_hold")
+    return {
+        "entry_cutoff": current.get("entry_cutoff") or configured.get("entry_cutoff"),
+        "max_hold": hold,
+    }
+
+
+def _state_panel(latest: dict, mismatch: bool, go_live: str, running: str, clock: dict | None = None) -> str:
     sha_class = "mismatch" if mismatch else "num"
     age = _age(latest.get("ts_utc"))
     cards = [
@@ -537,7 +562,18 @@ def _state_panel(latest: dict, mismatch: bool, go_live: str, running: str) -> st
     )
     if latest.get("cutoff_reason"):
         meta += f" · cutoff {_esc(latest.get('cutoff_reason'))}"
-    return f"<section class='grid'>{body}</section><p class='meta'>{presence}. {meta}.</p>"
+    clock = clock or {}
+    hold = clock.get("max_hold")
+    hold_text = "—" if hold is None else _esc(hold)
+    clock_line = (
+        f"entry_cutoff {_esc(clock.get('entry_cutoff') or '—')}"
+        f" · max_hold {hold_text}"
+    )
+    return (
+        f"<section class='grid'>{body}</section>"
+        f"<p class='meta'>{presence}. {meta}.</p>"
+        f"<p class='meta'>{clock_line}</p>"
+    )
 
 
 def _book_panel(latest: dict, desk: dict, pnl) -> str:

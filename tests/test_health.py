@@ -37,6 +37,8 @@ class HealthTests(unittest.TestCase):
             self.assertEqual(body["mode"], "shadow")
             self.assertTrue(body["dry_run"])
             self.assertEqual(body["equity_tmn"], 5_000_000)
+            self.assertEqual(body["entry_cutoff"], "2026-10-23T21:00:00+03:30")
+            self.assertEqual(body["max_hold"], 6)
             encoded = json.dumps(body)
             self.assertNotIn("WALLEX_API_KEY", encoded)
             self.assertNotIn("LLM_API_KEY", encoded)
