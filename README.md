@@ -121,7 +121,7 @@ The read-only desk and `python -m trader report` show one card per symbol on the
 
 ### Alerts
 
-When both `TELEGRAM_ALERT_BOT_TOKEN` and `TELEGRAM_ALERT_CHAT_ID` are set, the process can alert on a cycle gap over 5 minutes, a `HALT` or `KILLED` state, an exchange order reject, or a taker entry fill. The same alert key stays quiet for 5 minutes after a send. If either variable is unset, nothing is sent. A failed send logs the exception type and not the request URL.
+When both `TELEGRAM_ALERT_BOT_TOKEN` and `TELEGRAM_ALERT_CHAT_ID` are set, the process can alert on a cycle gap over 5 minutes, a `HALT` or `KILLED` state, an exchange order reject, or a taker entry fill. The same alert key stays quiet for 5 minutes after a send. The same two variables also post each BUY and SELL (entry, stop, trail, max-hold, and `flat_by`), then a follow-up when that order fills, partially fills, or is cancelled. A sell follow-up includes realized PnL after fees. Skipped entries are one summary at most every 30 minutes. Shadow messages start with `[SHADOW]`. These posts are fire-and-forget and are not part of `config/default.yaml`. If either variable is unset, nothing is sent. A failed send logs the exception type and not the request URL.
 
 ### Compare
 

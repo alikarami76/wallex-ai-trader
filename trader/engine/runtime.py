@@ -59,7 +59,7 @@ from trader.strategy.quotes import execution_cost, inventory_skew, maker_buy_lim
 from trader.strategy.signals import build_candidates, evaluate_symbol
 from trader.timeutil import iso, now_tehran
 from trader.types import Bar, MarketRule
-from trader.alerts import notify, report_cycle
+from trader.alerts import notify, report_cycle, send_decision, send_skips, send_update
 from trader.order_guard import OrderIntent, assess
 from trader.scorecard import seal_signals
 from trader.wallex.client import (
@@ -709,9 +709,9 @@ def _cycle(
     _refresh_dust_book(state, portfolio, marks)
     if state.get("pending"):
         if send_orders:
-            _sync_pending(client, portfolio, state)
+            _sync_pending(client, portfolio, state, mode=mode)
         else:
-            _sync_paper(cfg, portfolio, state, books)
+            _sync_paper(cfg, portfolio, state, books, mode=mode)
     portfolio.mark_peaks(marks)
     now = now_tehran()
     now_unix = time.time()
@@ -846,10 +846,15 @@ def _cycle(
                     if cancelled.get("error"):
                         cancel_errors += 1
                         rejected.append({"symbol": action.symbol, "reason": cancelled["error"]})
+                    else:
+                        _relay_cancel(mode, now, cancelled)
                 continue
             if action.symbol in pending_symbols:
                 rejected.append({"symbol": action.symbol, "reason": "an order for this symbol is already working"})
                 continue
+            noted_requests = len(requests)
+            noted_fills = len(fills)
+            held = portfolio.positions.get(action.symbol)
             dust = _try_dust_flatten(
                 cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees, unavailable,
                 ops_state=ops["state"], guard_blocks=guard_blocks,
@@ -870,6 +875,10 @@ def _cycle(
                     fills.append(fill)
                     state["order_times"].append(now_unix)
                     journal.trade(_trade_row(fill, now, mode))
+                _relay_orders(
+                    mode, now, action, held, requests[noted_requests:], fills[noted_fills:],
+                    feature_by_symbol.get(action.symbol), cfg, hurdle, marks,
+                )
                 continue
             try:
                 before_guard = len(guard_blocks)
@@ -915,6 +924,10 @@ def _cycle(
                     entry_taker_fills += 1
                 if fill.side == "SELL" and str(ops["state"]) in {"FLATTEN", "KILLED"}:
                     _note_unsellable_remainder(state, portfolio, marks, action.symbol, float(cfg["risk"]["min_notional_tmn"]))
+            _relay_orders(
+                mode, now, action, held, requests[noted_requests:], fills[noted_fills:],
+                feature_by_symbol.get(action.symbol), cfg, hurdle, marks,
+            )
 
     protective, _deferred = risk.protective_actions(
         portfolio=portfolio, marks=marks, view=view, now_unix=now_unix, liquidity=liquidity,
@@ -1020,6 +1033,7 @@ def _cycle(
         order_rejects=order_rejects,
         entry_taker_fills=entry_taker_fills,
     )
+    _relay_skips(mode, now, candidates, features, planned.rejected)
     ops["last_cycle_unix"] = now_unix
     _emit_contract(
         journal.directory, cfg, state, ops, facts, now, mode, send_orders, equity, portfolio,
@@ -1875,13 +1889,145 @@ def _execute(
     return fill, request
 
 
-def _sync_pending(client: WallexClient, portfolio: Portfolio, state: dict) -> None:
+def _request_body(request) -> dict:
+    if not isinstance(request, dict) or request.get("op") == "cancel":
+        return {}
+    body = request.get("body")
+    if isinstance(body, dict) and body.get("side"):
+        return body
+    nested = request.get("request")
+    if isinstance(nested, dict) and isinstance(nested.get("body"), dict):
+        return nested["body"]
+    return {}
+
+
+def _telegram_levels(cfg, price, position, side: str):
+    risk = (cfg or {}).get("risk") or {}
+    try:
+        stop_pct = float(risk.get("stop_loss_pct") or 0)
+        arm = float(risk.get("trail_arm_pct") or 0)
+    except (TypeError, ValueError):
+        return None, None
+    if str(side).upper() == "SELL" and position is not None:
+        entry = getattr(position, "entry_price", None) or price
+        try:
+            tp = float(entry) * (1 + arm) if entry else None
+        except (TypeError, ValueError):
+            tp = None
+        return getattr(position, "stop_price", None), tp
+    try:
+        px = float(price)
+    except (TypeError, ValueError):
+        return None, None
+    return px * (1 - stop_pct), px * (1 + arm)
+
+
+def _relay_orders(mode, when, action, held, new_requests, new_fills, feature, cfg, hurdle, marks=None) -> None:
+    """Tell Telegram about orders this action just produced. Never affects the book."""
+    try:
+        ordered = {}
+        for request in new_requests:
+            body = _request_body(request)
+            side = str(body.get("side") or "").upper()
+            if side not in {"BUY", "SELL"}:
+                continue
+            price = body.get("price") or (marks or {}).get(str(body.get("symbol") or action.symbol))
+            edge = getattr(feature, "expected_gross", None) if side == "BUY" else None
+            reason = action.reason or action.source or "signal"
+            if side == "BUY" and edge is not None:
+                reason = "uptrend pullback"
+            sl, tp = _telegram_levels(cfg, price, held if side == "SELL" else None, side)
+            client_id = str(body.get("client_id") or "")
+            ordered[client_id] = body.get("quantity")
+            send_decision(
+                mode=mode, when=when, symbol=str(body.get("symbol") or action.symbol),
+                side=side, order_type=str(body.get("type") or action.order_type or ""),
+                price=price, qty=body.get("quantity"), reason=reason,
+                edge=edge, hurdle=hurdle if side == "BUY" else None,
+                sl=sl, tp=tp, client_id=client_id,
+            )
+        for fill in new_fills:
+            target = ordered.get(fill.client_id)
+            _relay_fill(mode, fill, {"qty": target, "order_type": fill.order_type}, None, when=when)
+    except Exception as exc:
+        log.warning("telegram note failed: %s", type(exc).__name__)
+
+
+def _relay_fill(mode, fill, meta, order, when=None) -> None:
+    if fill is None:
+        return
+    try:
+        target = None
+        status = "FILL"
+        if order is not None:
+            target = getattr(order, "orig_qty", None) or (meta or {}).get("qty")
+            done = getattr(order, "executed_qty", None)
+            if done and target and float(done) + 1e-12 < float(target):
+                status = "PARTIAL"
+        else:
+            target = (meta or {}).get("qty") or fill.qty
+            try:
+                if target and float(fill.qty) < float(target) * 0.98:
+                    status = "PARTIAL"
+            except (TypeError, ValueError):
+                status = "FILL"
+        send_update(
+            mode=mode, when=when or now_tehran(), symbol=fill.symbol, side=fill.side,
+            order_type=fill.order_type or (meta or {}).get("order_type") or "",
+            status=status, price=fill.price, qty=fill.qty, qty_total=target or fill.qty,
+            pnl=fill.pnl_tmn, client_id=fill.client_id,
+        )
+    except Exception as exc:
+        log.warning("telegram note failed: %s", type(exc).__name__)
+
+
+def _relay_cancel(mode, when, row: dict) -> None:
+    try:
+        send_update(
+            mode=mode, when=when or now_tehran(), symbol=str(row.get("symbol") or ""),
+            side=str(row.get("side") or ""), order_type=str(row.get("order_type") or ""),
+            status="CANCEL", price=None, qty=None, qty_total=None, pnl=None,
+            client_id=str(row.get("client_id") or ""),
+        )
+    except Exception as exc:
+        log.warning("telegram note failed: %s", type(exc).__name__)
+
+
+def _relay_skips(mode, when, candidates, features, rejected) -> None:
+    try:
+        rows = []
+        seen = set()
+        names = {getattr(item, "symbol", None) for item in candidates or []}
+        for row in rejected or []:
+            symbol = str(row.get("symbol") or "")
+            if not symbol or symbol in seen or symbol not in names:
+                continue
+            rows.append((symbol, str(row.get("reason") or "skipped")))
+            seen.add(symbol)
+        for feature in features or []:
+            if getattr(feature, "signal", True):
+                continue
+            symbol = str(getattr(feature, "symbol", "") or "")
+            if not symbol or symbol in seen:
+                continue
+            blockers = list(getattr(feature, "blockers", None) or [])
+            if not blockers:
+                continue
+            rows.append((symbol, str(blockers[0])))
+            seen.add(symbol)
+        send_skips(mode=mode, when=when, rows=rows[:8])
+    except Exception as exc:
+        log.warning("telegram note failed: %s", type(exc).__name__)
+
+
+def _sync_pending(client: WallexClient, portfolio: Portfolio, state: dict, mode: str = "") -> None:
     """Apply only the executedQty added since the last sync, then drop finished orders."""
     for client_id, meta in list(state.get("pending", {}).items()):
         order = _consume_live_order(client, client_id)
         if order is None:
             continue
-        _book_pending(portfolio, meta, order, client_id)
+        fill = _book_pending(portfolio, meta, order, client_id)
+        _relay_fill(mode, fill, meta, order)
         partial_buy = _partial_buy(order, float(meta.get("qty") or order.orig_qty or 0))
         age = time.time() - float(meta.get("created") or time.time())
         finished = (not order.active) or str(order.status or "").upper() in {
@@ -1890,8 +2036,16 @@ def _sync_pending(client: WallexClient, portfolio: Portfolio, state: dict) -> No
         if partial_buy and order.active:
             _cancel_quiet(client, client_id)
             again = _consume_live_order(client, client_id)
+            extra = None
             if again is not None:
-                _book_pending(portfolio, meta, again, client_id)
+                extra = _book_pending(portfolio, meta, again, client_id)
+                _relay_fill(mode, extra, meta, again)
+            _relay_cancel(mode, None, {
+                "client_id": client_id,
+                "symbol": meta.get("symbol"),
+                "side": meta.get("side"),
+                "order_type": meta.get("order_type"),
+            })
             state["pending"].pop(client_id, None)
             continue
         if finished or age > 600:
@@ -1899,20 +2053,35 @@ def _sync_pending(client: WallexClient, portfolio: Portfolio, state: dict) -> No
                 _cancel_quiet(client, client_id)
                 again = _consume_live_order(client, client_id)
                 if again is not None:
-                    _book_pending(portfolio, meta, again, client_id)
+                    extra = _book_pending(portfolio, meta, again, client_id)
+                    _relay_fill(mode, extra, meta, again)
+                _relay_cancel(mode, None, {
+                    "client_id": client_id,
+                    "symbol": meta.get("symbol"),
+                    "side": meta.get("side"),
+                    "order_type": meta.get("order_type"),
+                })
+            elif str(order.status or "").upper() in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
+                _relay_cancel(mode, None, {
+                    "client_id": client_id,
+                    "symbol": meta.get("symbol"),
+                    "side": meta.get("side"),
+                    "order_type": meta.get("order_type"),
+                })
             state["pending"].pop(client_id, None)
 
 
-def _sync_paper(cfg, portfolio: Portfolio, state: dict, books: dict) -> None:
+def _sync_paper(cfg, portfolio: Portfolio, state: dict, books: dict, mode: str = "") -> None:
     """A resting maker quote fills only after the touch trades through it."""
     for client_id, meta in list(state.get("pending", {}).items()):
         book = books.get(meta.get("symbol"))
         age = time.time() - float(meta.get("created") or time.time())
         price = float(meta.get("price") or 0)
         filled = False
+        paper_fill = None
         if book and price > 0 and meta.get("side") == "BUY" and book.best_bid and book.best_bid < price:
             if meta["symbol"] not in portfolio.positions:
-                portfolio.buy(
+                paper_fill = portfolio.buy(
                     symbol=meta["symbol"], price=price, qty=float(meta.get("qty") or 0),
                     fee_rate=float(meta.get("fee") or 0), time=int(time.time()),
                     stop_price=price * (1 - float(cfg["risk"]["stop_loss_pct"])),
@@ -1924,12 +2093,21 @@ def _sync_paper(cfg, portfolio: Portfolio, state: dict, books: dict) -> None:
             position = portfolio.positions.get(meta["symbol"])
             if position is not None:
                 raw_qty = meta.get("qty")
-                portfolio.sell(
+                paper_fill = portfolio.sell(
                     symbol=meta["symbol"], price=price, fee_rate=float(meta.get("fee") or 0),
                     reason=meta.get("reason") or "paper maker fill", client_id=client_id, order_type="LIMIT",
                     qty=float(raw_qty) if raw_qty else None,
                 )
             filled = True
+        if paper_fill is not None:
+            _relay_fill(mode, paper_fill, meta, None)
+        elif age > 600 and not filled:
+            _relay_cancel(mode, None, {
+                "client_id": client_id,
+                "symbol": meta.get("symbol"),
+                "side": meta.get("side"),
+                "order_type": meta.get("order_type"),
+            })
         if filled or age > 600:
             state["pending"].pop(client_id, None)
 

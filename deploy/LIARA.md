@@ -72,7 +72,7 @@ liara env set --app wallex-ai-trader --force \
 | `DASHBOARD_USER` | Fallback basic-auth user for `/` and `/status` when you want one account. |
 | `DASHBOARD_PASSWORD` | Password for that fallback user. Compared in constant time. |
 | `TELEGRAM_ALERT_BOT_TOKEN` | Optional. Alerts stay off unless this and the chat id are both set. |
-| `TELEGRAM_ALERT_CHAT_ID` | Optional chat for a cycle gap, HALT or KILLED, an order reject, or a taker entry fill. |
+| `TELEGRAM_ALERT_CHAT_ID` | Optional chat for a cycle gap, HALT or KILLED, an order reject, a taker entry fill, and each BUY/SELL decision plus its fill or cancel. |
 | `WATCHDOG_ENABLED` | Optional. Off unless this is `1`, `true`, `yes`, or `on`. The entrypoint then runs the journal sidecar in the same container. It does not place orders or write journals. |
 | `TRADER_LIVE_AUTHORIZED` | `1` arms live orders. Leave it unset in the image. The running lock keeps the value already stored in `/data/state.json`. |
 | `TRADER_EV_OVERRIDE` | `1` keeps the locked cost-gate override on. A re-freeze does not clear it. Leave it set across the redeploy. |
