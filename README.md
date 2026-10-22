@@ -27,8 +27,9 @@ cp .env.example .env
 | `DASHBOARD_USERS` | optional | JSON object `{"username": "password"}` for several desk users. Compared in constant time. |
 | `DASHBOARD_USER` | desk only | Fallback HTTP basic user when `DASHBOARD_USERS` is unset. |
 | `DASHBOARD_PASSWORD` | desk only | Password for that fallback user. The page stays closed when no user is configured. |
-| `TELEGRAM_ALERT_BOT_TOKEN` | optional | Alert bot token. Alerts stay off unless this and the chat id are both set. |
-| `TELEGRAM_ALERT_CHAT_ID` | optional | Chat that receives alerts. The token is not written to the journal. |
+| `TELEGRAM_ALERT_BOT_TOKEN` | optional | Bot token for alerts and the trade log. |
+| `TELEGRAM_ALERT_CHAT_ID` | optional | Group that receives watchdog alerts. The token is not written to the journal. |
+| `TELEGRAM_TRADES_CHAT_ID` | optional | Channel for BUY/SELL decisions, fills, and cancels. Unset means no trade log. |
 
 The client omits `temperature` unless `llm.send_temperature: true`. A completion cap is sent as `max_completion_tokens` (`gpt-6-luna` rejects `max_tokens`). `reasoning_effort` is retried once without the field on HTTP 400. Each call logs `usage.cost` and the running total against the $3 budget. The hard cap defaults to $2.50: the router steps down a tier near it, then stops and uses the deterministic fallback. `/key` and `/credits` report a shared upstream account, so the bot does not use them as its balance.
 
@@ -121,7 +122,7 @@ The read-only desk and `python -m trader report` show one card per symbol on the
 
 ### Alerts
 
-When both `TELEGRAM_ALERT_BOT_TOKEN` and `TELEGRAM_ALERT_CHAT_ID` are set, the process can alert on a cycle gap over 5 minutes, a `HALT` or `KILLED` state, an exchange order reject, or a taker entry fill. The same alert key stays quiet for 5 minutes after a send. The same two variables also post each BUY and SELL (entry, stop, trail, max-hold, and `flat_by`), then a follow-up when that order fills, partially fills, or is cancelled. A sell follow-up includes realized PnL after fees. Skipped entries are one summary at most every 30 minutes. Shadow messages start with `[SHADOW]`. These posts are fire-and-forget and are not part of `config/default.yaml`. If either variable is unset, nothing is sent. A failed send logs the exception type and not the request URL.
+When both `TELEGRAM_ALERT_BOT_TOKEN` and `TELEGRAM_ALERT_CHAT_ID` are set, the process can alert on a cycle gap over 5 minutes, a `HALT` or `KILLED` state, an exchange order reject, or a taker entry fill. The same alert key stays quiet for 5 minutes after a send. Those alerts stay on the group. BUY and SELL decisions (entry, stop, trail, max-hold, and `flat_by`), plus a follow-up when that order fills, partially fills, or is cancelled, go to `TELEGRAM_TRADES_CHAT_ID` with the same bot token. A sell follow-up includes realized PnL after fees. Skipped entries are one summary at most every 30 minutes. Shadow messages start with `[SHADOW]`. The trade log is a no-op when `TELEGRAM_TRADES_CHAT_ID` is unset. These posts are fire-and-forget and are not part of `config/default.yaml`. A failed send logs the exception type and not the request URL.
 
 ### Compare
 

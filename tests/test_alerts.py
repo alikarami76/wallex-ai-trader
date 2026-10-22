@@ -107,9 +107,11 @@ class DecisionPostTests(unittest.TestCase):
         self._env = {
             "TELEGRAM_ALERT_BOT_TOKEN": os.environ.get("TELEGRAM_ALERT_BOT_TOKEN"),
             "TELEGRAM_ALERT_CHAT_ID": os.environ.get("TELEGRAM_ALERT_CHAT_ID"),
+            "TELEGRAM_TRADES_CHAT_ID": os.environ.get("TELEGRAM_TRADES_CHAT_ID"),
         }
         os.environ.pop("TELEGRAM_ALERT_BOT_TOKEN", None)
         os.environ.pop("TELEGRAM_ALERT_CHAT_ID", None)
+        os.environ.pop("TELEGRAM_TRADES_CHAT_ID", None)
         self.when = datetime(2026, 10, 23, 17, 31, tzinfo=timezone.utc)
 
     def tearDown(self):
@@ -124,6 +126,7 @@ class DecisionPostTests(unittest.TestCase):
     def _arm(self):
         os.environ["TELEGRAM_ALERT_BOT_TOKEN"] = "123456:secret-token"
         os.environ["TELEGRAM_ALERT_CHAT_ID"] = "4242"
+        os.environ["TELEGRAM_TRADES_CHAT_ID"] = "-1003898687684"
 
     def _capture(self):
         calls = []
@@ -188,6 +191,9 @@ class DecisionPostTests(unittest.TestCase):
         self.assertIn("TP 102.5", buy)
         self.assertIn("id SCabc", buy)
         self.assertNotIn("secret-token", buy)
+        for row in calls:
+            self.assertEqual(row["chat_id"], "-1003898687684")
+            self.assertNotIn("4242", row["text"])
         sell = texts[1]
         self.assertFalse(sell.startswith("[SHADOW]"))
         self.assertIn("SELL ETH TMN MARKET", sell)
@@ -212,6 +218,7 @@ class DecisionPostTests(unittest.TestCase):
             mode="shadow", when=self.when, rows=[("BTCTMN", "fee hurdle")], post=post, now=20,
         ))
         self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["chat_id"], "-1003898687684")
         self.assertIn("skipped entries", calls[0]["text"])
         self.assertIn("BTCTMN: fee hurdle", calls[0]["text"])
         self.assertTrue(calls[0]["text"].startswith("[SHADOW] "))
@@ -267,6 +274,44 @@ class DecisionPostTests(unittest.TestCase):
         self.assertIn("TP 102.5", text)
         self.assertIn("id SCabc", text)
         self.assertNotIn("secret-token", calls[0]["text"])
+        self.assertEqual(calls[0]["chat_id"], "-1003898687684")
+
+    def test_the_alert_group_does_not_receive_the_trade_log(self):
+        calls, post = self._capture()
+        os.environ["TELEGRAM_ALERT_BOT_TOKEN"] = "123456:secret-token"
+        os.environ["TELEGRAM_ALERT_CHAT_ID"] = "4242"
+        self.assertFalse(send_decision(
+            mode="shadow", when=self.when, symbol="BTCTMN", side="BUY", order_type="LIMIT",
+            price=100, qty=0.01, reason="uptrend pullback", edge=0.0045, hurdle=0.0072,
+            sl=95.5, tp=102.5, client_id="SCabc", post=post,
+        ))
+        sent = report_cycle(
+            gap_seconds=None, ops_state="SHADOW", order_rejects=1, entry_taker_fills=0,
+            post=post, now=1,
+        )
+        self.assertEqual(sent, ["order_reject"])
+        self.assertEqual(calls[0]["chat_id"], "4242")
+        self.assertNotIn("BUY", calls[0]["text"])
+        os.environ["TELEGRAM_TRADES_CHAT_ID"] = "-1003898687684"
+        self.assertTrue(send_decision(
+            mode="live", when=self.when, symbol="BTCTMN", side="BUY", order_type="LIMIT",
+            price=100, qty=0.01, reason="uptrend pullback", edge=0.0045, hurdle=0.0072,
+            sl=95.5, tp=102.5, client_id="SCabc", post=post,
+        ))
+        self.assertEqual(calls[-1]["chat_id"], "-1003898687684")
+        os.environ.pop("TELEGRAM_ALERT_CHAT_ID", None)
+        self.assertTrue(send_update(
+            mode="live", when=self.when, symbol="BTCTMN", side="SELL", order_type="LIMIT",
+            status="FILL", price=110, qty=0.01, qty_total=0.01, pnl=1, client_id="SCabc", post=post,
+        ))
+        self.assertEqual(calls[-1]["chat_id"], "-1003898687684")
+        self.assertEqual(
+            report_cycle(
+                gap_seconds=900, ops_state="HALT", order_rejects=1, entry_taker_fills=1,
+                post=post, now=2,
+            ),
+            [],
+        )
 
 
 if __name__ == "__main__":
