@@ -232,7 +232,7 @@ class AuditTests(unittest.TestCase):
         cfg = load_config("config/default.yaml")
         self.assertEqual(
             config_hash(cfg),
-            "f2736a83dcccdc2584ca3f4bcb67b357182885436c007e6dfe190f579ce11f81",
+            "1491d58fe95ca57de6cffe79b5a470e4932b06511f47226c2781ecbcbc475ac3",
         )
         cfg["exchange"]["base_url"] = "http://127.0.0.1:9"
         set_log_context(cfg, "abc")

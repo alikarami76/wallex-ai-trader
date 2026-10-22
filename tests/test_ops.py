@@ -226,18 +226,18 @@ class StateMachineTests(unittest.TestCase):
         self.assertTrue(kept.signal)
         self.assertEqual(kept.expected_gross, 0.009)
 
-    def test_default_clock_is_friday_18_with_a_six_hour_hold(self):
+    def test_default_clock_is_friday_21_with_a_six_hour_hold(self):
         loaded = load_config("config/default.yaml")
-        self.assertEqual(entry_cutoff(loaded).isoformat(), "2026-10-23T18:00:00+03:30")
+        self.assertEqual(entry_cutoff(loaded).isoformat(), "2026-10-23T21:00:00+03:30")
         self.assertEqual(loaded["risk"]["time_stop_hours"], 6)
         self.assertEqual(loaded["liquidation"]["flat_by"], "2026-10-23T23:30:00+03:30")
-        self.assertEqual(loaded["liquidation"]["min_hours_to_enter"], 5.5)
+        self.assertEqual(loaded["liquidation"]["min_hours_to_enter"], 2.5)
         from trader.engine.ops import CHECKPOINT_END, CHECKPOINT_START
 
-        self.assertEqual(CHECKPOINT_START["C2"], "2026-10-23T17:00:00+03:30")
-        self.assertEqual(CHECKPOINT_END["C2"], "2026-10-23T18:00:00+03:30")
-        self.assertEqual(CHECKPOINT_START["C3"], "2026-10-23T18:00:00+03:30")
-        self.assertEqual(CHECKPOINT_END["C3"], "2026-10-23T19:30:00+03:30")
+        self.assertEqual(CHECKPOINT_START["C2"], "2026-10-23T20:00:00+03:30")
+        self.assertEqual(CHECKPOINT_END["C2"], "2026-10-23T21:00:00+03:30")
+        self.assertEqual(CHECKPOINT_START["C3"], "2026-10-23T21:00:00+03:30")
+        self.assertEqual(CHECKPOINT_END["C3"], "2026-10-23T22:30:00+03:30")
         self.assertEqual(CHECKPOINT_END["C4"], "2026-10-23T08:00:00+03:30")
 
     def test_approved_config_hash_refreezes_without_clearing_ev_override(self):

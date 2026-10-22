@@ -23,7 +23,7 @@ flowchart TD
   risk --> journal
 ```
 
-The backtest is rules only. It calls `evaluate_symbol` and `RiskManager.plan` with `use_llm=False`, so it never calls BoxAPI and it never builds the menu. Shadow and live call that same quant and risk code, then ask the model to pick one id from the menu and check the pick again. Live entries also pass through the operational state machine in `trader/engine/ops.py`. The researched cost-gate prior stays 0.9% for the rules-only backtest. Shadow and live freeze the measured 0.45% gross prior, which blocks entries unless `ev_override` was set before go-live and then locked. Last new entry is Fri 2026-10-23 18:00 Asia/Tehran. The hold is 6 hours, and a position also exits at `flat_by`. The flatten clock is unchanged: passive Fri 22:50, aggressive 23:20, flat 23:30.
+The backtest is rules only. It calls `evaluate_symbol` and `RiskManager.plan` with `use_llm=False`, so it never calls BoxAPI and it never builds the menu. Shadow and live call that same quant and risk code, then ask the model to pick one id from the menu and check the pick again. Live entries also pass through the operational state machine in `trader/engine/ops.py`. The researched cost-gate prior stays 0.9% for the rules-only backtest. Shadow and live freeze the measured 0.45% gross prior, which blocks entries unless `ev_override` was set before go-live and then locked. Last new entry is Fri 2026-10-23 21:00 Asia/Tehran. The hold is 6 hours, and a position also exits at `flat_by`. The flatten clock is unchanged: passive Fri 22:50, aggressive 23:20, flat 23:30.
 
 ## Buy
 
@@ -130,7 +130,7 @@ Universe at startup: config allowlist ∩ config candidates ∩ not on the packa
 
 Deadline `2026-10-23T23:50:00+03:30`. Flat-by target `2026-10-23T23:30:00+03:30`.
 
-- Entries stop when fewer than 5.5 hours remain before flat-by, which is the Fri 18:00 entry cutoff.
+- Entries stop when fewer than 2.5 hours remain before flat-by, which is the Fri 21:00 entry cutoff.
 - From 22:50 Tehran, phase `passive`: no new buys, resting limits sell inventory.
 - From 23:20 Tehran, phase `aggressive`: market sells (or aggressive limits if market orders are disabled). The phase stays aggressive after the deadline until the book is flat.
 - A forced exit under 50,000 TMN (liquidation, kill, stop, or trail) cannot be a normal spot sell. When cash can fund it, the bot buys enough extra base that the buy and the combined sell both clear 50,000 TMN, then sells the sum. Both orders are spot `POST /v1/account/orders`. If cash cannot fund the top-up and the symbol allows market orders, it sends a spot market sell. OTC and instant convert are not used. Coin that is still unsold is written on the decision as `residuals` and listed in the report. Shadow stays the default run mode.

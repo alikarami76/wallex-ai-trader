@@ -126,13 +126,13 @@ The live book is already locked. A new image whose `config/default.yaml` hash di
 ```bash
 sha256sum config/default.yaml
 liara env set --app wallex-ai-trader --force \
-  TRADER_APPROVED_CONFIG_HASH=5ecb9699adf3c24ead89a8cc55bc494db45adcb7b7f5064113f00d72a5a3ceac \
+  TRADER_APPROVED_CONFIG_HASH=f363d1f6cc5a78a4daa857672eb5ce2cbc76e2d3b2b2901f9f1f1d467b0ebacc \
   TRADER_GIT_SHA="<deployed commit>" \
   TRADER_EV_OVERRIDE=1 \
   TRADER_LIVE_AUTHORIZED=1
 ```
 
-`5ecb9699adf3c24ead89a8cc55bc494db45adcb7b7f5064113f00d72a5a3ceac` is the SHA-256 of this image's `config/default.yaml`. Recompute it if the file changes. `TRADER_GIT_SHA` is the commit you deploy.
+`f363d1f6cc5a78a4daa857672eb5ce2cbc76e2d3b2b2901f9f1f1d467b0ebacc` is the SHA-256 of this image's `config/default.yaml`. Recompute it if the file changes. `TRADER_GIT_SHA` is the commit you deploy.
 
 The image has no git metadata. Without `TRADER_GIT_SHA` the lock stores `unknown`. Set that variable to the commit being deployed before the new process starts, and do not wipe `/data/state.json`.
 

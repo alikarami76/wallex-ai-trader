@@ -77,16 +77,16 @@ GATES = (
 CHECKPOINT_END = {
     "C0": "2026-10-22T21:30:00+03:30",
     "C1": "2026-10-22T22:30:00+03:30",
-    # C2 ends at the Fri 18:00 entry cutoff. C3 is the 90 minutes after it.
-    "C2": "2026-10-23T18:00:00+03:30",
-    "C3": "2026-10-23T19:30:00+03:30",
+    # C2 ends at the Fri 21:00 entry cutoff. C3 is the 90 minutes after it.
+    "C2": "2026-10-23T21:00:00+03:30",
+    "C3": "2026-10-23T22:30:00+03:30",
     "C4": "2026-10-23T08:00:00+03:30",
 }
 CHECKPOINT_START = {
     "C0": "2026-10-22T19:00:00+03:30",
     "C1": "2026-10-22T21:30:00+03:30",
-    "C2": "2026-10-23T17:00:00+03:30",
-    "C3": "2026-10-23T18:00:00+03:30",
+    "C2": "2026-10-23T20:00:00+03:30",
+    "C3": "2026-10-23T21:00:00+03:30",
     "C4": "2026-10-23T01:00:00+03:30",
 }
 _LOG_CONTEXT = {"config_hash": "", "go_live_sha": None}
@@ -143,7 +143,7 @@ def frozen_gross_prior(cfg: dict) -> float:
 
 
 def entry_cutoff(cfg: dict) -> datetime:
-    raw = (cfg.get("ops") or {}).get("entry_cutoff") or "2026-10-23T18:00:00+03:30"
+    raw = (cfg.get("ops") or {}).get("entry_cutoff") or "2026-10-23T21:00:00+03:30"
     return parse_ts(str(raw))
 
 
@@ -628,7 +628,7 @@ def _entry_cutoff(ops: dict, facts: Facts, cfg: dict) -> None:
     ops["state"] = "LIVE_MANAGE"
     _queue(ops, _note_row(
         ops, action="A0_NO_CHANGE", before=before, after="LIVE_MANAGE", playbook="B7",
-        note="Fri 18:00 Asia/Tehran entry cutoff. entries_allowed false. cutoff_reason entry_cutoff.",
+        note="Fri 21:00 Asia/Tehran entry cutoff. entries_allowed false. cutoff_reason entry_cutoff.",
         param="entries_allowed", old=True, new=False,
     ))
 

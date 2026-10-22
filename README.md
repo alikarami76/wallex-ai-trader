@@ -89,7 +89,7 @@ Liara deployment is in [deploy/LIARA.md](deploy/LIARA.md). The image listens on 
 
 ## Safety architecture
 
-These checks can only refuse an order, shrink a size, or write a log. They do not raise a size, add a symbol, or change a strategy number: EMA windows, return and pullback bands, ATR cap, spread cap, −4.5% stop, trail arm +2.5% with 1.2% distance, confidence floor 0.55, 12% size cap, 30% gross cap, frozen prior 0.45%, kill levels −1.5% and −3%. Ali approved two clock changes for the live book: the hold is 6 hours, and the entry cutoff is Fri 2026-10-23 18:00 Asia/Tehran. `flat_by` stays Fri 2026-10-23 23:30. A time stop also exits at `flat_by`. `ev_override`, once locked on, stays on. `TRADER_APPROVED_CONFIG_HASH` re-freezes the go-live config hash for that file. The C0 report, the state machine, B1–B10, and the A0–A8 adjustment enum are unchanged. There are no new model calls. The $2.50 BoxAPI cap is unchanged.
+These checks can only refuse an order, shrink a size, or write a log. They do not raise a size, add a symbol, or change a strategy number: EMA windows, return and pullback bands, ATR cap, spread cap, −4.5% stop, trail arm +2.5% with 1.2% distance, confidence floor 0.55, 12% size cap, 30% gross cap, frozen prior 0.45%, kill levels −1.5% and −3%. Ali approved the clock for the live book: the hold is 6 hours, and the entry cutoff is Fri 2026-10-23 21:00 Asia/Tehran. `flat_by` stays Fri 2026-10-23 23:30. A time stop also exits at `flat_by`. `ev_override`, once locked on, stays on. `TRADER_APPROVED_CONFIG_HASH` re-freezes the go-live config hash for that file. The C0 report, the state machine, B1–B10, and the A0–A8 adjustment enum are unchanged. There are no new model calls. The $2.50 BoxAPI cap is unchanged.
 
 ### Pre-send order guard
 

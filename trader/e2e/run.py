@@ -146,7 +146,7 @@ def run_all(root: Path | None = None) -> int:
     def dip() -> str:
         directory = enter(world, clock, root, "b-dip")
         journals["dip"] = directory
-        clock.unix = at(18, 2, day=23)
+        clock.unix = at(21, 2, day=23)
         drive(world, directory, mode="live", cycles=1, send=True, authorize=True, override=True, fresh=False)
         reasons = " ".join(row.get("reason") or "" for row in trades(directory))
         need("time stop" in reasons, f"exit reasons: {reasons}")
@@ -156,7 +156,7 @@ def run_all(root: Path | None = None) -> int:
         need(sells and sells[-1].get("order_type") == "LIMIT", "6h exit was not a maker limit")
         crumb = remainder_tmn(directory)
         extra = f", sub-step remainder {crumb:.4f} TMN" if crumb else ""
-        return "maker buy then 6h limit exit, LIVE_MANAGE after the Fri 18:00 cutoff" + extra
+        return "maker buy then 6h limit exit, LIVE_MANAGE after the Fri 21:00 cutoff" + extra
 
     def stop() -> str:
         directory = enter(world, clock, root, "c-stop")
@@ -399,7 +399,7 @@ def run_all(root: Path | None = None) -> int:
     def cutoff() -> str:
         world.reset()
         world.llm_mode = "accept"
-        clock.unix = at(18, 1, day=23)
+        clock.unix = at(21, 1, day=23)
         directory = root / "j-cutoff"
         drive(world, directory, mode="live", cycles=20, send=True, authorize=True, override=True)
         rows = cycles_of(directory)
@@ -407,7 +407,7 @@ def run_all(root: Path | None = None) -> int:
         need(all(row.get("state") == "LIVE_MANAGE" for row in rows), machine(directory))
         need(sum(int(row.get("n_orders_submitted") or 0) for row in rows) == 0, "cutoff submitted an order")
         need(world.order_posts == 0, "cutoff posted an order")
-        return "Fri 18:01 opens in LIVE_MANAGE with zero orders"
+        return "Fri 21:01 opens in LIVE_MANAGE with zero orders"
 
     def gating() -> str:
         world.reset()
