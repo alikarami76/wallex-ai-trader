@@ -15,6 +15,7 @@ from pathlib import Path
 
 from trader.config import wallex_credentials
 from trader.engine.backtest import _trade_row
+from trader.engine.dust import FORCED_FLATTEN, apply_paper, plan_dust_flatten
 from trader.engine.journal import Journal
 from trader.engine.portfolio import Portfolio
 from trader.engine.state import load_state, save_state
@@ -278,6 +279,7 @@ def _cycle(
     )
     fills = []
     requests = []
+    residuals = []
     pending_symbols = {row.get("symbol") for row in state.get("pending", {}).values()}
     for action in planned.actions:
         if action.source == "cancel":
@@ -291,6 +293,24 @@ def _cycle(
             continue
         if action.symbol in pending_symbols:
             planned.rejected.append({"symbol": action.symbol, "reason": "an order for this symbol is already working"})
+            continue
+        dust = _try_dust_flatten(
+            cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees, unavailable,
+        )
+        if dust is not None:
+            dust_fills, dust_requests, residual = dust
+            requests.extend(dust_requests)
+            if residual:
+                residuals.append(residual)
+                planned.rejected.append({"symbol": action.symbol, "reason": residual["reason"]})
+                log.warning(
+                    "residual %s qty=%s mark_tmn=%s %s",
+                    residual.get("symbol"), residual.get("qty"), residual.get("mark_tmn"), residual.get("reason"),
+                )
+            for fill in dust_fills:
+                fills.append(fill)
+                state["order_times"].append(now_unix)
+                journal.trade(_trade_row(fill, now, mode))
             continue
         try:
             fill, request = _execute(
@@ -338,6 +358,7 @@ def _cycle(
         },
         "requests": requests,
         "fills": [f.__dict__ for f in fills],
+        "residuals": residuals,
     })
     save_state(state_path, state)
     log.info(
@@ -384,6 +405,142 @@ def _cancel_resting(client, state, action, send_orders) -> dict | None:
         "symbol": meta.get("symbol"),
         "side": meta.get("side"),
     }
+
+
+def _try_dust_flatten(cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees, unavailable):
+    """Flatten a forced exit that is under the minimum notional.
+
+    Returns None when the held coin already clears the minimum and the normal
+    sell should run. Otherwise returns (fills, requests, residual or None).
+    """
+    if action.side != "SELL" or action.source not in FORCED_FLATTEN:
+        return None
+    position = portfolio.positions.get(action.symbol)
+    rule = rules.get(action.symbol)
+    if position is None or rule is None:
+        return None
+    book = books.get(action.symbol)
+    mark = marks.get(action.symbol) or rule.last_price or 0
+    buy_price = book.best_ask if book and book.best_ask else mark
+    sell_price = book.best_bid if book and book.best_bid else mark
+    if not buy_price or not sell_price:
+        return None
+    _ignored, taker = _fee_pair(cfg, rule, account_fees.get(action.symbol))
+    floor = float(rule.min_notional or cfg["risk"].get("min_notional_tmn") or 50_000)
+    blocked = symbol_block(action.symbol, cfg, unavailable or set(), rule)
+    plan = plan_dust_flatten(
+        qty=position.qty,
+        buy_price=float(buy_price),
+        sell_price=float(sell_price),
+        min_notional=floor,
+        min_qty=float(rule.min_qty or 0),
+        qty_decimals=int(rule.qty_decimals),
+        cash=portfolio.cash,
+        buy_fee=taker,
+        market_orders_enabled=bool(rule.market_orders_enabled),
+        buy_allowed=blocked is None,
+    )
+    if plan.kind == "sell":
+        return None
+    if plan.kind == "residual":
+        return [], [], plan.residual(action.symbol, position.qty)
+    slip = float(cfg["execution"].get("stop_slippage_bps", 5)) / 10_000
+    paper_sell = float(sell_price) * (1 - slip)
+    reason = f"{action.reason}; {plan.reason}"
+    requests = []
+    buy_fills = []
+    try:
+        if plan.kind == "topup":
+            buy_id = _next_id(state)
+            buy_response = client.place_order(
+                symbol=action.symbol, side="BUY", order_type="LIMIT", quantity=plan.buy_qty,
+                price=float(buy_price), client_id=buy_id, rule=rule, price_direction="up",
+            )
+            requests.append(buy_response.get("request") or {})
+            if not send_orders:
+                sell_id = _next_id(state)
+                preview = "MARKET" if rule.market_orders_enabled else "LIMIT"
+                sell_response = client.place_order(
+                    symbol=action.symbol, side="SELL", order_type=preview, quantity=plan.sell_qty,
+                    price=None if preview == "MARKET" else float(sell_price),
+                    client_id=sell_id, rule=rule, price_direction="down",
+                )
+                requests.append(sell_response.get("request") or {})
+                fills = apply_paper(
+                    portfolio, plan, symbol=action.symbol, buy_price=float(buy_price),
+                    sell_price=paper_sell, buy_fee=taker, sell_fee=taker, reason=reason,
+                    buy_id=buy_id, sell_id=sell_id,
+                )
+                if len(fills) < 2 or action.symbol in portfolio.positions:
+                    return fills, requests, plan.residual(action.symbol, portfolio.positions.get(action.symbol).qty if action.symbol in portfolio.positions else 0)
+                return fills, requests, None
+            filled = _wait_fill(client, buy_id)
+            if filled is None or filled.executed_qty <= 0:
+                _cancel_quiet(client, buy_id)
+                return [], requests, plan.residual(action.symbol, position.qty)
+            bought = portfolio.top_up(
+                symbol=action.symbol, price=filled.executed_price or float(buy_price),
+                qty=filled.executed_qty, fee_rate=taker, reason=reason, client_id=buy_id, order_type="LIMIT",
+            )
+            buy_fills = [] if bought is None else [bought]
+        held = portfolio.positions.get(action.symbol)
+        if held is None:
+            return buy_fills, requests, None
+        sell_id = _next_id(state)
+        order_type = "MARKET" if rule.market_orders_enabled else "LIMIT"
+        sell_qty = float(round_qty(held.qty, rule.qty_decimals))
+        sell_response = client.place_order(
+            symbol=action.symbol, side="SELL", order_type=order_type, quantity=sell_qty,
+            price=None if order_type == "MARKET" else float(sell_price),
+            client_id=sell_id, rule=rule, price_direction="down",
+        )
+        requests.append(sell_response.get("request") or {})
+        if not send_orders:
+            fills = apply_paper(
+                portfolio, plan, symbol=action.symbol, buy_price=float(buy_price),
+                sell_price=paper_sell, buy_fee=taker, sell_fee=taker, reason=reason,
+                buy_id=sell_id, sell_id=sell_id,
+            )
+            if action.symbol in portfolio.positions:
+                return fills, requests, plan.residual(action.symbol, portfolio.positions[action.symbol].qty)
+            return fills, requests, None
+        filled = _wait_fill(client, sell_id)
+        if filled is None or filled.executed_qty <= 0 or action.symbol not in portfolio.positions:
+            left_qty = portfolio.positions[action.symbol].qty if action.symbol in portfolio.positions else held.qty
+            return buy_fills, requests, plan.residual(action.symbol, left_qty)
+        fill = portfolio.sell(
+            symbol=action.symbol, price=filled.executed_price or paper_sell, fee_rate=taker,
+            reason=reason, client_id=sell_id, order_type=order_type,
+            qty=min(filled.executed_qty, sell_qty, portfolio.positions[action.symbol].qty),
+        )
+        fills = buy_fills + ([] if fill is None else [fill])
+        left = portfolio.positions.get(action.symbol)
+        residual = None if left is None else plan.residual(action.symbol, left.qty)
+        if residual:
+            residual["reason"] = "residual coin after the dust sell"
+        return fills, requests, residual
+    except (WallexError, OrderRejected) as exc:
+        left = portfolio.positions.get(action.symbol)
+        payload = plan.residual(action.symbol, left.qty if left else position.qty)
+        payload["reason"] = f"residual coin; dust flatten failed: {exc}"
+        return buy_fills, requests, payload
+
+
+def _wait_fill(client: WallexClient, client_id: str):
+    order = None
+    for _ in range(3):
+        order = _consume_live_order(client, client_id)
+        if order is not None and (order.executed_qty > 0 or order.status in {"FILLED", "CANCELED"}):
+            return order
+        time.sleep(0.3)
+    return order
+
+
+def _cancel_quiet(client: WallexClient, client_id: str) -> None:
+    try:
+        client.cancel_order(client_id)
+    except WallexError as exc:
+        log.warning("cancel %s failed: %s", client_id, exc)
 
 
 def _execute(cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees, feature=None, unavailable=None):

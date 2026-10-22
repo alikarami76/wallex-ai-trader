@@ -2,6 +2,8 @@
 
 Fee-aware spot bot for the Starcoach × Wallex credit account (package 183, 5,000,000 TMN). One process, one CLI, the same decision code in backtest, shadow, and live. Orders go only to spot `POST /v1/account/orders`. The config allowlist is intersected with the live package list, and TON, NEAR, FET, INJ, TAO, WIF, BONK, PENDLE, and RENDER are denied in every quote.
 
+A forced exit under 50,000 TMN tops up with a spot buy and sells the combined amount. Coin that cannot be flattened is reported. Shadow is the default mode in `scripts/run.sh`.
+
 In shadow and live the model picks one id from a menu of actions the quant and risk layers already validated (hold, buy, sell, reduce, or cancel). Invalid output is hold. Stops, size caps, the drawdown kill switch, and the Tehran liquidation window sit outside the model and can still veto the pick. If BoxAPI is down, over the call cap, or the key is missing, a deterministic fallback keeps the loop running.
 
 ## Setup
@@ -19,7 +21,9 @@ cp .env.example .env
 | `WALLEX_SUBACCOUNT_ID` | optional | Sent as `sub-account-client-id` when the credit sub-account key needs it. |
 | `LLM_BASE_URL` | live/shadow AI | Default `https://ai.boxapi.ir/ai/v1`. |
 | `LLM_API_KEY` | live/shadow AI | BoxAPI bearer token. Empty means the deterministic fallback. |
-| `LLM_MODEL` | live/shadow AI | Leave empty to use the tier table. Default decision model is `openai/gpt-6-luna`. `openai/gpt-6-sol` is only the rare high-stakes tier. Set `LLM_MODEL` to pin every tier. Bare ids such as `gpt-6-luna` also work; the client prefers the prefixed form. |
+| `LLM_MODEL` | unused | Ignored. It does not pin every tier. |
+| `LLM_MODEL_CHEAP` | optional | Overrides routine, signal, and trade. Default `openai/gpt-6-luna`. |
+| `LLM_MODEL_STRONG` | optional | Overrides the rare high-stakes tier. Default `openai/gpt-6-sol`. |
 
 The client omits `temperature` unless `llm.send_temperature: true`. A completion cap is sent as `max_completion_tokens` (`gpt-6-luna` rejects `max_tokens`). `reasoning_effort` is retried once without the field on HTTP 400. Each call logs `usage.cost` and the running total against the $3 budget. The hard cap defaults to $2.50: the router steps down a tier near it, then stops and uses the deterministic fallback. `/key` and `/credits` report a shared upstream account, so the bot does not use them as its balance.
 

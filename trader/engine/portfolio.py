@@ -112,6 +112,43 @@ class Portfolio:
             client_id=client_id,
         )
 
+    def top_up(
+        self,
+        *,
+        symbol: str,
+        price: float,
+        qty: float,
+        fee_rate: float,
+        reason: str,
+        client_id: str,
+        order_type: str,
+    ) -> Fill | None:
+        """Add base to a held coin. Used only to lift dust over the minimum before a sell."""
+        if qty <= 0 or price <= 0:
+            return None
+        notional = price * qty
+        if notional > self.cash + 1e-6:
+            return None
+        base_qty = qty * (1 - fee_rate)
+        fee_tmn = notional * fee_rate
+        self.cash -= notional
+        self.fees_paid += fee_tmn
+        position = self.positions.get(symbol)
+        if position is None:
+            self.positions[symbol] = Position(
+                symbol=symbol, qty=base_qty, entry_price=price, entry_time=0,
+                cost_tmn=notional, stop_price=price, peak_price=price,
+                setup="dust_topup", reason=reason,
+            )
+        else:
+            position.qty += base_qty
+            position.cost_tmn += notional
+        return Fill(
+            symbol=symbol, side="BUY", price=price, qty=base_qty, fee_tmn=fee_tmn,
+            fee_rate=fee_rate, notional_tmn=notional, pnl_tmn=None, reason=reason,
+            order_type=order_type, client_id=client_id,
+        )
+
     def sell(
         self,
         *,

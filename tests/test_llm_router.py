@@ -5,7 +5,7 @@ from pathlib import Path
 
 from trader.sentiment import SentimentSnapshot
 from trader.strategy.agent import LlmHTTPError, TradingAgent, _price, adapt_rejected_body, llm_settings, request_body
-from trader.strategy.router import choose_tier, quoted_call_usd
+from trader.strategy.router import choose_tier, list_prices, quoted_call_usd
 from trader.strategy.signals import Candidate, SymbolFeatures
 
 
@@ -43,6 +43,8 @@ class RouterTests(unittest.TestCase):
         os.environ["LLM_BASE_URL"] = "https://ai.boxapi.ir/ai/v1"
         os.environ["LLM_API_KEY"] = "test"
         os.environ.pop("LLM_MODEL", None)
+        os.environ.pop("LLM_MODEL_CHEAP", None)
+        os.environ.pop("LLM_MODEL_STRONG", None)
         self.path = Path("data/test_llm_router.json")
         if self.path.exists():
             self.path.unlink()
@@ -50,6 +52,8 @@ class RouterTests(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("LLM_API_KEY", None)
         os.environ.pop("LLM_MODEL", None)
+        os.environ.pop("LLM_MODEL_CHEAP", None)
+        os.environ.pop("LLM_MODEL_STRONG", None)
         if self.path.exists():
             self.path.unlink()
 
@@ -218,6 +222,38 @@ class RouterTests(unittest.TestCase):
         )
         self.assertEqual(exact["cost_source"], "usage.cost")
         self.assertAlmostEqual(exact["usd"], 0.0007)
+        # A missing usage.cost bills the model's list price, not the luna assumed rate.
+        settings["assumed_input_usd_per_million"] = 99
+        settings["assumed_output_usd_per_million"] = 99
+        self.assertEqual(list_prices("openai/gpt-6-sol", settings), (2.0, 10.0))
+        self.assertEqual(list_prices("gpt-6-luna", settings), (0.10, 0.50))
+        self.assertEqual(list_prices("openai/gpt-6.1-sol", settings), (2.0, 10.0))
+        sol = _price(
+            {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000},
+            settings,
+            "gpt-6-sol",
+        )
+        self.assertEqual(sol["cost_source"], "estimated_tokens")
+        self.assertAlmostEqual(sol["usd"], 13.8)
+
+    def test_llm_model_does_not_pin_every_tier(self):
+        settings = llm_settings({})
+        os.environ["LLM_MODEL"] = "openai/gpt-6-luna"
+        stakes = choose_tier("stakes", settings, spent_total=0.0, spent_today=0.0)
+        trade = choose_tier("trade", settings, spent_total=0.0, spent_today=0.0)
+        self.assertEqual(stakes["model"], "openai/gpt-6-sol")
+        self.assertEqual(stakes["reasoning_effort"], "high")
+        self.assertEqual(trade["model"], "openai/gpt-6-luna")
+        os.environ["LLM_MODEL_CHEAP"] = "gpt-5-nano"
+        os.environ["LLM_MODEL_STRONG"] = "gpt-6.1-sol"
+        self.assertEqual(choose_tier("routine", settings, 0, 0)["model"], "openai/gpt-5-nano")
+        self.assertEqual(choose_tier("signal", settings, 0, 0)["model"], "openai/gpt-5-nano")
+        self.assertEqual(choose_tier("trade", settings, 0, 0)["model"], "openai/gpt-5-nano")
+        self.assertEqual(choose_tier("stakes", settings, 0, 0)["model"], "openai/gpt-6.1-sol")
+        # A downgrade from stakes lands on the cheap model, not the strong one.
+        stepped = choose_tier("stakes", settings, spent_total=2.05, spent_today=0.1)
+        self.assertEqual(stepped["tier"], "trade")
+        self.assertEqual(stepped["model"], "openai/gpt-5-nano")
 
     def test_hard_cap_degrades_then_stops(self):
         settings = llm_settings({})

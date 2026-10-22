@@ -1,6 +1,7 @@
 # Fee-aware uptrend pullback for the Wallex hackathon credit account.
 # Secrets stay in the environment: WALLEX_API_KEY, WALLEX_SUBACCOUNT_ID,
-# LLM_BASE_URL, LLM_API_KEY, LLM_MODEL.
+# LLM_BASE_URL, LLM_API_KEY.
+# LLM_MODEL is ignored. Per-tier overrides are LLM_MODEL_CHEAP and LLM_MODEL_STRONG.
 
 exchange:
   base_url: https://api.wallex.ir
@@ -31,8 +32,8 @@ universe:
     - BNBTMN
     - ADATMN
     - XAUTTMN
-  # Announcement hard-deny, any quote, even if the package later marks them allowed.
-  hard_deny_bases:
+  # Announcement hard denylist, any quote, on top of the allowlist and the live ban list.
+  denylist: &hard_deny
     - TON
     - NEAR
     - FET
@@ -42,6 +43,7 @@ universe:
     - BONK
     - PENDLE
     - RENDER
+  hard_deny_bases: *hard_deny
   candidates:
     - USDTTMN
     - BTCTMN
@@ -142,7 +144,8 @@ liquidation:
 llm:
   # BoxAPI is OpenRouter-like (https://ai.boxapi.ir/ai/v1). Prefer prefixed ids.
   # Bare ids such as gpt-6-luna also answer; the client rewrites the verified ones.
-  # Leave LLM_MODEL empty to use the tiers below. Setting it pins every tier to that model.
+  # LLM_MODEL does not pin tiers. LLM_MODEL_CHEAP overrides routine/signal/trade.
+  # LLM_MODEL_STRONG overrides the stakes tier. Leave both unset to keep this router.
   # Temperature is omitted unless send_temperature is true.
   # A completion cap is sent as max_completion_tokens. gpt-6-luna rejects max_tokens.
   # reasoning_effort is sent and dropped once if the model returns HTTP 400.

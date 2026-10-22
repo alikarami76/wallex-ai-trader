@@ -298,6 +298,8 @@ class MenuAgentTests(unittest.TestCase):
         os.environ["LLM_BASE_URL"] = "https://ai.boxapi.ir/ai/v1"
         os.environ["LLM_API_KEY"] = "test"
         os.environ.pop("LLM_MODEL", None)
+        os.environ.pop("LLM_MODEL_CHEAP", None)
+        os.environ.pop("LLM_MODEL_STRONG", None)
         self.path = Path("data/test_menu_llm.json")
         if self.path.exists():
             self.path.unlink()
@@ -306,6 +308,8 @@ class MenuAgentTests(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("LLM_API_KEY", None)
         os.environ.pop("LLM_MODEL", None)
+        os.environ.pop("LLM_MODEL_CHEAP", None)
+        os.environ.pop("LLM_MODEL_STRONG", None)
         if self.path.exists():
             self.path.unlink()
 

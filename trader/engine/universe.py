@@ -16,10 +16,23 @@ _QUOTES = ("TMN", "USDT", "IRT")
 
 
 def hard_deny_bases(cfg: dict) -> set[str]:
-    raw = (cfg.get("universe") or {}).get("hard_deny_bases")
-    if raw is None:
+    """Announcement bases, from `denylist` and `hard_deny_bases`.
+
+    Either key adds names. When both are missing, the announcement list applies.
+    The denylist sits on top of the allowlist and the live unavailable-markets list.
+    """
+    universe = cfg.get("universe") or {}
+    names: set[str] = set()
+    seen = False
+    for key in ("denylist", "hard_deny_bases"):
+        raw = universe.get(key)
+        if raw is None:
+            continue
+        seen = True
+        names.update(str(item).upper() for item in raw)
+    if not seen:
         return {item.upper() for item in HARD_DENY_BASES}
-    return {str(item).upper() for item in raw}
+    return names
 
 
 def allowlist_symbols(cfg: dict) -> list[str]:

@@ -256,8 +256,9 @@ class LlmClient:
         self._next_at = 0.0
 
     def model_name(self) -> str:
-        chosen = (os.getenv("LLM_MODEL") or "").strip()
-        return canonical_model(chosen or str(self.settings.get("model") or "openai/gpt-6-luna"))
+        """Fallback model when a call has no tier spec. Not a pin for every tier."""
+        cheap = (os.getenv("LLM_MODEL_CHEAP") or "").strip()
+        return canonical_model(cheap or str(self.settings.get("model") or "openai/gpt-6-luna"))
 
     def configured(self) -> bool:
         return bool(os.getenv("LLM_BASE_URL") and os.getenv("LLM_API_KEY") and self.model_name())

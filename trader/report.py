@@ -116,7 +116,28 @@ def _stats(equity: list[dict], trades: list[dict], decisions: list[dict]) -> dic
         "latency_median_ms": latencies[len(latencies) // 2] if latencies else None,
         "latency_p95_ms": latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))] if latencies else None,
         "latency_samples": len(latencies),
+        "residuals": _latest_residuals(decisions),
     }
+
+
+def _latest_residuals(decisions: list[dict]) -> list[dict]:
+    latest: list[dict] = []
+    for row in decisions:
+        if "residuals" in row:
+            latest = list(row.get("residuals") or [])
+    return latest
+
+
+def _residual_lines(rows: list[dict]) -> str:
+    if not rows:
+        return "Residual coin: none."
+    lines = ["Residual coin still held:", ""]
+    for row in rows:
+        lines.append(
+            f"- {row.get('symbol')}: qty {row.get('qty')} "
+            f"mark {row.get('mark_tmn')} TMN. {row.get('reason')}"
+        )
+    return "\n".join(lines)
 
 
 def _sharpe(rets: list[float], dts: list[float]) -> float | None:
@@ -245,6 +266,8 @@ def _markdown(title: str, stats: dict, out_dir: Path) -> str:
 | Logged errors | {stats['errors']} |
 
 Equity samples: {stats['points']}.
+
+{_residual_lines(stats.get('residuals') or [])}
 
 ![Equity](equity.png)
 

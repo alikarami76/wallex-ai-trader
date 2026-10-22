@@ -42,6 +42,20 @@ _SPOT_GET_EXACT = {
 _DENIED_SEGMENTS = ("margin", "leverage", "futures", "otc", "easy-trade", "easytrade", "credit-margin")
 
 
+SPOT_ORDER_PATH = "/v1/account/orders"
+
+
+def assert_spot_order(method: str, path: str) -> None:
+    """Order placement is only POST /v1/account/orders. Cancels stay on DELETE of that path."""
+    method = (method or "").upper()
+    clean = (path or "").split("?", 1)[0].rstrip("/") or "/"
+    if method != "POST" or clean != SPOT_ORDER_PATH:
+        raise WallexError(
+            f"spot-only: order requests are POST {SPOT_ORDER_PATH}, refused {method} {clean}"
+        )
+    assert_spot_request(method, clean)
+
+
 def assert_spot_request(method: str, path: str) -> None:
     """Refuse anything except spot reads and `/v1/account/orders` writes."""
     method = (method or "").upper()
@@ -487,7 +501,9 @@ class WallexClient:
         }
         if self.subaccount_id:
             headers["sub-account-client-id"] = self.subaccount_id
-        return PreparedOrder("POST", f"{self.base_url}/v1/account/orders", headers, body)
+        prepared = PreparedOrder("POST", f"{self.base_url}{SPOT_ORDER_PATH}", headers, body)
+        assert_spot_order(prepared.method, SPOT_ORDER_PATH)
+        return prepared
 
     def place_order(
         self,
@@ -501,6 +517,7 @@ class WallexClient:
         rule: MarketRule,
         price_direction: str,
     ) -> dict:
+        assert_spot_order("POST", SPOT_ORDER_PATH)
         prepared = self.prepare_order(
             symbol=symbol,
             side=side,
@@ -511,6 +528,8 @@ class WallexClient:
             rule=rule,
             price_direction=price_direction,
         )
+        if prepared.method != "POST" or not prepared.url.split("?", 1)[0].rstrip("/").endswith(SPOT_ORDER_PATH):
+            raise WallexError(f"spot-only: prepared order left {SPOT_ORDER_PATH}")
         if self.dry_run or not self.api_key:
             log.info("order not sent: %s", prepared.redacted())
             return {
@@ -519,7 +538,7 @@ class WallexClient:
                 "result": {"clientOrderId": client_id, "status": "DRY_RUN", "active": False},
                 "request": prepared.redacted(),
             }
-        response = self._request("POST", "/v1/account/orders", body=prepared.body, auth=True, is_order=True)
+        response = self._request("POST", SPOT_ORDER_PATH, body=prepared.body, auth=True, is_order=True)
         response["request"] = prepared.redacted()
         return response
 

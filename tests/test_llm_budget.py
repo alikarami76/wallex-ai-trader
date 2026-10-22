@@ -72,6 +72,7 @@ class LlmBudgetTests(unittest.TestCase):
             self.assertIn("prompt_tokens", saved["calls"][0])
         finally:
             os.environ.pop("LLM_API_KEY", None)
+            os.environ.pop("LLM_MODEL", None)
             if path.exists():
                 path.unlink()
 

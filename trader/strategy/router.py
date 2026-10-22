@@ -74,13 +74,23 @@ def canonical_model(name: str) -> str:
 
 
 def list_prices(model: str, settings: dict | None = None) -> tuple[float, float]:
+    """USD per 1M tokens. Known models keep their list price.
+
+    gpt-6-sol and gpt-6.1-sol are $2 / $10. gpt-6-luna is $0.10 / $0.50.
+    The luna assumed rate is only for a model that is not in the table.
+    """
     settings = settings or {}
     key = (model or "").strip()
-    if key in LIST_PRICES:
-        return LIST_PRICES[key]
-    bare = key.split("/")[-1]
-    if bare in LIST_PRICES:
-        return LIST_PRICES[bare]
+    bare = key.split("/")[-1].lower()
+    table = {name.lower(): pair for name, pair in LIST_PRICES.items()}
+    if key.lower() in table:
+        return table[key.lower()]
+    if bare in table:
+        return table[bare]
+    if "gpt-6.1-sol" in bare or "gpt-6-sol" in bare:
+        return (2.0, 10.0)
+    if "gpt-6-luna" in bare:
+        return (0.10, 0.50)
     return (
         float(settings.get("assumed_input_usd_per_million", 0.10)),
         float(settings.get("assumed_output_usd_per_million", 0.50)),
@@ -135,6 +145,15 @@ def tier_table(settings: dict) -> dict[str, dict]:
     return table
 
 
+def _tier_env_model(tier: str) -> str:
+    """Per-tier override. `LLM_MODEL` is not read, so it cannot pin every tier."""
+    if tier in {"routine", "signal", "trade"}:
+        return (os.getenv("LLM_MODEL_CHEAP") or "").strip()
+    if tier == "stakes":
+        return (os.getenv("LLM_MODEL_STRONG") or "").strip()
+    return ""
+
+
 def choose_tier(task: str, settings: dict, spent_total: float, spent_today: float) -> dict:
     """Return the tier to call. `downgraded` is true when the budget stepped it down."""
     requested = task if task in ORDER else "routine"
@@ -152,8 +171,11 @@ def choose_tier(task: str, settings: dict, spent_total: float, spent_today: floa
         index = max(0, index - 1)
     name = ORDER[index]
     spec = dict(tier_table(settings)[name])
-    pinned = (os.getenv("LLM_MODEL") or "").strip()
-    spec["model"] = canonical_model(pinned or spec.get("model") or "")
+    # LLM_MODEL used to pin every tier, which forced the sol stakes tier onto luna.
+    # Cheap tiers read LLM_MODEL_CHEAP. The stakes tier reads LLM_MODEL_STRONG.
+    # Unset, the config router stays as it is.
+    override = _tier_env_model(name)
+    spec["model"] = canonical_model(override or spec.get("model") or "")
     spec["tier"] = name
     spec["requested_tier"] = requested
     spec["downgraded"] = name != requested

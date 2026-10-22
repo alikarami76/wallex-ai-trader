@@ -6,7 +6,8 @@ from trader.strategy.parser import AgentDecision, ParsedDecision
 from trader.strategy.signals import Candidate
 from trader.timeutil import TEHRAN
 from trader.types import MarketRule
-from trader.wallex.client import WallexClient, WallexError, assert_spot_request
+from trader.config import load_config
+from trader.wallex.client import WallexClient, WallexError, assert_spot_order, assert_spot_request
 from datetime import datetime
 
 
@@ -80,6 +81,18 @@ class SpotPathTests(unittest.TestCase):
         client = WallexClient(dry_run=True, api_key="test")
         with self.assertRaises(WallexError):
             client._request("POST", "/v1/account/leverage/orders", body={"symbol": "BTCTMN"}, auth=True, is_order=True)
+        for method, path in refused:
+            with self.assertRaises(WallexError, msg=path):
+                assert_spot_order(method, path)
+        rule = _rule("BTCTMN", "BTC")
+        placed = client.place_order(
+            symbol="BTCTMN", side="BUY", order_type="LIMIT", quantity=500, price=100,
+            client_id="SCSPOT1", rule=rule, price_direction="down",
+        )
+        request = placed["request"]
+        self.assertEqual(request["method"], "POST")
+        self.assertTrue(request["url"].endswith("/v1/account/orders"))
+        self.assertNotIn("margin", request["url"])
 
 
 class AllowlistTests(unittest.TestCase):
@@ -111,6 +124,17 @@ class AllowlistTests(unittest.TestCase):
         self.assertEqual(banned, [])
         self.assertIn("banned", symbol_block("BTCTMN", cfg, {"BTCTMN"}, rules["BTCTMN"]))
         self.assertTrue(is_hard_denied("BONKUSDT", {"universe": {}}))
+        cfg = _cfg()
+        cfg["universe"].pop("hard_deny_bases")
+        cfg["universe"]["denylist"] = ["TON", "NEAR", "FET", "INJ", "TAO", "WIF", "BONK", "PENDLE", "RENDER"]
+        cfg["universe"]["allowlist"] = ["BTCTMN", "TONTMN", "RENDERUSDT"]
+        self.assertIn("hard-denied", symbol_block("TONTMN", cfg, set(), rules["TONTMN"]))
+        self.assertIn("hard-denied", symbol_block("RENDERUSDT", cfg, set(), rules["RENDERUSDT"]))
+        self.assertIsNone(symbol_block("BTCTMN", cfg, set(), rules["BTCTMN"]))
+        shipped = load_config("config/default.yaml")
+        for base in ("TON", "NEAR", "FET", "INJ", "TAO", "WIF", "BONK", "PENDLE", "RENDER"):
+            self.assertIn(base, {item.upper() for item in shipped["universe"]["denylist"]})
+            self.assertIn("hard-denied", symbol_block(f"{base}USDT", shipped, set(), None))
 
     def test_risk_refuses_a_hard_denied_buy_even_when_the_package_allows_it(self):
         cfg = _cfg()
