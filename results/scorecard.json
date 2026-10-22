@@ -1,0 +1,29 @@
+{
+  "rows": 7,
+  "shadow_rows": 7,
+  "signals": 0,
+  "rules_pnl_tmn": 0.0,
+  "taken_pnl_tmn": 0.0,
+  "gap_tmn": 0.0,
+  "buckets": {
+    "vetoed": {
+      "n": 0,
+      "rules_pnl_tmn": 0.0,
+      "taken_pnl_tmn": 0.0,
+      "exits": {}
+    },
+    "shrunk": {
+      "n": 0,
+      "rules_pnl_tmn": 0.0,
+      "taken_pnl_tmn": 0.0,
+      "exits": {}
+    },
+    "accepted": {
+      "n": 0,
+      "rules_pnl_tmn": 0.0,
+      "taken_pnl_tmn": 0.0,
+      "exits": {}
+    }
+  },
+  "trades": []
+}

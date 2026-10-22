@@ -1,0 +1,242 @@
+# Fee-aware uptrend pullback for the Wallex hackathon credit account.
+# Secrets stay in the environment: WALLEX_API_KEY, WALLEX_SUBACCOUNT_ID,
+# LLM_BASE_URL, LLM_API_KEY.
+# LLM_MODEL is ignored. Per-tier overrides are LLM_MODEL_CHEAP and LLM_MODEL_STRONG.
+
+exchange:
+  base_url: https://api.wallex.ir
+  package_id: 183
+  timeout_seconds: 20
+  max_retries: 4
+
+account:
+  initial_equity_tmn: 5000000
+
+fees:
+  # Tier-1 TMN spot. Live mode replaces these with GET /v1/account/fee when the key works.
+  maker_rate: 0.0025
+  taker_rate: 0.0030
+  slippage_bps: 3
+
+universe:
+  # Explicit spot allowlist. A name must be here AND absent from the package
+  # unavailableMarkets list. Nothing else can be bought.
+  # Liquid TMN majors from the 2026-10-22 allowed-market snapshot.
+  allowlist:
+    - USDTTMN
+    - BTCTMN
+    - ETHTMN
+    - SOLTMN
+    - XRPTMN
+    - DOGETMN
+    - BNBTMN
+    - ADATMN
+    - XAUTTMN
+  # Announcement hard denylist, any quote, on top of the allowlist and the live ban list.
+  denylist: &hard_deny
+    - TON
+    - NEAR
+    - FET
+    - INJ
+    - TAO
+    - WIF
+    - BONK
+    - PENDLE
+    - RENDER
+  hard_deny_bases: *hard_deny
+  candidates:
+    - USDTTMN
+    - BTCTMN
+    - ETHTMN
+    - XAUTTMN
+    - XRPTMN
+    - DOGETMN
+    - SOLTMN
+    - BNBTMN
+    - ADATMN
+  max_symbols: 6
+  min_quote_volume_tmn: 8000000000
+  max_spread_bps: 22
+  # Depth snapshot from 2026-10-22. Live mode replaces this with the current book.
+  spread_bps_snapshot:
+    USDTTMN: 1.8
+    BTCTMN: 16.3
+    ETHTMN: 18.9
+    XAUTTMN: 10.4
+    XRPTMN: 18.8
+    DOGETMN: 8.9
+    SOLTMN: 24.4
+    BNBTMN: 31.0
+    ADATMN: 22.2
+
+strategy:
+  ema_fast: 8
+  ema_slow: 24
+  pullback_bars: 4
+  pullback_roc_max: -0.004
+  pullback_roc_min: -0.025
+  trend_bars: 24
+  trend_roc_min: 0.01
+  # Moskowitz, Ooi and Pedersen time-series momentum, on a 3-day window.
+  # A prior floor of zero, not a fitted threshold.
+  slow_bars: 72
+  slow_roc_min: 0.0
+  rsi_period: 14
+  atr_period: 14
+  max_atr_pct: 0.03
+  # Researched 24h drift of this setup, before fees. Not a per-trade forecast.
+  # The rules-only backtest keeps this 0.9% prior. Live and shadow use ops.frozen_gross_prior.
+  expected_gross: 0.009
+  edge_multiple: 1.2
+  min_micro_return: -0.004
+  entry_size_fraction: 0.12
+  imbalance_block: -0.55
+
+liquidity:
+  # Depth is quote notional within this fraction of mid, from /v2/depth/all.
+  # Z-scores use a 24-point window and need 18 prior points. |z| >= 2 blocks.
+  # The scale multiplies size after quarter-Kelly. It does not raise size.
+  depth_band: 0.01
+  depth_band_tight: 0.005
+  history: 24
+  min_history: 18
+  z_block: 2.0
+  max_order_fraction_of_depth: 0.10
+  min_depth_tmn: 1000000
+  min_scale: 0.50
+  exit_defer_hours: 6
+
+execution:
+  # Join the bid (maker). A marketable limit is the old taker entry and is off.
+  # Stops still cross the spread. quote_gamma is the Avellaneda-Stoikov inventory weight.
+  entry: limit_maker
+  exit: limit_maker
+  stop_slippage_bps: 5
+  quote_gamma: 0.5
+
+risk:
+  max_fraction_per_trade: 0.12
+  max_fraction_per_symbol: 0.12
+  # Quarter-Kelly. p and payoff are priors (Kelly 1956; Thorp). The 12% caps still bind.
+  kelly_fraction: 0.25
+  kelly_win_prob: 0.55
+  kelly_payoff: 1.0
+  max_gross_exposure: 0.30
+  max_positions: 2
+  stop_loss_pct: 0.045
+  # Six hours, and never past liquidation.flat_by.
+  time_stop_hours: 6
+  trail_arm_pct: 0.025
+  trail_distance_pct: 0.012
+  cooldown_after_stop_seconds: 21600
+  max_orders_per_hour: 8
+  max_entries_per_hour: 2
+  daily_max_drawdown: 0.015
+  global_max_drawdown: 0.03
+  min_notional_tmn: 50000
+  min_confidence: 0.55
+
+liquidation:
+  deadline: "2026-10-23T23:50:00+03:30"
+  start_before_minutes: 60
+  aggressive_before_minutes: 30
+  flat_by: "2026-10-23T23:30:00+03:30"
+  # 23:30 flat minus the Fri 21:00 entry cutoff. A shorter gap would close entries early.
+  min_hours_to_enter: 2.5
+
+ops:
+  # Measured gross per closed trade on the recorded backtest (~0.45%).
+  # Entries stay blocked unless ev_override was set before go-live and then locked.
+  frozen_gross_prior: 0.0045
+  entry_cutoff: "2026-10-23T21:00:00+03:30"
+  zscore_min_n: 18
+  size_cut_pnl: -0.005
+  unprotected_stop_pnl: -0.02
+  fee_maker_bps_max: 25
+  fee_taker_bps_max: 30
+
+llm:
+  # BoxAPI is OpenRouter-like (https://ai.boxapi.ir/ai/v1). Prefer prefixed ids.
+  # Bare ids such as gpt-6-luna also answer; the client rewrites the verified ones.
+  # LLM_MODEL does not pin tiers. LLM_MODEL_CHEAP overrides routine/signal/trade.
+  # LLM_MODEL_STRONG overrides the stakes tier. Leave both unset to keep this router.
+  # Temperature is omitted unless send_temperature is true.
+  # A completion cap is sent as max_completion_tokens. gpt-6-luna rejects max_tokens.
+  # reasoning_effort is sent and dropped once if the model returns HTTP 400.
+  # Spend is response usage.cost. /key and /credits are a shared upstream account, not our balance.
+  model: openai/gpt-6-luna
+  enabled: true
+  timeout_seconds: 20
+  routine_timeout_seconds: 8
+  send_temperature: false
+  temperature: 0.1
+  send_response_format: false
+  tiers:
+    routine: # tier0, flat-cycle headline scoring
+      model: openai/gpt-6-luna
+      reasoning_effort: low
+    signal: # tier1, sell / reduce / cancel, no new buy
+      model: openai/gpt-6-luna
+      reasoning_effort: medium
+    trade: # tier2, default decision when a buy is legal and the book is flat
+      model: openai/gpt-6-luna
+      reasoning_effort: medium
+    stakes: # tier3, rare: a buy while already exposed, or the day is already down 0.75%
+      model: openai/gpt-6-sol
+      reasoning_effort: high
+  # $3 competition budget. The ledger is the sum of usage.cost. Hard stop at $2.50.
+  # At $2.00 total or $1.00 today the router steps down one tier; inside $0.20 of a cap it uses routine.
+  # At the hard cap the call is skipped and the deterministic fallback runs.
+  competition_budget_usd: 3.00
+  max_llm_calls_per_hour: 8
+  max_llm_calls_total: 160
+  max_spend_usd: 2.50
+  max_spend_usd_per_day: 1.25
+  downgrade_spend_usd: 2.00
+  downgrade_daily_usd: 1.00
+  high_stakes_exposure: 0.0
+  high_stakes_daily_drawdown: 0.0075
+  min_interval_seconds: 1
+  max_retries: 3
+  retry_backoff_seconds: 0.5
+  # List prices are per model (see STRATEGY). These two are the luna list, used only for an unknown model.
+  # Missing usage.cost is list price times price_markup (measured bills run about 15% above list).
+  # Reasoning tokens bill as output. A call with no usage at all is priced as ~3k in + ~500 out.
+  assumed_input_usd_per_million: 0.10
+  assumed_output_usd_per_million: 0.50
+  price_markup: 1.15
+  typical_prompt_tokens: 3000
+  typical_completion_tokens: 500
+  assumed_usd_per_call_if_usage_missing: 0.0006325
+  cache_seconds: 3600
+  sentiment_cache_seconds: 900
+  usage_path: data/llm_usage.json
+
+mcp:
+  enabled: true
+  url: https://api.wallex.ir/mcp
+  timeout_seconds: 8
+  refresh_seconds: 600
+
+runtime:
+  loop_interval_seconds: 60
+  candle_refresh_seconds: 300
+  history_days: 29
+
+sentiment:
+  enabled: true
+  fear_greed_url: https://api.alternative.me/fng/
+  # Turned on only when the ablation in results/backtest/sentiment_ablation.json says it helps.
+  block_extreme_greed: false
+  extreme_greed: 80
+  cache_seconds: 900
+  history_cache_seconds: 21600
+  cache_path: data/sentiment_cache.json
+  timeout_seconds: 8
+
+validation:
+  # Families inspected before this rule was locked: breakout, continuation,
+  # cross-sectional momentum, dip reversal, tight-stop pullback, this one.
+  folds: 3
+  n_trials: 6
+  warmup_bars: 80

@@ -1,0 +1,16 @@
+[Unit]
+Description=Wallex Starcoach AI trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/wallex-ai-trader
+EnvironmentFile=-/opt/wallex-ai-trader/.env
+ExecStart=/usr/bin/python3 -m trader --mode live --config config/default.yaml
+Restart=on-failure
+RestartSec=15
+# stdout/stderr go to the journal: journalctl -u wallex-trader -f
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,25 @@
+{
+  "app": "wallex-ai-trader",
+  "platform": "docker",
+  "port": 8080,
+  "build": {
+    "location": "iran",
+    "dockerfile": "Dockerfile"
+  },
+  "disks": [
+    {
+      "name": "data",
+      "mountTo": "/data"
+    }
+  ],
+  "healthCheck": {
+    "command": "CMD curl --fail http://localhost:8080/health || exit 1",
+    "interval": 30,
+    "timeout": 15,
+    "retries": 3,
+    "startPeriod": 10
+  },
+  "docker": {
+    "timezone": "Asia/Tehran"
+  }
+}

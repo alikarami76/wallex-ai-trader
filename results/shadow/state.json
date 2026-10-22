@@ -1,0 +1,17 @@
+{
+  "portfolio": {
+    "cash": 5000000.0,
+    "realized_pnl": 0.0,
+    "fees_paid": 0.0,
+    "positions": {}
+  },
+  "peak_equity": 5000000.0,
+  "day_start_equity": 5000000.0,
+  "day_key": "2026-10-22",
+  "kill_switch": false,
+  "kill_reason": "",
+  "cooldowns": {},
+  "order_times": [],
+  "pending": {},
+  "client_seq": 1
+}

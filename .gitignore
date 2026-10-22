@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+data/
+*.tmp
+.pytest_cache/
+results/compare/head/
+results/e2e/

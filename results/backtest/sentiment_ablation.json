@@ -1,0 +1,21 @@
+{
+  "hypothesis": "block new entries when lagged Fear & Greed is >= 80",
+  "without_gate": {
+    "ending_equity": 4983233.31,
+    "return_pct": -0.335,
+    "max_drawdown_pct": 0.491,
+    "realized_pnl": -16766.69,
+    "fees_paid": 12660.13,
+    "closed_trades": 23
+  },
+  "with_gate": {
+    "ending_equity": 4983233.31,
+    "return_pct": -0.335,
+    "max_drawdown_pct": 0.491,
+    "realized_pnl": -16766.69,
+    "fees_paid": 12660.13,
+    "closed_trades": 23
+  },
+  "gate_helps": false,
+  "decision_rule": "keep the gate only if return rises by >= 0.05pp, drawdown is not worse by > 0.10pp, and closed trades stay >= 8"
+}

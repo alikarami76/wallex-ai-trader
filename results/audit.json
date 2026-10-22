@@ -1,0 +1,55 @@
+{
+  "ok": true,
+  "failures": [],
+  "starting_cash_tmn": 5000000.0,
+  "cash_tmn": 5000000.0,
+  "coins": {},
+  "max_drift_tmn": 0.0,
+  "drift": [
+    {
+      "ts": "2026-10-22T16:35:12+03:30",
+      "rebuilt_equity_tmn": 5000000.0,
+      "logged_equity_tmn": 5000000.0,
+      "drift_tmn": 0.0
+    },
+    {
+      "ts": "2026-10-22T16:36:01+03:30",
+      "rebuilt_equity_tmn": 5000000.0,
+      "logged_equity_tmn": 5000000.0,
+      "drift_tmn": 0.0
+    },
+    {
+      "ts": "2026-10-22T16:36:50+03:30",
+      "rebuilt_equity_tmn": 5000000.0,
+      "logged_equity_tmn": 5000000.0,
+      "drift_tmn": 0.0
+    },
+    {
+      "ts": "2026-10-22T16:37:39+03:30",
+      "rebuilt_equity_tmn": 5000000.0,
+      "logged_equity_tmn": 5000000.0,
+      "drift_tmn": 0.0
+    },
+    {
+      "ts": "2026-10-22T16:38:28+03:30",
+      "rebuilt_equity_tmn": 5000000.0,
+      "logged_equity_tmn": 5000000.0,
+      "drift_tmn": 0.0
+    }
+  ],
+  "duplicate_client_ids": [],
+  "gaps": [],
+  "clock_mismatches": [],
+  "order_failures": [],
+  "fills": [],
+  "fee_bill_tmn": 0,
+  "secret_hits": [],
+  "snapshot": null,
+  "rows": {
+    "cycles.jsonl": 0,
+    "decisions.jsonl": 7,
+    "adjustments.jsonl": 0,
+    "reviews.jsonl": 0,
+    "replay.jsonl": 0
+  }
+}
