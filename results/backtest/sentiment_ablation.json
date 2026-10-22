@@ -1,19 +1,19 @@
 {
   "hypothesis": "block new entries when lagged Fear & Greed is >= 80",
   "without_gate": {
-    "ending_equity": 4993712.5,
-    "return_pct": -0.126,
-    "max_drawdown_pct": 0.436,
-    "realized_pnl": -349.05,
-    "fees_paid": 11736.35,
+    "ending_equity": 4993023.91,
+    "return_pct": -0.14,
+    "max_drawdown_pct": 0.415,
+    "realized_pnl": -1037.64,
+    "fees_paid": 10242.27,
     "closed_trades": 17
   },
   "with_gate": {
-    "ending_equity": 4993712.5,
-    "return_pct": -0.126,
-    "max_drawdown_pct": 0.436,
-    "realized_pnl": -349.05,
-    "fees_paid": 11736.35,
+    "ending_equity": 4993023.91,
+    "return_pct": -0.14,
+    "max_drawdown_pct": 0.415,
+    "realized_pnl": -1037.64,
+    "fees_paid": 10242.27,
     "closed_trades": 17
   },
   "gate_helps": false,

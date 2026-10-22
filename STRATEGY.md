@@ -159,7 +159,7 @@ Both the level and the change are fields on each symbol's feature payload, so th
 
 The only hard rule that was tested is pre-specified: block a new entry when lagged Fear & Greed is at least 80 (extreme greed), on the view that a pullback in a crowded market is more likely to become a larger decline. It is kept only if the with-gate backtest beats the without-gate backtest by at least 0.05 percentage points of return, does not worsen max drawdown by more than 0.10 points, and still closes at least 8 trades. Otherwise the number stays an input and the gate stays off. The comparison is `results/backtest/sentiment_ablation.json`. Thresholds were not searched.
 
-On the 2026-10-22 hourly window the lagged index ranged from 53 to 78. It never reached 80, so the gate bound zero times. With and without the gate the books are the same: ending equity 4,993,712 TMN, return −0.126%, max drawdown 0.436%, realized PnL −349 TMN, fees 11,736 TMN, 17 closed trades. `gate_helps` is false, and `sentiment.block_extreme_greed` stays false. The level and the daily change are still attached on every feature row (695 rows, none missing) and are passed to the regime filter. Headline scores are live-only. From this network CoinDesk and Cointelegraph RSS answer; CryptoPanic and Reddit return 403 and are skipped.
+On the 2026-10-22 hourly window the lagged index ranged from 53 to 78. It never reached 80, so the gate bound zero times. With and without the gate the books are the same: ending equity 4,993,024 TMN, return −0.140%, max drawdown 0.415%, realized PnL −1,038 TMN, fees 10,242 TMN, 17 closed trades. That rerun includes the volume liquidity score. `gate_helps` is false, and `sentiment.block_extreme_greed` stays false. The level and the daily change are still attached on every feature row (695 rows, none missing) and are passed to the regime filter. Headline scores are live-only. From this network CoinDesk and Cointelegraph RSS answer; CryptoPanic and Reddit return 403 and are skipped.
 
 ## Literature
 
@@ -185,15 +185,15 @@ The report's desk block is PnL after fees (mark-to-market and realized), annuali
 
 | Desk metric | Value |
 | --- | --- |
-| PnL after fees, mark-to-market | −6,288 TMN (−0.126%) |
-| PnL after fees, realized | −349 TMN |
-| Sharpe (annualized) | −1.13 |
-| Max drawdown | 0.436% |
+| PnL after fees, mark-to-market | −6,976 TMN (−0.140%) |
+| PnL after fees, realized | −1,038 TMN |
+| Sharpe (annualized) | −1.47 |
+| Max drawdown | 0.415% |
 | Hit rate | 58.8% (17 closed trades) |
-| Fees | 11,736 TMN |
-| Deflated Sharpe probability | 0.052 (per-bar Sharpe −0.0121, hurdle 0.048 at N=6) |
+| Fees | 10,242 TMN |
+| Deflated Sharpe probability | 0.043 (per-bar Sharpe −0.0157, hurdle 0.048 at N=6) |
 
-Fear & Greed was attached on every bar (lagged, range 53–78). The extreme-greed gate was left off because the ablation did not change a single trade. Walk-forward, frozen parameters, fresh 5,000,000 TMN each fold: +0.136%, −0.154%, −0.153%. Fold deflated-Sharpe probabilities are 0.173, 0.000, and 0.003. The rule does not clear the Bailey and López de Prado hurdle. Parameters were not changed after seeing this. Open buys on the last bar are why mark-to-market PnL is worse than realized PnL. Candle aggregation for BTCTMN matched native hourly closes (median absolute error 0). The series used for the ablation is `results/backtest/fear_greed.json`.
+Fear & Greed was attached on every bar (lagged, range 53–78). The extreme-greed gate was left off because the ablation did not change a single trade. The volume liquidity score was on, which is why size and fees differ from the prior run; depth and spread shocks were not, because the hourly history has no book. Walk-forward, frozen parameters, fresh 5,000,000 TMN each fold: +0.102%, −0.139%, −0.145%. Fold deflated-Sharpe probabilities are 0.163, 0.000, and 0.003. The rule does not clear the Bailey and López de Prado hurdle. Parameters were not changed after seeing this. Open buys on the last bar are why mark-to-market PnL is worse than realized PnL. Candle aggregation for BTCTMN matched native hourly closes (median absolute error 0). The series used for the ablation is `results/backtest/fear_greed.json`.
 
 A short shadow the same afternoon (`--duration 200 --interval 45`, no API key) ran five fallback cycles from 16:35 to 16:38 Asia/Tehran. No candidate cleared the gates, so there were no orders. Equity stayed 5,000,000 TMN. Median decision latency was 4.1 seconds. Fear & Greed printed 68 (Greed), up 5 from the prior published point. CoinDesk and Cointelegraph headlines were scored; CryptoPanic and Reddit returned 403 and were skipped. Later cycles reused the 15-minute headline cache. The Wallex MCP candle tool responded. Zero errors.
 
