@@ -1,6 +1,9 @@
 {
+  "sha_a": "3880ac429f56f652cffd871d11dc5b05a1bd70ce",
+  "sha_b": "32aa7c1de902ab1b43931e54a0cc84cd53521e09",
+  "replayed_b": true,
   "base_sha": "3880ac429f56f652cffd871d11dc5b05a1bd70ce",
-  "head_sha": "8d2948e5e1258a8fd570943c8291b0138dffed7c",
+  "head_sha": "32aa7c1de902ab1b43931e54a0cc84cd53521e09",
   "config_hash": "ca79f960827676f3177a2b1940ee06c2b16bf77c5d75c3c9e39fedccc540fd0d",
   "identical": true,
   "base": {

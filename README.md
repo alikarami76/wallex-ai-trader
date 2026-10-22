@@ -72,8 +72,14 @@ python3 -m trader replay --log-dir results/live
 python3 -m trader scorecard
 
 # Replay the stored candles and diff the trade list against a recorded commit.
-# Does not rewrite results/backtest/.
+# Does not rewrite results/backtest/. The second ref may be another commit.
 python3 -m trader backtest --compare 3880ac429f56f652cffd871d11dc5b05a1bd70ce HEAD
+
+# Offline journal audit. No keys. Writes results/audit.md and results/audit.json.
+python3 -m trader audit --log-dir results/shadow
+
+# Optional sidecar. Off unless WATCHDOG_ENABLED=1. Does not write journals.
+# WATCHDOG_ENABLED=1 python3 -m trader watchdog --log-dir results/live --once
 ```
 
 `./scripts/run.sh shadow --duration 900 --fresh` loads `.env` and calls the same CLI.
@@ -118,11 +124,29 @@ When both `TELEGRAM_ALERT_BOT_TOKEN` and `TELEGRAM_ALERT_CHAT_ID` are set, the p
 
 ### Compare
 
-`python -m trader backtest --compare <sha> HEAD` replays the stored candles with the 2026-10-22 market precision, diffs the trade list against that commit's `results/backtest/trades.csv`, and writes `results/compare/compare.md` plus `compare.json`. The report stamps the base SHA, the HEAD SHA, and the config hash. A sensitivity table reruns the same candles at 1.0× and 1.5× fees, each with 0 and +5 bps extra slippage. Those multiples are copies; `config/default.yaml` is not edited, and `results/backtest/` is not rewritten.
+`python -m trader backtest --compare <sha_a> <sha_b>` diffs the two trade lists and stamps both SHAs and the config hash. `HEAD` replays the stored candles. Any other second ref uses the trade list committed at that SHA. A sensitivity table reruns the same candles at 1.0× and 1.5× fees, each with 0 and +5 bps extra slippage. Those multiples are copies; `config/default.yaml` is not edited, and `results/backtest/` is not rewritten.
 
-HEAD versus `3880ac429f56f652cffd871d11dc5b05a1bd70ce` is identical: −0.140% mark-to-market, 17 closed trades, ending equity 4,993,023.91105763 TMN. At 1.5× fees the existing cost gate takes no trades. At 1.0× fees and +5 bps extra slippage the same 17 trades finish at −0.142%.
+`3880ac429f56f652cffd871d11dc5b05a1bd70ce` versus HEAD `32aa7c1de902ab1b43931e54a0cc84cd53521e09` is identical: −0.140% mark-to-market, 17 closed trades, ending equity 4,993,023.91105763 TMN. At 1.5× fees the existing cost gate takes no trades. At 1.0× fees and +5 bps extra slippage the same 17 trades finish at −0.142%. A bar that trades through both the stop and a target exits at the stop. That order was already the engine's behavior, and the compare test locks it.
 
 Random model text cannot raise a size or turn a veto into a buy. The order-guard property tests and the schema veto cover that. Nothing in this section sets `TRADER_LIVE_AUTHORIZED`.
+
+## Audit and evaluation
+
+These commands read journals and stored candles. They do not place orders, call the model, or change C0, the state machine, or B1–B10.
+
+### Journal audit
+
+`python -m trader audit` reads the jsonl files and writes `results/audit.md` and `results/audit.json`. It rebuilds TMN and coin balances from fills and fees and flags equity drift over 1 TMN. `--wallex-snapshot` compares that book with a balances file. It also checks duplicate `client_id`s, cycle gaps over 5 minutes, `ts_utc` against `ts_tehran` (+03:30), and that every submitted order has an all-pass `gate_trace`, `git_sha` equal to `go_live_sha`, and the config hash. Each fill is listed with maker or taker and slippage versus mid, in bps. The fee bill is its own line. A regex hit for a secret-like string fails the audit, and the match is not copied into the report. `python -m trader report --checkpoint C0` (and C1–C4) appends this summary under the playbook text. The suggested action is unchanged.
+
+The shadow journal audits clean: no fills, 0 TMN drift, no secret hits.
+
+### Random-entry baseline
+
+The backtest report includes 1,000 seeded runs on the same universe and denylist, with the same 24-hour hold, stop, trail, fees, and size. Only the entry times are random. On the recorded book the strategy return of −0.14% is at the 76.7 percentile of those runs, and the Sharpe of −1.47 is at the 61.4 percentile. Return quantiles are −2.389 / −1.418 / −0.777 / −0.184 / 0.598 percent at p05 / p25 / p50 / p75 / p95. Sharpe quantiles are −6.49 / −4.04 / −2.30 / −0.55 / 1.94. The numbers are in `results/backtest/baseline.json`.
+
+### Watchdog
+
+`trader/watchdog.py` is a separate process. It tails `cycles.jsonl` and `decisions.jsonl` and can send one Telegram alert for a cycle gap over 5 minutes, `HALT` or `KILLED`, rejected orders above zero, or taker entry fills above zero. The same event type is quiet for 15 minutes. The message is the event and the percent PnL. The token comes from `TELEGRAM_ALERT_BOT_TOKEN` and `TELEGRAM_ALERT_CHAT_ID`. The process writes nothing under the journal directory. It stays off unless `WATCHDOG_ENABLED` is set.
 
 ## Unattended run
 

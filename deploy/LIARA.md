@@ -72,6 +72,7 @@ liara env set --app wallex-ai-trader --force \
 | `DASHBOARD_PASSWORD` | Basic-auth password. Set it with the keys above, not in the image. |
 | `TELEGRAM_ALERT_BOT_TOKEN` | Optional. Alerts stay off unless this and the chat id are both set. |
 | `TELEGRAM_ALERT_CHAT_ID` | Optional chat for a cycle gap, HALT or KILLED, an order reject, or a taker entry fill. |
+| `WATCHDOG_ENABLED` | Optional. The journal sidecar stays off unless this is `1`. It does not place orders. |
 
 `LLM_MODEL` is ignored. It does not pin every tier.
 
