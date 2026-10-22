@@ -127,13 +127,13 @@ The live book is already locked. A new image whose `config/default.yaml` hash di
 ```bash
 sha256sum config/default.yaml
 liara env set --app wallex-ai-trader --force \
-  TRADER_APPROVED_CONFIG_HASH=a589f0d17499650c8b281b9b079def4215bc7f5d66fb3c88d6c2637adef1e1cc \
+  TRADER_APPROVED_CONFIG_HASH=6f8fc2d60d8c910d133ee5e1d0b4995141a918c09df4436c953155d313673e28 \
   TRADER_GIT_SHA="<deployed commit>" \
   TRADER_EV_OVERRIDE=1 \
   TRADER_LIVE_AUTHORIZED=1
 ```
 
-`a589f0d17499650c8b281b9b079def4215bc7f5d66fb3c88d6c2637adef1e1cc` is the SHA-256 of this image's `config/default.yaml`. It is the file that was hot-deployed with the Fri 21:00 cutoff and `min_hours_to_enter: 2.5`. Recompute it if the file changes. `TRADER_GIT_SHA` is the commit you deploy.
+`6f8fc2d60d8c910d133ee5e1d0b4995141a918c09df4436c953155d313673e28` is the SHA-256 of this image's `config/default.yaml` (adds `strategy.name` and optional `take_profit_pct`; default behavior stays `uptrend_pullback`). Recompute it if the file changes. `TRADER_GIT_SHA` is the commit you deploy.
 
 The image has no git metadata. Without `TRADER_GIT_SHA` the lock stores `unknown`. Set that variable to the commit being deployed before the new process starts, and do not wipe `/data/state.json`.
 

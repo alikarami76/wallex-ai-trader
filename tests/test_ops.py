@@ -243,7 +243,7 @@ class StateMachineTests(unittest.TestCase):
 
         self.assertEqual(
             config_file_hash("config/default.yaml"),
-            "a589f0d17499650c8b281b9b079def4215bc7f5d66fb3c88d6c2637adef1e1cc",
+            "6f8fc2d60d8c910d133ee5e1d0b4995141a918c09df4436c953155d313673e28",
         )
         self.assertEqual(clock_status(loaded), {
             "entry_cutoff": "2026-10-23T21:00:00+03:30",

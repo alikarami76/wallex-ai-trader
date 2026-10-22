@@ -268,7 +268,7 @@ def build_candidates(rows: list[SymbolFeatures], cfg: dict) -> list[Candidate]:
         found.append(
             Candidate(
                 symbol=row.symbol,
-                setup="uptrend_pullback",
+                setup=str((cfg.get("strategy") or {}).get("name") or "uptrend_pullback"),
                 size_fraction=size,
                 score=row.score,
                 expected_gross=row.expected_gross,

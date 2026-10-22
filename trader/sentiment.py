@@ -218,7 +218,9 @@ class SentimentFeed:
                 snap.sources_ok.append(name)
             except Exception as exc:
                 snap.sources_failed.append(name)
-                if _status_code(exc) == 410:
+                code = _status_code(exc)
+                if code in {403, 410} or name in {"cryptopanic", "reddit"}:
+                    # Dead or blocked feeds stay off for the process. Fear & greed still runs.
                     self._disabled_sources.add(name)
                 self._log_source_failure(name, exc)
         if not titles:
@@ -253,6 +255,11 @@ class SentimentFeed:
         if now - self._logged_at.get(name, 0.0) < 3600:
             return
         self._logged_at[name] = now
+        code = _status_code(exc)
+        # Cryptopanic 410 and Reddit blocks are expected; keep them off the cycle log.
+        if name in {"cryptopanic", "reddit"} or code in {403, 410, 429}:
+            log.debug("sentiment source %s failed: %s", name, type(exc).__name__)
+            return
         log.info("sentiment source %s failed: %s", name, exc)
 
     def _apply_cached_news(self, symbols, snap, cached_news) -> None:

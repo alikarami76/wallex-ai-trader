@@ -64,6 +64,9 @@ python3 -m trader --mode live --config config/default.yaml
 
 python3 -m trader --mode report --log-dir results/backtest
 
+# Optional strategy overlay. Default is uptrend_pullback. fast_scalp is maker-only with a 1.2% TP.
+# TRADER_STRATEGY=fast_scalp python3 -m trader --mode backtest
+
 # Offline checkpoint draft from local jsonl. No key and no LLM call.
 python3 -m trader report --checkpoint C0 --log-dir results/shadow
 
