@@ -98,3 +98,13 @@ def runtime_dirs(explicit_out: str | None, mode: str, dry_run: bool) -> tuple[Pa
 
 def wallex_credentials() -> tuple[str, str]:
     return os.getenv("WALLEX_API_KEY", "").strip(), os.getenv("WALLEX_SUBACCOUNT_ID", "").strip()
+
+
+def credential_status() -> str:
+    """Say whether the Wallex key is set. Never include the value."""
+    api_key, subaccount = wallex_credentials()
+    api = "WALLEX_API_KEY present" if api_key else "WALLEX_API_KEY absent"
+    sub = "WALLEX_SUBACCOUNT_ID present" if subaccount else "WALLEX_SUBACCOUNT_ID absent"
+    if api_key:
+        return f"{api}; {sub}"
+    return f"{api}; {sub}; shadow and dry-run keep serving without orders"

@@ -15,7 +15,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-from trader.config import wallex_credentials
+from trader.config import credential_status, wallex_credentials
 from trader.health import configure_status, serve_in_background, update_status
 from trader.engine.backtest import _trade_row
 from trader.engine.dust import FORCED_FLATTEN, apply_paper, plan_dust_flatten
@@ -102,6 +102,7 @@ def run_runtime(
     if mode not in {"shadow", "live"}:
         raise ValueError(mode)
     api_key, subaccount = wallex_credentials()
+    log.info("%s", credential_status())
     send_orders = mode == "live" and not dry_run
     if send_orders and not api_key:
         raise SystemExit("live mode needs WALLEX_API_KEY. Use --dry-run to build requests without sending.")

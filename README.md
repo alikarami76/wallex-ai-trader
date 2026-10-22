@@ -146,7 +146,7 @@ The backtest report includes 1,000 seeded runs on the same universe and denylist
 
 ### Watchdog
 
-`trader/watchdog.py` is a separate process. It tails `cycles.jsonl` and `decisions.jsonl` and can send one Telegram alert for a cycle gap over 5 minutes, `HALT` or `KILLED`, rejected orders above zero, or taker entry fills above zero. The same event type is quiet for 15 minutes. The message is the event and the percent PnL. The token comes from `TELEGRAM_ALERT_BOT_TOKEN` and `TELEGRAM_ALERT_CHAT_ID`. The process writes nothing under the journal directory. It stays off unless `WATCHDOG_ENABLED` is set.
+`trader/watchdog.py` is a separate process. It tails `cycles.jsonl` and `decisions.jsonl` and can send one Telegram alert for a cycle gap over 5 minutes, `HALT` or `KILLED`, rejected orders above zero, or taker entry fills above zero. The same event type is quiet for 15 minutes. The message is the event and the percent PnL. The token comes from `TELEGRAM_ALERT_BOT_TOKEN` and `TELEGRAM_ALERT_CHAT_ID`. The process writes nothing under the journal directory. It stays off unless `WATCHDOG_ENABLED` is set. The container entrypoint starts it beside the trader when that variable is `1`. Shadow still boots with `WALLEX_API_KEY` unset, logs that the key is absent, and keeps serving `/health` and the desk.
 
 ## Unattended run
 

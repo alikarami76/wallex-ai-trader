@@ -31,4 +31,7 @@ EXPOSE 8080
 
 # Shadow is the default. It uses public market data and does not send orders.
 # Live orders require TRADER_MODE=live and WALLEX_API_KEY from the environment.
-CMD ["python", "-m", "trader", "--config", "config/default.yaml"]
+# The entrypoint logs a missing Wallex key and starts the watchdog only when
+# WATCHDOG_ENABLED=1. /health and the desk stay on this process.
+ENTRYPOINT ["python", "-m", "trader.entrypoint"]
+CMD ["--config", "config/default.yaml"]

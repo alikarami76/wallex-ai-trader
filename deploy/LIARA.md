@@ -1,8 +1,8 @@
 # Deploy on Liara
 
-The competition process runs as a Docker app on [Liara](https://liara.ir). The image starts the trading loop and an HTTP server on port 8080. Liara's Docker platform publishes one HTTP port and curls it (`/health`) before it treats a release as healthy, so the loop alone is not enough. The same port serves a read-only desk at `/`.
+The competition process runs as a Docker app on [Liara](https://liara.ir). The image entrypoint is `python -m trader.entrypoint`. It starts the trading loop and an HTTP server on port 8080. When `WATCHDOG_ENABLED=1` it also starts `python -m trader watchdog` in the same container, tailing the journal on the disk. Liara's Docker platform publishes one HTTP port and curls it (`/health`) before it treats a release as healthy, so the loop alone is not enough. The same port serves a read-only desk at `/`.
 
-Shadow is the default. The container reads public Wallex data and does not send orders. Nothing in this repository is a secret. Set keys with `liara env set`.
+Shadow is the default. The container reads public Wallex data and does not send orders. A missing `WALLEX_API_KEY` is logged as `WALLEX_API_KEY absent` and the process keeps serving `/health` and the desk. The log never includes the key value. Nothing in this repository is a secret. Set keys with `liara env set`.
 
 These commands use `@liara/cli` 9.6.0. Do not commit the API token or the trading keys.
 
@@ -72,13 +72,13 @@ liara env set --app wallex-ai-trader --force \
 | `DASHBOARD_PASSWORD` | Basic-auth password. Set it with the keys above, not in the image. |
 | `TELEGRAM_ALERT_BOT_TOKEN` | Optional. Alerts stay off unless this and the chat id are both set. |
 | `TELEGRAM_ALERT_CHAT_ID` | Optional chat for a cycle gap, HALT or KILLED, an order reject, or a taker entry fill. |
-| `WATCHDOG_ENABLED` | Optional. The journal sidecar stays off unless this is `1`. It does not place orders. |
+| `WATCHDOG_ENABLED` | Optional. Off unless this is `1`, `true`, `yes`, or `on`. The entrypoint then runs the journal sidecar in the same container. It does not place orders or write journals. |
 
 `LLM_MODEL` is ignored. It does not pin every tier.
 
-## Deploy, logs, restart, stop
+## Deploy
 
-`liara.json` already carries the port, the Iran build, and the disk. This command repeats them so a deploy from another directory still mounts the disk:
+This is the deploy command. Run it from the repository root after `liara login`. It does not set `TRADER_LIVE_AUTHORIZED` and it does not require a Wallex key. `liara.json` already carries the same app, platform, port, Iran build, and disk; the flags repeat them so a deploy from another directory still mounts the disk.
 
 ```bash
 liara deploy \
@@ -89,9 +89,19 @@ liara deploy \
   --disks data:/data
 ```
 
-`--disks data:/data` is the same mount as `liara.json`: disk name `data`, container path `/data`.
+`--disks data:/data` is the same mount as `liara.json`: disk name `data`, container path `/data`. If the Iran builder cannot download the Python base image or the wheels, repeat the deploy with `--build-location germany`. The image is the same; the push from Germany is slower.
 
-If the Iran builder cannot download the Python base image or the wheels, repeat the deploy with `--build-location germany`. The image is the same; the push from Germany is slower.
+Shadow with no Wallex credentials uses the image defaults (`TRADER_MODE=shadow`, `TRADER_DATA_DIR=/data`, `TRADER_HEALTH_PORT=8080`). Leave `WALLEX_API_KEY` and `WALLEX_SUBACCOUNT_ID` unset. The first log lines are `WALLEX_API_KEY absent; WALLEX_SUBACCOUNT_ID absent; shadow and dry-run keep serving without orders` and `watchdog off`. `/health` returns `{"ok": true}`. `/` and `/status` stay on the same port.
+
+To run the watchdog beside the trader, add it before deploy:
+
+```bash
+liara env set --app wallex-ai-trader --force WATCHDOG_ENABLED=1
+```
+
+The entrypoint then logs `watchdog enabled` and `watchdog started`. Alerts still send only when both `TELEGRAM_ALERT_BOT_TOKEN` and `TELEGRAM_ALERT_CHAT_ID` are set.
+
+## Logs, restart, stop
 
 ```bash
 liara logs --app wallex-ai-trader --follow
@@ -130,4 +140,17 @@ docker run --rm -p 8080:8080 \
   wallex-ai-trader
 ```
 
-In another shell, `curl -s http://127.0.0.1:8080/health` is `{"ok": true}`. The desk is `curl -s -u "$DASHBOARD_USER:$DASHBOARD_PASSWORD" http://127.0.0.1:8080/`. The log line `starting shadow dry_run=True` means the loop is in shadow. Stop the container with Ctrl-C. No `WALLEX_API_KEY` is required for that check. `/health` does not need the dashboard password.
+Do not pass `WALLEX_API_KEY`. The log contains `WALLEX_API_KEY absent` and `starting shadow dry_run=True`. In another shell, `curl -s http://127.0.0.1:8080/health` is `{"ok": true}`. Without `DASHBOARD_USER` and `DASHBOARD_PASSWORD`, `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/` is `401` and `/health` is still `200`. With both set, the desk is `curl -s -u "$DASHBOARD_USER:$DASHBOARD_PASSWORD" http://127.0.0.1:8080/`. Stop the container with Ctrl-C.
+
+The same image runs the watchdog beside the trader when the flag is set. It still does not need a Wallex key:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e TRADER_MODE=shadow \
+  -e TRADER_DATA_DIR=/data \
+  -e TRADER_HEALTH_PORT=8080 \
+  -e WATCHDOG_ENABLED=1 \
+  wallex-ai-trader
+```
+
+The log then contains `watchdog started`. `/health` stays up.
