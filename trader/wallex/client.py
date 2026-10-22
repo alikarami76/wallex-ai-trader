@@ -5,6 +5,10 @@ Public market data needs no key. Private calls send `X-API-Key` and, when
 signature. Order placement is capped well under the documented 20 requests
 per 10 seconds. `dry_run` builds the private write request and returns it
 without sending.
+
+The challenge is spot only. The only order write is POST or DELETE
+`/v1/account/orders`. Margin, leverage, futures, OTC, and credit-margin
+paths are refused before any socket is opened.
 """
 
 from __future__ import annotations
@@ -21,6 +25,56 @@ from trader.types import Balance, Bar, BookLevel, MarketRule, OrderBook, OrderRe
 from trader.wallex.precision import build_order_body
 
 log = logging.getLogger("trader.wallex")
+
+
+_SPOT_GET_EXACT = {
+    "/v1/markets",
+    "/v1/depth",
+    "/v2/depth/all",
+    "/v1/trades",
+    "/v1/udf/history",
+    "/v1/account/balances",
+    "/v1/account/balances-detail",
+    "/v1/account/fee",
+    "/v1/account/openOrders",
+    "/v1/account/orders",
+}
+_DENIED_SEGMENTS = ("margin", "leverage", "futures", "otc", "easy-trade", "easytrade", "credit-margin")
+
+
+def assert_spot_request(method: str, path: str) -> None:
+    """Refuse anything except spot reads and `/v1/account/orders` writes."""
+    method = (method or "").upper()
+    path = (path or "").split("?", 1)[0]
+    if not path.startswith("/"):
+        raise WallexError(f"spot-only: refused {method} {path}")
+    parts = [part for part in path.split("/") if part]
+    scan = parts
+    if len(parts) >= 4 and parts[:3] == ["v1", "account", "orders"]:
+        scan = parts[:3]
+    for part in scan:
+        lowered = part.lower()
+        for marker in _DENIED_SEGMENTS:
+            if marker in lowered:
+                raise WallexError(f"spot-only: refused {method} {path}")
+    if method == "POST":
+        if path != "/v1/account/orders":
+            raise WallexError(f"spot-only: orders are POST /v1/account/orders, refused {path}")
+        return
+    if method == "DELETE":
+        rest = path[len("/v1/account/orders/"):] if path.startswith("/v1/account/orders/") else ""
+        if not rest or "/" in rest:
+            raise WallexError(f"spot-only: cancel is DELETE /v1/account/orders/{{id}}, refused {path}")
+        return
+    if method == "GET":
+        if path in _SPOT_GET_EXACT:
+            return
+        if path.startswith("/v1/prop/packages/") and path.count("/") == 4:
+            return
+        if path.startswith("/v1/account/orders/") and "/" not in path[len("/v1/account/orders/"):]:
+            return
+        raise WallexError(f"spot-only: refused GET {path}")
+    raise WallexError(f"spot-only: refused {method} {path}")
 
 
 class WallexError(RuntimeError):
@@ -128,6 +182,7 @@ class WallexClient:
         auth: bool = False,
         is_order: bool = False,
     ) -> dict:
+        assert_spot_request(method, path)
         query = urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v is not None})
         url = f"{self.base_url}{path}"
         if query:

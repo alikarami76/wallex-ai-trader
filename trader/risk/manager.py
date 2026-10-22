@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from trader.engine.portfolio import Portfolio
+from trader.engine.universe import symbol_block
 from trader.strategy.liquidity import Liquidity, liquidity_settings
 from trader.strategy.menu import MenuAction, hold_action
 from trader.strategy.parser import AgentDecision, ParsedDecision
@@ -549,8 +550,9 @@ class RiskManager:
         symbol = decision.symbol
         if view.entries_blocked:
             return {"symbol": symbol, "reason": view.block_reason or "entries blocked"}
-        if symbol in unavailable:
-            return {"symbol": symbol, "reason": "symbol is on the credit-plan banned list"}
+        blocked = symbol_block(symbol, self.cfg, unavailable, rules.get(symbol))
+        if blocked:
+            return {"symbol": symbol, "reason": blocked}
         if symbol not in candidate_by_symbol:
             return {"symbol": symbol, "reason": "model selected a symbol the quant layer did not propose"}
         if symbol not in rules or rules[symbol].quote_asset != "TMN":

@@ -18,7 +18,7 @@ from trader.engine.backtest import _trade_row
 from trader.engine.journal import Journal
 from trader.engine.portfolio import Portfolio
 from trader.engine.state import load_state, save_state
-from trader.engine.universe import explain_universe, select_universe
+from trader.engine.universe import explain_universe, select_universe, symbol_block
 from trader.risk.manager import RiskManager, roll_day
 from trader.sentiment import SentimentFeed
 from trader.strategy.agent import TradingAgent
@@ -295,7 +295,7 @@ def _cycle(
         try:
             fill, request = _execute(
                 cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees,
-                feature_by_symbol.get(action.symbol),
+                feature_by_symbol.get(action.symbol), unavailable,
             )
         except (WallexError, OrderRejected) as exc:
             planned.rejected.append({"symbol": action.symbol, "reason": str(exc)})
@@ -386,7 +386,7 @@ def _cancel_resting(client, state, action, send_orders) -> dict | None:
     }
 
 
-def _execute(cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees, feature=None):
+def _execute(cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees, feature=None, unavailable=None):
     rule: MarketRule | None = rules.get(action.symbol)
     if rule is None:
         raise OrderRejected(f"no market rules for {action.symbol}")
@@ -396,6 +396,9 @@ def _execute(cfg, client, portfolio, action, books, marks, rules, state, send_or
     client_id = _next_id(state)
     skew = _quote_skew(cfg, portfolio, marks, feature)
     if action.side == "BUY":
+        blocked = symbol_block(action.symbol, cfg, unavailable or set(), rule)
+        if blocked:
+            raise OrderRejected(blocked)
         maker_entry = cfg["execution"]["entry"] != "marketable_limit" and not action.aggressive
         if maker_entry:
             raw_price = maker_buy_limit(
@@ -710,9 +713,10 @@ def _load_bans(client: WallexClient, package_id: int) -> set[str]:
 def _refresh_universe(client, cfg, rules, unavailable):
     preliminary = []
     for symbol in cfg["universe"]["candidates"]:
-        rule = rules.get(symbol.upper())
-        if rule and symbol.upper() not in unavailable and rule.quote_asset == "TMN":
-            preliminary.append(symbol.upper())
+        symbol = symbol.upper()
+        rule = rules.get(symbol)
+        if rule and rule.quote_asset == "TMN" and symbol_block(symbol, cfg, unavailable, rule) is None:
+            preliminary.append(symbol)
     books = _books_for(client, preliminary)
     spreads = {symbol: book.spread_bps for symbol, book in books.items() if book.spread_bps is not None}
     universe = select_universe(cfg, rules, unavailable, spreads)
@@ -786,8 +790,10 @@ def check_order(cfg: dict, symbol: str, side: str, notional: float) -> dict:
     rules = client.get_markets()
     unavailable = client.get_unavailable_markets(int(cfg["exchange"]["package_id"]))
     symbol = symbol.upper()
-    if symbol in unavailable:
-        raise SystemExit(f"{symbol} is on the credit-plan banned list")
+    if side.upper() == "BUY":
+        blocked = symbol_block(symbol, cfg, unavailable, rules.get(symbol))
+        if blocked:
+            raise SystemExit(blocked)
     rule = rules[symbol]
     book = client.get_depth(symbol)
     price = book.best_ask if side.upper() == "BUY" else book.best_bid

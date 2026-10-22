@@ -18,6 +18,30 @@ fees:
   slippage_bps: 3
 
 universe:
+  # Explicit spot allowlist. A name must be here AND absent from the package
+  # unavailableMarkets list. Nothing else can be bought.
+  # Liquid TMN majors from the 2026-10-22 allowed-market snapshot.
+  allowlist:
+    - USDTTMN
+    - BTCTMN
+    - ETHTMN
+    - SOLTMN
+    - XRPTMN
+    - DOGETMN
+    - BNBTMN
+    - ADATMN
+    - XAUTTMN
+  # Announcement hard-deny, any quote, even if the package later marks them allowed.
+  hard_deny_bases:
+    - TON
+    - NEAR
+    - FET
+    - INJ
+    - TAO
+    - WIF
+    - BONK
+    - PENDLE
+    - RENDER
   candidates:
     - USDTTMN
     - BTCTMN
@@ -27,6 +51,7 @@ universe:
     - DOGETMN
     - SOLTMN
     - BNBTMN
+    - ADATMN
   max_symbols: 6
   min_quote_volume_tmn: 8000000000
   max_spread_bps: 22
@@ -40,6 +65,7 @@ universe:
     DOGETMN: 8.9
     SOLTMN: 24.4
     BNBTMN: 31.0
+    ADATMN: 22.2
 
 strategy:
   ema_fast: 8

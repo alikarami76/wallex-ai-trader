@@ -1,6 +1,6 @@
 # Wallex AI trader
 
-Fee-aware spot bot for the Starcoach × Wallex credit account (package 183, 5,000,000 TMN). One process, one CLI, the same decision code in backtest, shadow, and live.
+Fee-aware spot bot for the Starcoach × Wallex credit account (package 183, 5,000,000 TMN). One process, one CLI, the same decision code in backtest, shadow, and live. Orders go only to spot `POST /v1/account/orders`. The config allowlist is intersected with the live package list, and TON, NEAR, FET, INJ, TAO, WIF, BONK, PENDLE, and RENDER are denied in every quote.
 
 In shadow and live the model picks one id from a menu of actions the quant and risk layers already validated (hold, buy, sell, reduce, or cancel). Invalid output is hold. Stops, size caps, the drawdown kill switch, and the Tehran liquidation window sit outside the model and can still veto the pick. If BoxAPI is down, over the call cap, or the key is missing, a deterministic fallback keeps the loop running.
 
