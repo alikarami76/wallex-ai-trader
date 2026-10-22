@@ -102,6 +102,22 @@ def run_runtime(
     )
     log.info("starting %s dry_run=%s data=%s", mode, not send_orders, out_dir)
     signal.signal(signal.SIGTERM, _request_stop)
+    try:
+        _run_loop(
+            cfg, mode, client, state, state_path, journal,
+            api_key=api_key, subaccount=subaccount,
+            duration=duration, once=once, send_orders=send_orders, interval=interval,
+        )
+    except KeyboardInterrupt:
+        log.info("stopped by user")
+        save_state(state_path, state)
+    journal.close()
+
+
+def _run_loop(
+    cfg, mode, client, state, state_path, journal,
+    *, api_key: str, subaccount: str, duration, once, send_orders, interval,
+) -> None:
     risk = RiskManager(cfg)
     mcp = None
     if cfg.get("mcp", {}).get("enabled", False):
@@ -156,45 +172,40 @@ def run_runtime(
     candles_at = time.time()
     backoff = 1.0
 
-    try:
-        while True:
-            try:
-                if time.time() - markets_at > 300:
-                    rules = _load_rules(client)
-                    unavailable = _load_bans(client, int(cfg["exchange"]["package_id"]))
-                    universe, spreads = _refresh_universe(client, cfg, rules, unavailable)
-                    markets_at = time.time()
-                if time.time() - candles_at > float(cfg["runtime"]["candle_refresh_seconds"]):
-                    hourly, micro = _load_history(client, universe, cfg, previous=hourly)
-                    candles_at = time.time()
-                _cycle(
-                    cfg, mode, client, agent, risk, journal, state, state_path,
-                    rules, unavailable, account_fees, universe, spreads, hourly, micro,
-                    send_orders=send_orders, sentiment=sentiment,
-                )
-                backoff = 1.0
-            except Exception as exc:
-                log.exception("cycle failed")
-                journal.decision({
-                    "timestamp": iso(),
-                    "mode": mode,
-                    "event": "error",
-                    "error": str(exc),
-                    "traceback": traceback.format_exc()[-2000:],
-                })
-                update_status(last_error=str(exc), last_cycle_at=iso())
-                save_state(state_path, state)
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-            if once:
-                break
-            if deadline is not None and time.time() >= deadline:
-                break
-            time.sleep(loop_seconds)
-    except KeyboardInterrupt:
-        log.info("stopped by user")
-        save_state(state_path, state)
-    journal.close()
+    while True:
+        try:
+            if time.time() - markets_at > 300:
+                rules = _load_rules(client)
+                unavailable = _load_bans(client, int(cfg["exchange"]["package_id"]))
+                universe, spreads = _refresh_universe(client, cfg, rules, unavailable)
+                markets_at = time.time()
+            if time.time() - candles_at > float(cfg["runtime"]["candle_refresh_seconds"]):
+                hourly, micro = _load_history(client, universe, cfg, previous=hourly)
+                candles_at = time.time()
+            _cycle(
+                cfg, mode, client, agent, risk, journal, state, state_path,
+                rules, unavailable, account_fees, universe, spreads, hourly, micro,
+                send_orders=send_orders, sentiment=sentiment,
+            )
+            backoff = 1.0
+        except Exception as exc:
+            log.exception("cycle failed")
+            journal.decision({
+                "timestamp": iso(),
+                "mode": mode,
+                "event": "error",
+                "error": str(exc),
+                "traceback": traceback.format_exc()[-2000:],
+            })
+            update_status(last_error=str(exc), last_cycle_at=iso())
+            save_state(state_path, state)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+        if once:
+            break
+        if deadline is not None and time.time() >= deadline:
+            break
+        time.sleep(loop_seconds)
 
 
 def _cycle(
