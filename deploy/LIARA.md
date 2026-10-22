@@ -74,6 +74,10 @@ liara env set --app wallex-ai-trader --force \
 | `TELEGRAM_ALERT_BOT_TOKEN` | Optional. Alerts stay off unless this and the chat id are both set. |
 | `TELEGRAM_ALERT_CHAT_ID` | Optional chat for a cycle gap, HALT or KILLED, an order reject, or a taker entry fill. |
 | `WATCHDOG_ENABLED` | Optional. Off unless this is `1`, `true`, `yes`, or `on`. The entrypoint then runs the journal sidecar in the same container. It does not place orders or write journals. |
+| `TRADER_LIVE_AUTHORIZED` | `1` arms live orders. Leave it unset in the image. The running lock keeps the value already stored in `/data/state.json`. |
+| `TRADER_EV_OVERRIDE` | `1` keeps the locked cost-gate override on. A re-freeze does not clear it. Leave it set across the redeploy. |
+| `TRADER_APPROVED_CONFIG_HASH` | SHA-256 of `config/default.yaml` for one approved config change. When it matches the file in the new image, the go-live lock re-freezes that hash and the new git SHA and writes an adjustment row. A different file hash halts. `ev_override` is not changed. |
+| `TRADER_GIT_SHA` | Commit recorded in the go-live lock. The image has no git checkout, so an unset value stores `unknown`. Set it to the deployed commit before the process starts. |
 
 `LLM_MODEL` is ignored. It does not pin every tier.
 
@@ -113,7 +117,26 @@ liara start --app wallex-ai-trader
 
 After deploy, `https://wallex-ai-trader.liara.run/health` returns `{"ok": true}` with no credentials. `/` is one auto-refreshing HTML page. `/status` returns the mode, whether orders are dry-run, equity, open symbols, and the last cycle time. Both require HTTP basic auth. `DASHBOARD_USERS` is a JSON object of username to password, for example `{"ada":"...","ben":"..."}`. Each password is compared with `hmac.compare_digest`. `DASHBOARD_USER` and `DASHBOARD_PASSWORD` remain the single-user fallback, and they still work when the JSON map is also set. If neither is configured, those routes return 401 and `/health` still returns 200. Each successful access logs `dashboard login user=<name>` and the page says `logged in as <name>`. The password is not logged. The page reads only `cycles.jsonl`, `decisions.jsonl`, `adjustments.jsonl`, and `reviews.jsonl` on the disk. It shows key presence, never key values, and it has no route that places or cancels orders, changes config, flips a flag, or starts or stops trading.
 
-A restart keeps `/data` because that path is the disk. The decision log is `decisions.jsonl`. Positions and the kill switch are `state.json`. Both sit on the disk.
+A restart keeps `/data` because that path is the disk. The decision log is `decisions.jsonl`. Positions and the kill switch are `state.json`. Both sit on the disk. `state.json` `ops` also stores `go_live_sha`, `config_hash`, and `ev_override`.
+
+## Approved config re-freeze
+
+The live book is already locked. A new image whose `config/default.yaml` hash differs from `ops.config_hash` halts unless `TRADER_APPROVED_CONFIG_HASH` is that new file hash. Set it before the process starts. Do not unset `TRADER_EV_OVERRIDE` or `TRADER_LIVE_AUTHORIZED`.
+
+```bash
+sha256sum config/default.yaml
+liara env set --app wallex-ai-trader --force \
+  TRADER_APPROVED_CONFIG_HASH=5ecb9699adf3c24ead89a8cc55bc494db45adcb7b7f5064113f00d72a5a3ceac \
+  TRADER_GIT_SHA="<deployed commit>" \
+  TRADER_EV_OVERRIDE=1 \
+  TRADER_LIVE_AUTHORIZED=1
+```
+
+`5ecb9699adf3c24ead89a8cc55bc494db45adcb7b7f5064113f00d72a5a3ceac` is the SHA-256 of this image's `config/default.yaml`. Recompute it if the file changes. `TRADER_GIT_SHA` is the commit you deploy.
+
+The image has no git metadata. Without `TRADER_GIT_SHA` the lock stores `unknown`. Set that variable to the commit being deployed before the new process starts, and do not wipe `/data/state.json`.
+
+The first cycle logs `approved config re-freeze` and appends `CONFIG_REFREEZE` to `adjustments.jsonl`. `ev_override` stays at the locked value. After that cycle the env can stay set; a later unapproved edit still halts because the env will no longer match the file. A locked book that has no `config_hash` yet adopts the running file without a halt, and leaves `go_live_sha` where it was. Set the env on that boot too, so the locked SHA moves to this commit.
 
 ## Shadow, then live
 

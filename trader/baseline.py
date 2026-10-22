@@ -84,7 +84,7 @@ def render_baseline(result: dict) -> str:
         "## Random-entry baseline",
         "",
         f"{result['n_runs']} seeded runs. Entries are random times on the same universe, "
-        "with the denylist, 24-hour hold, stop, trail, fees, and size cap left as configured. "
+        "with the denylist, the configured hold, stop, trail, fees, and size cap left as configured. "
         f"Each run attempts {result['target_entries']} entries.",
         "",
         f"Strategy return {result['observed_return_pct']}% is at the {result['return_percentile']:.1f} percentile "

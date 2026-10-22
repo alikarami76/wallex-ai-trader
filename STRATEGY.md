@@ -23,7 +23,7 @@ flowchart TD
   risk --> journal
 ```
 
-The backtest is rules only. It calls `evaluate_symbol` and `RiskManager.plan` with `use_llm=False`, so it never calls BoxAPI and it never builds the menu. Shadow and live call that same quant and risk code, then ask the model to pick one id from the menu and check the pick again. Live entries also pass through the operational state machine in `trader/engine/ops.py`. The researched cost-gate prior stays 0.9% for the rules-only backtest. Shadow and live freeze the measured 0.45% gross prior, which blocks entries unless `ev_override` was set before go-live and then locked. Last new entry is Thu 2026-10-22 23:30 Asia/Tehran. The flatten clock is unchanged: passive Fri 22:50, aggressive 23:20, flat 23:30.
+The backtest is rules only. It calls `evaluate_symbol` and `RiskManager.plan` with `use_llm=False`, so it never calls BoxAPI and it never builds the menu. Shadow and live call that same quant and risk code, then ask the model to pick one id from the menu and check the pick again. Live entries also pass through the operational state machine in `trader/engine/ops.py`. The researched cost-gate prior stays 0.9% for the rules-only backtest. Shadow and live freeze the measured 0.45% gross prior, which blocks entries unless `ev_override` was set before go-live and then locked. Last new entry is Fri 2026-10-23 18:00 Asia/Tehran. The hold is 6 hours, and a position also exits at `flat_by`. The flatten clock is unchanged: passive Fri 22:50, aggressive 23:20, flat 23:30.
 
 ## Buy
 
@@ -100,7 +100,7 @@ Wallex MCP (`wallex_basic_candle_history`) is an optional note in the prompt. Tw
 
 - Disaster stop at −4.5% from the fill. MARKET when the symbol allows market orders, otherwise an aggressive limit through the bid. Extra 5 bps of slippage is charged in the backtest. A stop starts a 6-hour cooldown on that symbol.
 - Trailing stop arms after +2.5% and sells 1.2% off the peak.
-- Time exit after 24 hours rests as a maker offer. The offer is the ask, pulled toward the mid by the inventory skew, and it never crosses the bid. The backtest gives that quote one bar: a fill if the next high reaches it, otherwise a taker at the next close.
+- Time exit after 6 hours rests as a maker offer. The offer is the ask, pulled toward the mid by the inventory skew, and it never crosses the bid. The same exit becomes a taker when the clock reaches `flat_by`, so a hold cannot run past Fri 23:30. The backtest gives the maker quote one bar: a fill if the next high reaches it, otherwise a taker at the next close.
 - No fixed take-profit. On this fee tier a tight target converted the 24-hour drift into a loss.
 - The model may request an early close under the rule above. The risk layer still checks that a position exists.
 
@@ -130,14 +130,14 @@ Universe at startup: config allowlist ∩ config candidates ∩ not on the packa
 
 Deadline `2026-10-23T23:50:00+03:30`. Flat-by target `2026-10-23T23:30:00+03:30`.
 
-- Entries stop when fewer than 8 hours remain before flat-by.
+- Entries stop when fewer than 5.5 hours remain before flat-by, which is the Fri 18:00 entry cutoff.
 - From 22:50 Tehran, phase `passive`: no new buys, resting limits sell inventory.
 - From 23:20 Tehran, phase `aggressive`: market sells (or aggressive limits if market orders are disabled). The phase stays aggressive after the deadline until the book is flat.
 - A forced exit under 50,000 TMN (liquidation, kill, stop, or trail) cannot be a normal spot sell. When cash can fund it, the bot buys enough extra base that the buy and the combined sell both clear 50,000 TMN, then sells the sum. Both orders are spot `POST /v1/account/orders`. If cash cannot fund the top-up and the symbol allows market orders, it sends a spot market sell. OTC and instant convert are not used. Coin that is still unsold is written on the decision as `residuals` and listed in the report. Shadow stays the default run mode.
 
 ## Execution assumptions
 
-Entry joins the bid. The price is the Avellaneda and Stoikov (2008) reservation shift applied to the touch: `bid × (1 − q γ σ² τ)`, with `q` the current gross exposure, `γ = 0.5`, `σ` the hourly ATR, and `τ` the 24-hour hold. A flat book does not move the quote. The order is rounded down to the tick and is not allowed to cross the ask, so it pays the maker fee. The same skew pulls a long inventory's offer toward the mid without crossing the bid.
+Entry joins the bid. The price is the Avellaneda and Stoikov (2008) reservation shift applied to the touch: `bid × (1 − q γ σ² τ)`, with `q` the current gross exposure, `γ = 0.5`, `σ` the hourly ATR, and `τ` the 6-hour hold. A flat book does not move the quote. The order is rounded down to the tick and is not allowed to cross the ask, so it pays the maker fee. The same skew pulls a long inventory's offer toward the mid without crossing the bid.
 
 The backtest does not assume the bid is filled. The quote rests for the next hourly bar and fills only if that bar's low trades to the limit. That is the adverse-selection case, and it is the one the fill model uses. A missed quote is cancelled rather than chased. Stops still use the low of the bar and pay the taker fee. Walk-forward folds flatten leftovers as a taker so each fold's PnL is realized.
 
@@ -171,7 +171,7 @@ Both the level and the change are fields on each symbol's feature payload, so th
 
 The only hard rule that was tested is pre-specified: block a new entry when lagged Fear & Greed is at least 80 (extreme greed), on the view that a pullback in a crowded market is more likely to become a larger decline. It is kept only if the with-gate backtest beats the without-gate backtest by at least 0.05 percentage points of return, does not worsen max drawdown by more than 0.10 points, and still closes at least 8 trades. Otherwise the number stays an input and the gate stays off. The comparison is `results/backtest/sentiment_ablation.json`. Thresholds were not searched.
 
-On the 2026-10-22 hourly window the lagged index ranged from 53 to 78. It never reached 80, so the gate bound zero times. With and without the gate the books are the same: ending equity 4,993,024 TMN, return −0.140%, max drawdown 0.415%, realized PnL −1,038 TMN, fees 10,242 TMN, 17 closed trades. That rerun includes the volume liquidity score. `gate_helps` is false, and `sentiment.block_extreme_greed` stays false. The level and the daily change are still attached on every feature row (695 rows, none missing) and are passed to the regime filter. Headline scores are live-only. From this network CoinDesk and Cointelegraph RSS answer; CryptoPanic and Reddit return 403 and are skipped.
+On the 2026-10-22 hourly window the lagged index ranged from 53 to 78. It never reached 80, so the gate bound zero times. With and without the gate the books are the same: ending equity 4,983,233 TMN, return −0.335%, max drawdown 0.491%, realized PnL −16,767 TMN, fees 12,660 TMN, 23 closed trades. That rerun includes the volume liquidity score and the 6-hour hold. `gate_helps` is false, and `sentiment.block_extreme_greed` stays false. The level and the daily change are still attached on every feature row (695 rows, none missing) and are passed to the regime filter. Headline scores are live-only. From this network CoinDesk and Cointelegraph RSS answer; CryptoPanic and Reddit return 403 and are skipped.
 
 ## Literature
 
@@ -197,15 +197,15 @@ The report's desk block is PnL after fees (mark-to-market and realized), annuali
 
 | Desk metric | Value |
 | --- | --- |
-| PnL after fees, mark-to-market | −6,976 TMN (−0.140%) |
-| PnL after fees, realized | −1,038 TMN |
-| Sharpe (annualized) | −1.47 |
-| Max drawdown | 0.415% |
-| Hit rate | 58.8% (17 closed trades) |
-| Fees | 10,242 TMN |
-| Deflated Sharpe probability | 0.043 (per-bar Sharpe −0.0157, hurdle 0.048 at N=6) |
+| PnL after fees, mark-to-market | −16,767 TMN (−0.335%) |
+| PnL after fees, realized | −16,767 TMN |
+| Sharpe (annualized) | −4.41 |
+| Max drawdown | 0.491% |
+| Hit rate | 47.8% (23 closed trades) |
+| Fees | 12,660 TMN |
+| Deflated Sharpe probability | 0.0039 (per-bar Sharpe −0.0472, hurdle 0.0451 at N=6) |
 
-Fear & Greed was attached on every bar (lagged, range 53–78). The extreme-greed gate was left off because the ablation did not change a single trade. The volume liquidity score was on, which is why size and fees differ from the prior run; depth and spread shocks were not, because the hourly history has no book. Walk-forward, frozen parameters, fresh 5,000,000 TMN each fold: +0.102%, −0.139%, −0.145%. Fold deflated-Sharpe probabilities are 0.163, 0.000, and 0.003. The rule does not clear the Bailey and López de Prado hurdle. Parameters were not changed after seeing this. Open buys on the last bar are why mark-to-market PnL is worse than realized PnL. Candle aggregation for BTCTMN matched native hourly closes (median absolute error 0). The series used for the ablation is `results/backtest/fear_greed.json`.
+Fear & Greed was attached on every bar (lagged, range 53–78). The extreme-greed gate was left off because the ablation did not change a single trade. The volume liquidity score was on. Depth and spread shocks were not, because the hourly history has no book. Walk-forward, frozen parameters, fresh 5,000,000 TMN each fold: −0.078%, −0.149%, −0.142%. Fold deflated-Sharpe probabilities are 0.053, 0.000, and 0.000. The rule does not clear the Bailey and López de Prado hurdle. Parameters were not changed after seeing this. The 6-hour hold closes the book before the last bar, so mark-to-market and realized PnL match. Candle aggregation for BTCTMN matched native hourly closes (median absolute error 0). The series used for the ablation is `results/backtest/fear_greed.json`.
 
 A short shadow the same afternoon (`--duration 200 --interval 45`, no API key) ran five fallback cycles from 16:35 to 16:38 Asia/Tehran. No candidate cleared the gates, so there were no orders. Equity stayed 5,000,000 TMN. Median decision latency was 4.1 seconds. Fear & Greed printed 68 (Greed), up 5 from the prior published point. CoinDesk and Cointelegraph headlines were scored; CryptoPanic and Reddit returned 403 and were skipped. Later cycles reused the 15-minute headline cache. The Wallex MCP candle tool responded. Zero errors.
 

@@ -8,7 +8,7 @@ invented, or a size above the quant proposal, is cut here.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from trader.engine.portfolio import Portfolio
 from trader.engine.universe import symbol_block
@@ -89,6 +89,18 @@ def hours_until_flat(now: datetime, cfg: dict) -> float:
 
     flat_by = parse_ts(cfg["liquidation"]["flat_by"])
     return (flat_by - to_tehran(now)).total_seconds() / 3600
+
+
+def _past_flat_by(cfg: dict, now_unix: float) -> bool:
+    """True once the clock has reached liquidation.flat_by. A missing clock is not past it."""
+    raw = (cfg.get("liquidation") or {}).get("flat_by")
+    if not raw:
+        return False
+    from trader.timeutil import parse_ts
+
+    flat = parse_ts(str(raw))
+    now = datetime.fromtimestamp(float(now_unix), tz=timezone.utc)
+    return to_tehran(now) >= flat
 
 
 class RiskManager:
@@ -524,15 +536,24 @@ class RiskManager:
                     aggressive=True,
                 )
         held_hours = (now_unix - position.entry_time) / 3600
-        if held_hours >= float(risk["time_stop_hours"]):
+        limit = float(risk["time_stop_hours"])
+        past_flat = _past_flat_by(self.cfg, now_unix)
+        if held_hours >= limit or past_flat:
+            # A 6h hold that would run through flat_by exits at flat_by, as a taker.
+            forced = past_flat and held_hours < limit
             return Action(
                 symbol=symbol,
                 side="SELL",
-                order_type="LIMIT",
+                order_type="MARKET" if past_flat else "LIMIT",
                 size_fraction=1.0,
-                reason=f"time stop after {held_hours:.1f}h",
+                reason=(
+                    f"time stop at flat_by after {held_hours:.1f}h"
+                    if forced
+                    else f"time stop after {held_hours:.1f}h"
+                ),
                 source="time",
-                price_direction="up",
+                price_direction="down" if past_flat else "up",
+                aggressive=past_flat,
             )
         return None
 
@@ -614,6 +635,8 @@ class RiskManager:
         still trade through a thin book.
         """
         if action.aggressive or view.phase == "aggressive" or view.kill_switch:
+            return False
+        if action.source == "time" and _past_flat_by(self.cfg, now_unix):
             return False
         if action.source not in {"time", "liquidation"} and view.phase == "normal":
             return False

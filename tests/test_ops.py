@@ -8,9 +8,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from trader.cli import main
+from trader.config import load_config
 from trader.engine.ops import (
     Facts,
     apply_frozen_cost_gate,
+    config_hash,
+    entry_cutoff,
     fresh_ops,
     llm_override_warning,
     load_ops,
@@ -73,7 +76,10 @@ class StateMachineTests(unittest.TestCase):
     def setUp(self):
         self._env = {
             key: os.environ.get(key)
-            for key in ("TRADER_LIVE_AUTHORIZED", "TRADER_EV_OVERRIDE", "LLM_MODEL", "WALLEX_API_KEY")
+            for key in (
+            "TRADER_LIVE_AUTHORIZED", "TRADER_EV_OVERRIDE", "TRADER_APPROVED_CONFIG_HASH",
+            "LLM_MODEL", "WALLEX_API_KEY",
+        )
         }
         for key in self._env:
             os.environ.pop(key, None)
@@ -219,6 +225,57 @@ class StateMachineTests(unittest.TestCase):
         apply_frozen_cost_gate([kept], CFG, locked_override=True)
         self.assertTrue(kept.signal)
         self.assertEqual(kept.expected_gross, 0.009)
+
+    def test_default_clock_is_friday_18_with_a_six_hour_hold(self):
+        loaded = load_config("config/default.yaml")
+        self.assertEqual(entry_cutoff(loaded).isoformat(), "2026-10-23T18:00:00+03:30")
+        self.assertEqual(loaded["risk"]["time_stop_hours"], 6)
+        self.assertEqual(loaded["liquidation"]["flat_by"], "2026-10-23T23:30:00+03:30")
+        self.assertEqual(loaded["liquidation"]["min_hours_to_enter"], 5.5)
+        from trader.engine.ops import CHECKPOINT_END, CHECKPOINT_START
+
+        self.assertEqual(CHECKPOINT_START["C2"], "2026-10-23T17:00:00+03:30")
+        self.assertEqual(CHECKPOINT_END["C2"], "2026-10-23T18:00:00+03:30")
+        self.assertEqual(CHECKPOINT_START["C3"], "2026-10-23T18:00:00+03:30")
+        self.assertEqual(CHECKPOINT_END["C3"], "2026-10-23T19:30:00+03:30")
+        self.assertEqual(CHECKPOINT_END["C4"], "2026-10-23T08:00:00+03:30")
+
+    def test_approved_config_hash_refreezes_without_clearing_ev_override(self):
+        from trader.engine.ops import git_sha
+
+        current = config_hash(CFG)
+        now = datetime(2026, 10, 23, 12, 0, tzinfo=TEHRAN)
+        ops = fresh_ops()
+        ops.update(
+            state="LIVE_ARMED", locked=True, ev_override=True, go_live_sha="bcb95fe",
+            config_hash="stale-hash",
+        )
+        halted = advance(ops, _facts(now, mode="live", send_orders=True), CFG, stage="pre")
+        self.assertEqual(ops["state"], "HALT")
+        self.assertTrue(ops["ev_override"])
+        self.assertEqual(ops["config_hash"], "stale-hash")
+        self.assertEqual(halted[-1]["playbook_rule"], "CONFIG_DRIFT")
+
+        os.environ["TRADER_APPROVED_CONFIG_HASH"] = current.upper()
+        ops["config_drift_logged"] = True
+        rows = advance(ops, _facts(now, mode="live", send_orders=True), CFG, stage="pre")
+        self.assertEqual(ops["config_hash"], current)
+        self.assertEqual(ops["go_live_sha"], git_sha())
+        self.assertTrue(ops["ev_override"])
+        self.assertEqual(ops["state"], "HALT")
+        self.assertTrue(any(row["playbook_rule"] == "CONFIG_REFREEZE" for row in rows))
+        self.assertIn("ev_override was not changed", rows[0]["note"])
+
+    def test_missing_config_hash_adopts_without_a_halt(self):
+        now = datetime(2026, 10, 23, 12, 0, tzinfo=TEHRAN)
+        ops = fresh_ops()
+        ops.update(state="LIVE_ARMED", locked=True, ev_override=True, go_live_sha="bcb95fe")
+        rows = advance(ops, _facts(now, mode="live", send_orders=True), CFG, stage="pre")
+        self.assertEqual(ops["state"], "LIVE_ARMED")
+        self.assertTrue(ops["ev_override"])
+        self.assertEqual(ops["go_live_sha"], "bcb95fe")
+        self.assertEqual(ops["config_hash"], config_hash(CFG))
+        self.assertEqual(rows[-1]["playbook_rule"], "CONFIG_FREEZE")
 
 
 class TehranMidnightTests(unittest.TestCase):

@@ -124,7 +124,8 @@ risk:
   max_gross_exposure: 0.30
   max_positions: 2
   stop_loss_pct: 0.045
-  time_stop_hours: 24
+  # Six hours, and never past liquidation.flat_by.
+  time_stop_hours: 6
   trail_arm_pct: 0.025
   trail_distance_pct: 0.012
   cooldown_after_stop_seconds: 21600
@@ -140,13 +141,14 @@ liquidation:
   start_before_minutes: 60
   aggressive_before_minutes: 30
   flat_by: "2026-10-23T23:30:00+03:30"
-  min_hours_to_enter: 8
+  # 23:30 flat minus the Fri 18:00 entry cutoff. A shorter gap would close entries early.
+  min_hours_to_enter: 5.5
 
 ops:
   # Measured gross per closed trade on the recorded backtest (~0.45%).
   # Entries stay blocked unless ev_override was set before go-live and then locked.
   frozen_gross_prior: 0.0045
-  entry_cutoff: "2026-10-22T23:30:00+03:30"
+  entry_cutoff: "2026-10-23T18:00:00+03:30"
   zscore_min_n: 18
   size_cut_pnl: -0.005
   unprotected_stop_pnl: -0.02

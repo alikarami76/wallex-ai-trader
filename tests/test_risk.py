@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from trader.engine.portfolio import Portfolio
+from trader.engine.portfolio import Portfolio, Position
 from trader.risk.manager import RiskManager
 from trader.strategy.parser import AgentDecision, ParsedDecision
 from trader.strategy.signals import Candidate
@@ -228,6 +228,54 @@ class RiskTests(unittest.TestCase):
         )
         self.assertFalse(any(a.side == "BUY" for a in planned.actions))
         self.assertTrue(any("cap" in row["reason"] for row in planned.rejected))
+
+    def test_time_stop_is_six_hours_and_also_flat_by(self):
+        settings = cfg()
+        settings["risk"]["time_stop_hours"] = 6
+        risk = RiskManager(settings)
+        portfolio = Portfolio(5_000_000)
+        entry = datetime(2026, 10, 23, 20, 0, tzinfo=TEHRAN)
+        portfolio.positions["BTCTMN"] = Position(
+            "BTCTMN", 1.0, 100, int(entry.timestamp()), 100, 95, 100, "uptrend_pullback", "seed",
+        )
+
+        def exits(moment: datetime):
+            view = risk.view(
+                portfolio, {"BTCTMN": 100}, moment, peak_equity=5_000_000, day_start_equity=5_000_000,
+                kill_switch=False, kill_reason="",
+            )
+            actions, _rejected = risk.protective_actions(
+                portfolio=portfolio, marks={"BTCTMN": 100}, view=view, now_unix=moment.timestamp(),
+            )
+            return [action for action in actions if action.source == "time"]
+
+        early = datetime(2026, 10, 23, 23, 0, tzinfo=TEHRAN)
+        self.assertEqual(exits(early), [])
+        flat = datetime(2026, 10, 23, 23, 30, tzinfo=TEHRAN)
+        forced = exits(flat)
+        self.assertEqual(len(forced), 1)
+        self.assertIn("flat_by", forced[0].reason)
+        self.assertEqual(forced[0].order_type, "MARKET")
+        self.assertTrue(forced[0].aggressive)
+
+        held = Portfolio(5_000_000)
+        opened = datetime(2026, 10, 23, 12, 0, tzinfo=TEHRAN)
+        held.positions["BTCTMN"] = Position(
+            "BTCTMN", 1.0, 100, int(opened.timestamp()), 100, 95, 100, "uptrend_pullback", "seed",
+        )
+        due = datetime(2026, 10, 23, 18, 0, tzinfo=TEHRAN)
+        view = risk.view(
+            held, {"BTCTMN": 100}, due, peak_equity=5_000_000, day_start_equity=5_000_000,
+            kill_switch=False, kill_reason="",
+        )
+        actions, _rejected = risk.protective_actions(
+            portfolio=held, marks={"BTCTMN": 100}, view=view, now_unix=due.timestamp(),
+        )
+        timed = [action for action in actions if action.source == "time"]
+        self.assertEqual(len(timed), 1)
+        self.assertIn("time stop after", timed[0].reason)
+        self.assertEqual(timed[0].order_type, "LIMIT")
+        self.assertFalse(timed[0].aggressive)
 
 
 if __name__ == "__main__":

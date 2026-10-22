@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from trader.timeutil import parse_ts, to_tehran
+
+log = logging.getLogger("trader.ops")
 
 STATES = ("SHADOW", "LIVE_ARMED", "LIVE_MANAGE", "FLATTEN", "HALT", "KILLED")
 ACTIONS = (
@@ -74,15 +77,16 @@ GATES = (
 CHECKPOINT_END = {
     "C0": "2026-10-22T21:30:00+03:30",
     "C1": "2026-10-22T22:30:00+03:30",
-    "C2": "2026-10-22T23:30:00+03:30",
-    "C3": "2026-10-23T01:00:00+03:30",
+    # C2 ends at the Fri 18:00 entry cutoff. C3 is the 90 minutes after it.
+    "C2": "2026-10-23T18:00:00+03:30",
+    "C3": "2026-10-23T19:30:00+03:30",
     "C4": "2026-10-23T08:00:00+03:30",
 }
 CHECKPOINT_START = {
     "C0": "2026-10-22T19:00:00+03:30",
     "C1": "2026-10-22T21:30:00+03:30",
-    "C2": "2026-10-22T22:30:00+03:30",
-    "C3": "2026-10-22T23:30:00+03:30",
+    "C2": "2026-10-23T17:00:00+03:30",
+    "C3": "2026-10-23T18:00:00+03:30",
     "C4": "2026-10-23T01:00:00+03:30",
 }
 _LOG_CONTEXT = {"config_hash": "", "go_live_sha": None}
@@ -139,7 +143,7 @@ def frozen_gross_prior(cfg: dict) -> float:
 
 
 def entry_cutoff(cfg: dict) -> datetime:
-    raw = (cfg.get("ops") or {}).get("entry_cutoff") or "2026-10-22T23:30:00+03:30"
+    raw = (cfg.get("ops") or {}).get("entry_cutoff") or "2026-10-23T18:00:00+03:30"
     return parse_ts(str(raw))
 
 
@@ -172,6 +176,19 @@ def config_hash(cfg: dict) -> str:
 def config_file_hash(path: str | Path) -> str:
     """Hash of the config file on disk. Overlays in memory do not change it."""
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def running_config_hash(cfg: dict) -> str:
+    """The hash the journal stamps. A file on disk wins over the in-memory overlay."""
+    path = cfg.get("_config_path") if isinstance(cfg, dict) else None
+    if path and Path(str(path)).is_file():
+        return config_file_hash(path)
+    return config_hash(cfg)
+
+
+def approved_config_hash() -> str:
+    """Hex digest from TRADER_APPROVED_CONFIG_HASH. Empty when the env is unset."""
+    return os.getenv("TRADER_APPROVED_CONFIG_HASH", "").strip().lower()
 
 
 def set_log_context(cfg: dict, go_live_sha: str | None) -> None:
@@ -350,6 +367,7 @@ def advance(ops: dict, facts: Facts, cfg: dict, *, stage: str) -> list[dict]:
 
     if stage == "pre":
         _go_live_if_needed(ops, facts, cfg)
+        _reconcile_config_lock(ops, cfg)
         _drop_symbols(ops, facts)
         _kill_if_needed(ops, facts, cfg)
         _fee_halt_if_needed(ops, facts, cfg)
@@ -375,6 +393,7 @@ def _go_live_if_needed(ops: dict, facts: Facts, cfg: dict) -> None:
     ops["locked"] = True
     ops["go_live_sha"] = git_sha()
     ops["go_live_equity"] = facts.equity
+    ops["config_hash"] = running_config_hash(cfg)
     set_log_context(cfg, ops["go_live_sha"])
     if _drawdown_killed(facts, cfg):
         ops["state"] = "KILLED"
@@ -389,6 +408,76 @@ def _go_live_if_needed(ops: dict, facts: Facts, cfg: dict) -> None:
         ops, action="A0_NO_CHANGE", before=before, after=ops["state"], playbook=playbook,
         note="live_authorized locked. ev_override is frozen at its pre-live value.",
         param="state", old=before, new=ops["state"], actor="operator:ali",
+    ))
+
+
+def _reconcile_config_lock(ops: dict, cfg: dict) -> None:
+    """Halt a locked book when the config file hash changes.
+
+    The go-live lock stores `config_hash` next to `go_live_sha`. A later
+    file is a drift and sets HALT. `TRADER_APPROVED_CONFIG_HASH` set to the
+    new file hash re-freezes that hash and the running git SHA, writes an
+    adjustment row, and does not change `ev_override`. A lock that has no
+    stored hash yet adopts the running file without a halt, so the first
+    boot of this check does not stop a book that locked before the field
+    existed. Set the env on that boot as well when the new SHA should
+    become the locked SHA.
+    """
+    if not ops.get("locked"):
+        return
+    current = running_config_hash(cfg)
+    stored = str(ops.get("config_hash") or "")
+    if stored == current:
+        return
+    approved = approved_config_hash()
+    if approved and approved == current:
+        old_sha = ops.get("go_live_sha")
+        ops["config_hash"] = current
+        ops["go_live_sha"] = git_sha()
+        ops["config_drift_logged"] = False
+        set_log_context(cfg, ops["go_live_sha"])
+        _queue(ops, _note_row(
+            ops, action="A0_NO_CHANGE", before=ops["state"], after=ops["state"],
+            playbook="CONFIG_REFREEZE",
+            note=(
+                "approved config re-freeze. TRADER_APPROVED_CONFIG_HASH matched the "
+                "running file. ev_override was not changed."
+            ),
+            param="config_hash", old=stored or None, new=current,
+        ))
+        _queue(ops, _note_row(
+            ops, action="A0_NO_CHANGE", before=ops["state"], after=ops["state"],
+            playbook="CONFIG_REFREEZE",
+            note="approved config re-freeze recorded the running git SHA.",
+            param="go_live_sha", old=old_sha, new=ops["go_live_sha"],
+        ))
+        log.info(
+            "approved config re-freeze hash %s -> %s sha %s -> %s",
+            stored or "none", current, old_sha, ops.get("go_live_sha"),
+        )
+        return
+    if ops.get("config_drift_logged"):
+        return
+    if not stored:
+        ops["config_hash"] = current
+        _queue(ops, _note_row(
+            ops, action="A0_NO_CHANGE", before=ops["state"], after=ops["state"],
+            playbook="CONFIG_FREEZE",
+            note="go-live lock had no config hash; froze the running config. ev_override unchanged.",
+            param="config_hash", old=None, new=current,
+        ))
+        return
+    before = ops["state"]
+    ops["config_drift_logged"] = True
+    if before not in {"HALT", "KILLED", "FLATTEN"}:
+        ops["state"] = "HALT"
+    _queue(ops, _note_row(
+        ops, action="A1_HALT_ENTRIES", before=before, after=ops["state"], playbook="CONFIG_DRIFT",
+        note=(
+            "config hash does not match the go-live lock. "
+            "Set TRADER_APPROVED_CONFIG_HASH to the new file hash to re-freeze. ev_override unchanged."
+        ),
+        param="config_hash", old=stored, new=current,
     ))
 
 
@@ -539,7 +628,7 @@ def _entry_cutoff(ops: dict, facts: Facts, cfg: dict) -> None:
     ops["state"] = "LIVE_MANAGE"
     _queue(ops, _note_row(
         ops, action="A0_NO_CHANGE", before=before, after="LIVE_MANAGE", playbook="B7",
-        note="Thu 23:30 Asia/Tehran entry cutoff. entries_allowed false. cutoff_reason entry_cutoff.",
+        note="Fri 18:00 Asia/Tehran entry cutoff. entries_allowed false. cutoff_reason entry_cutoff.",
         param="entries_allowed", old=True, new=False,
     ))
 

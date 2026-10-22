@@ -7,41 +7,41 @@
       "fold": 1,
       "trade_after": 1790460000,
       "trade_before": 1791198000,
-      "ending_equity": 5005095.37,
-      "return_pct": 0.102,
-      "fees_paid": 7911.08,
-      "realized_pnl": 5095.37,
-      "deflated_sharpe_probability": 0.1632
+      "ending_equity": 4996075.82,
+      "return_pct": -0.078,
+      "fees_paid": 9453.84,
+      "realized_pnl": -3924.18,
+      "deflated_sharpe_probability": 0.0526
     },
     {
       "fold": 2,
       "trade_after": 1791198000,
       "trade_before": 1791936000,
-      "ending_equity": 4993072.75,
-      "return_pct": -0.139,
-      "fees_paid": 1146.45,
-      "realized_pnl": -6927.25,
-      "deflated_sharpe_probability": 0.0001
+      "ending_equity": 4992562.91,
+      "return_pct": -0.149,
+      "fees_paid": 1145.17,
+      "realized_pnl": -7437.09,
+      "deflated_sharpe_probability": 0.0
     },
     {
       "fold": 3,
       "trade_after": 1791936000,
       "trade_before": 1792670401,
-      "ending_equity": 4992765.63,
-      "return_pct": -0.145,
-      "fees_paid": 2406.94,
-      "realized_pnl": -7234.37,
-      "deflated_sharpe_probability": 0.0033
+      "ending_equity": 4992900.38,
+      "return_pct": -0.142,
+      "fees_paid": 2611.56,
+      "realized_pnl": -7099.62,
+      "deflated_sharpe_probability": 0.0001
     }
   ],
   "full_sample": {
     "ok": true,
     "observations": 694,
     "n_trials": 6,
-    "sharpe_per_bar": -0.0157,
-    "skew": -2.5919,
-    "kurtosis": 36.1335,
-    "hurdle_sharpe": 0.0484,
-    "deflated_sharpe_probability": 0.0427
+    "sharpe_per_bar": -0.0472,
+    "skew": -4.4088,
+    "kurtosis": 76.711,
+    "hurdle_sharpe": 0.0451,
+    "deflated_sharpe_probability": 0.0039
   }
 }

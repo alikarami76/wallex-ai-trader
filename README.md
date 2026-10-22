@@ -89,7 +89,7 @@ Liara deployment is in [deploy/LIARA.md](deploy/LIARA.md). The image listens on 
 
 ## Safety architecture
 
-These checks can only refuse an order, shrink a size, or write a log. They do not raise a size, add a symbol, or change a strategy number: EMA windows, return and pullback bands, ATR cap, spread cap, 24-hour hold, −4.5% stop, trail arm +2.5% with 1.2% distance, confidence floor 0.55, 12% size cap, 30% gross cap, frozen prior 0.45%, `ev_override` default off, kill levels −1.5% and −3%, and the Thu 2026-10-22 23:30 Asia/Tehran entry cutoff. The C0 report, the state machine, B1–B10, and the A0–A8 adjustment enum are unchanged. There are no new model calls. The $2.50 BoxAPI cap is unchanged.
+These checks can only refuse an order, shrink a size, or write a log. They do not raise a size, add a symbol, or change a strategy number: EMA windows, return and pullback bands, ATR cap, spread cap, −4.5% stop, trail arm +2.5% with 1.2% distance, confidence floor 0.55, 12% size cap, 30% gross cap, frozen prior 0.45%, kill levels −1.5% and −3%. Ali approved two clock changes for the live book: the hold is 6 hours, and the entry cutoff is Fri 2026-10-23 18:00 Asia/Tehran. `flat_by` stays Fri 2026-10-23 23:30. A time stop also exits at `flat_by`. `ev_override`, once locked on, stays on. `TRADER_APPROVED_CONFIG_HASH` re-freezes the go-live config hash for that file. The C0 report, the state machine, B1–B10, and the A0–A8 adjustment enum are unchanged. There are no new model calls. The $2.50 BoxAPI cap is unchanged.
 
 ### Pre-send order guard
 
@@ -113,7 +113,7 @@ A hard timeout returns the deterministic fallback and stores `llm_source=fallbac
 
 ### Sealed scorecard
 
-At decision time each symbol row stores `prompt_hash`, `response_hash`, `action`, `size_mult`, and the signal snapshot. `python -m trader scorecard` is offline and needs no keys. It reads the journal and `results/backtest/candles`, then writes `results/scorecard.md` and `results/scorecard.json`. For each vetoed, shrunk, and accepted signal it computes after-fee PnL against a rules-only baseline, exiting at +24 hours or at the stop or trail, whichever comes first. Shadow-mode rows are counted.
+At decision time each symbol row stores `prompt_hash`, `response_hash`, `action`, `size_mult`, and the signal snapshot. `python -m trader scorecard` is offline and needs no keys. It reads the journal and `results/backtest/candles`, then writes `results/scorecard.md` and `results/scorecard.json`. For each vetoed, shrunk, and accepted signal it computes after-fee PnL against a rules-only baseline, exiting at the configured hold or at the stop or trail, whichever comes first. The hold is 6 hours. Shadow-mode rows are counted.
 
 ### Decision card
 
@@ -127,7 +127,7 @@ When both `TELEGRAM_ALERT_BOT_TOKEN` and `TELEGRAM_ALERT_CHAT_ID` are set, the p
 
 `python -m trader backtest --compare <sha_a> <sha_b>` diffs the two trade lists and stamps both SHAs and the config hash. `HEAD` replays the stored candles. Any other second ref uses the trade list committed at that SHA. A sensitivity table reruns the same candles at 1.0× and 1.5× fees, each with 0 and +5 bps extra slippage. Those multiples are copies; `config/default.yaml` is not edited, and `results/backtest/` is not rewritten.
 
-`3880ac429f56f652cffd871d11dc5b05a1bd70ce` versus HEAD `32aa7c1de902ab1b43931e54a0cc84cd53521e09` is identical: −0.140% mark-to-market, 17 closed trades, ending equity 4,993,023.91105763 TMN. At 1.5× fees the existing cost gate takes no trades. At 1.0× fees and +5 bps extra slippage the same 17 trades finish at −0.142%. A bar that trades through both the stop and a target exits at the stop. That order was already the engine's behavior, and the compare test locks it.
+The recorded book on the stored candles, with the 6-hour hold, is −0.335% mark-to-market, 23 closed trades, ending equity 4,983,233.3104847735 TMN. The compare test locks those trade-list bytes. A bar that trades through both the stop and a target exits at the stop. That order was already the engine's behavior.
 
 Random model text cannot raise a size or turn a veto into a buy. The order-guard property tests and the schema veto cover that. Nothing in this section sets `TRADER_LIVE_AUTHORIZED`.
 
@@ -143,7 +143,7 @@ The shadow journal audits clean: no fills, 0 TMN drift, no secret hits.
 
 ### Random-entry baseline
 
-The backtest report includes 1,000 seeded runs on the same universe and denylist, with the same 24-hour hold, stop, trail, fees, and size. Only the entry times are random. On the recorded book the strategy return of −0.14% is at the 76.7 percentile of those runs, and the Sharpe of −1.47 is at the 61.4 percentile. Return quantiles are −2.389 / −1.418 / −0.777 / −0.184 / 0.598 percent at p05 / p25 / p50 / p75 / p95. Sharpe quantiles are −6.49 / −4.04 / −2.30 / −0.55 / 1.94. The numbers are in `results/backtest/baseline.json`.
+The backtest report includes 1,000 seeded runs on the same universe and denylist, with the same configured hold, stop, trail, fees, and size. Only the entry times are random. On the recorded 6-hour book the strategy return of −0.335% is at the 92.1 percentile of those runs, and the Sharpe of −4.41 is at the 68.1 percentile. Return quantiles are −2.427 / −1.726 / −1.216 / −0.849 / −0.235 percent at p05 / p25 / p50 / p75 / p95. Sharpe quantiles are −9.85 / −7.31 / −5.46 / −3.70 / −1.10. The numbers are in `results/backtest/baseline.json`.
 
 ### Watchdog
 

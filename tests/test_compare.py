@@ -66,9 +66,9 @@ class CompareTests(unittest.TestCase):
         summary = replay(cfg, Path("results/backtest"), out)
         recorded = (Path("results/backtest") / "trades.csv").read_bytes()
         self.assertEqual((out / "trades.csv").read_bytes(), recorded)
-        self.assertEqual(summary["closed_trades"], 17)
-        self.assertEqual(summary["return_pct"], -0.14)
-        self.assertAlmostEqual(summary["ending_equity"], 4993023.91105763, places=4)
+        self.assertEqual(summary["closed_trades"], 23)
+        self.assertEqual(summary["return_pct"], -0.335)
+        self.assertAlmostEqual(summary["ending_equity"], 4983233.3104847735, places=4)
 
 
 class _Capture:
