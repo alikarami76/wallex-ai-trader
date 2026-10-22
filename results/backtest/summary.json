@@ -1,7 +1,7 @@
 {
-  "ending_equity": 4942865.067607116,
-  "fees_paid": 91840.42085318467,
-  "realized_pnl": -21985.55138604343,
+  "ending_equity": 4993360.883361751,
+  "fees_paid": 11736.35140010244,
+  "realized_pnl": -349.0513882489322,
   "bars": 695,
   "symbols": [
     "USDTTMN",
@@ -10,5 +10,15 @@
     "XAUTTMN",
     "XRPTMN",
     "DOGETMN"
-  ]
+  ],
+  "deflated_sharpe": {
+    "ok": true,
+    "observations": 694,
+    "n_trials": 6,
+    "sharpe_per_bar": -0.0127,
+    "skew": -3.3782,
+    "kurtosis": 48.1931,
+    "hurdle_sharpe": 0.0484,
+    "deflated_sharpe_probability": 0.0502
+  }
 }

@@ -67,4 +67,4 @@ A systemd unit is in `deploy/wallex-trader.service`. Point `WorkingDirectory` an
 
 No API key is required for 1–4. Shadow uses public REST only. Backtest forces the deterministic agent so a stray `LLM_API_KEY` cannot spend the budget. Charts land next to the journal: `report.md`, `equity.png`, `drawdown.png`, `trades.csv`, `equity.csv`, `decisions.jsonl`.
 
-The sample already in the repo is `results/backtest/` (about 29 days of hourly candles, deterministic agent) and `results/shadow/` (15 minutes of the live book, no orders). On 2026-10-22 the backtest finished at −1.143% with a 2.15% max drawdown. The shadow stayed flat. Numbers and the reason the parameters were left alone are in [STRATEGY.md](STRATEGY.md).
+The sample already in the repo is `results/backtest/` (about 29 days of hourly candles, deterministic agent, walk-forward and deflated Sharpe) and `results/shadow/` (about 12 minutes of the live book, no orders). On 2026-10-22 the backtest finished at −0.133% mark-to-market with a 0.44% max drawdown, and the deflated Sharpe probability was 0.05. The shadow stayed flat. Numbers and citations are in [STRATEGY.md](STRATEGY.md).

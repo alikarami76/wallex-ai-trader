@@ -142,24 +142,21 @@ The report's desk block is PnL after fees (mark-to-market and realized), annuali
 
 ## Result recorded on 2026-10-22
 
-The table below is the run from before the maker-fill, quarter-Kelly, and 72-hour filter. The regenerated report, walk-forward folds, and deflated Sharpe are in `results/backtest/` after `python3 -m trader --mode backtest`.
+`python3 -m trader --mode backtest --config config/default.yaml` on the live hourly history (695 bars, about 29 days) selected USDTTMN, BTCTMN, ETHTMN, XAUTTMN, XRPTMN, and DOGETMN. The deterministic agent ran on every bar. Maker quotes had to be touched by the next bar. Size was quarter-Kelly.
 
-`python3 -m trader --mode backtest --config config/default.yaml` on the live hourly history (695 bars, about 29 days) selected USDTTMN, BTCTMN, ETHTMN, XAUTTMN, XRPTMN, and DOGETMN. SOL and BNB were outside the 22 bp snapshot. The deterministic agent ran on every bar.
-
-| Metric | Value |
+| Desk metric | Value |
 | --- | --- |
-| Ending equity | 4,942,865 TMN |
-| Net return | −1.143% |
-| Max drawdown | 2.153% |
-| Sharpe | −2.19 |
-| Closed round trips | 26 |
-| Win rate | 53.8% |
-| Fees | 91,840 TMN |
-| Realized PnL | −21,986 TMN |
+| PnL after fees, mark-to-market | −6,639 TMN (−0.133%) |
+| PnL after fees, realized | −349 TMN |
+| Sharpe (annualized) | −1.19 |
+| Max drawdown | 0.436% |
+| Hit rate | 58.8% (17 closed trades) |
+| Fees | 11,736 TMN |
+| Deflated Sharpe probability | 0.050 (per-bar Sharpe −0.0127, hurdle 0.048 at N=6) |
 
-Nine trailing stops were all winners. Fifteen time stops and two disaster stops (both DOGE) more than offset them. Two positions were still open at the last bar, so the equity figure is mark-to-market, not a fully realized flatten. Parameters were not changed after seeing this. A negative sample is preferred to a curve-fit that would not survive the next month. Candle aggregation for BTCTMN matched native hourly closes (median absolute error 0).
+Walk-forward, frozen parameters, fresh 5,000,000 TMN each fold: +0.136%, −0.159%, −0.160%. The first fold is the only one with a positive deflated-Sharpe probability, and even that is 0.17. The rule does not clear the Bailey and López de Prado hurdle. Parameters were not changed after seeing this. Two buys were still open on the last bar, which is why mark-to-market PnL is worse than realized PnL. Candle aggregation for BTCTMN matched native hourly closes (median absolute error 0).
 
-The same day, a 15-minute shadow (`--duration 900 --interval 45`) on the live book kept 5,000,000 TMN, took no trades, logged 19 fallback decisions and zero errors, and confirmed the Wallex MCP candle tool. Live spreads that hour dropped XRPTMN, SOLTMN, and BNBTMN for being wider than 22 bps.
+The same day's shadow (`--duration 720 --interval 45`, no API key) ran 15 fallback cycles from 16:12 to 16:24 Asia/Tehran. No candidate cleared the gates, so there were no orders. Equity stayed 5,000,000 TMN. Median decision latency was 4.3 seconds, mostly the `/v2/depth/all` fetch. The Wallex MCP candle tool responded. Zero errors.
 
 ## Research, and what was not tuned
 
