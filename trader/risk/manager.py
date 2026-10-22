@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 
 from trader.engine.portfolio import Portfolio
 from trader.strategy.liquidity import Liquidity, liquidity_settings
+from trader.strategy.menu import MenuAction, hold_action
 from trader.strategy.parser import AgentDecision, ParsedDecision
 from trader.strategy.quotes import fractional_kelly
 from trader.strategy.signals import Candidate
@@ -58,6 +59,7 @@ class Action:
     source: str
     price_direction: str
     aggressive: bool = False
+    client_order_id: str = ""
 
 
 @dataclass
@@ -163,6 +165,7 @@ class RiskManager:
         cooldowns: dict[str, float],
         now_unix: float,
         liquidity: dict[str, Liquidity] | None = None,
+        features: list | None = None,
     ) -> RiskResult:
         actions: list[Action] = []
         rejected: list[dict] = []
@@ -197,18 +200,49 @@ class RiskManager:
         order_cap = int(risk["max_orders_per_hour"])
 
         hostile = (agent.regime or "").lower() == "hostile"
+        if agent.menu_bound:
+            for decision in agent.decisions:
+                if decision.action != "CANCEL":
+                    continue
+                if view.phase != "normal" or view.kill_switch or not decision.client_order_id:
+                    rejected.append({"symbol": decision.symbol or "*", "reason": "cancel vetoed by the risk layer"})
+                    continue
+                actions.append(
+                    Action(
+                        symbol=decision.symbol,
+                        side="CANCEL",
+                        order_type="LIMIT",
+                        size_fraction=0.0,
+                        reason=decision.rationale or "cancel a resting maker order",
+                        source="cancel",
+                        price_direction="down",
+                        client_order_id=decision.client_order_id,
+                    )
+                )
         if view.phase == "normal" and not view.kill_switch:
             for decision in agent.decisions:
                 if decision.action in {"SELL", "CLOSE"} and not decision.veto:
                     if decision.symbol in held and decision.symbol not in forced_symbols:
+                        if agent.menu_bound and features is not None and not self._close_condition(decision.symbol, features):
+                            rejected.append({
+                                "symbol": decision.symbol,
+                                "reason": "close vetoed; the quant exit condition is gone",
+                            })
+                            continue
+                        fraction = 1.0
+                        if agent.menu_bound and decision.size_fraction is not None:
+                            fraction = min(1.0, max(0.0, float(decision.size_fraction)))
+                        if fraction <= 0:
+                            rejected.append({"symbol": decision.symbol, "reason": "reduce size is zero"})
+                            continue
                         actions.append(
                             Action(
                                 symbol=decision.symbol,
                                 side="SELL",
                                 order_type="LIMIT",
-                                size_fraction=1.0,
+                                size_fraction=fraction,
                                 reason=decision.rationale or "model requested an early exit",
-                                source="agent_close",
+                                source="agent_reduce" if fraction < 0.999 else "agent_close",
                                 price_direction="up",
                             )
                         )
@@ -216,60 +250,229 @@ class RiskManager:
                         rejected.append({"symbol": decision.symbol, "reason": "close ignored; no position"})
             if agent.veto_all or hostile:
                 rejected.append({"symbol": "*", "reason": "model vetoed the regime"})
+            elif agent.menu_bound:
+                for decision in agent.decisions:
+                    if decision.action != "BUY" or decision.veto:
+                        continue
+                    self._append_buy(
+                        decision, actions, rejected, candidate_by_symbol, portfolio, view,
+                        unavailable, rules, cooldowns, now_unix, entries_this_hour,
+                        order_cap, entry_cap, liquidity, agent.source, menu_size=True,
+                    )
+                    if any(item.side == "BUY" for item in actions):
+                        break
             else:
                 for decision in _entry_decisions(agent, candidates):
-                    rejection = self._reject_buy(
-                        decision,
-                        candidate_by_symbol,
-                        portfolio,
-                        view,
-                        unavailable,
-                        rules,
-                        cooldowns,
-                        now_unix,
-                        entries_this_hour,
-                        order_cap,
-                        entry_cap,
+                    self._append_buy(
+                        decision, actions, rejected, candidate_by_symbol, portfolio, view,
+                        unavailable, rules, cooldowns, now_unix, entries_this_hour,
+                        order_cap, entry_cap, liquidity, agent.source, menu_size=False,
                     )
-                    if rejection:
-                        rejected.append(rejection)
-                        continue
-                    candidate = candidate_by_symbol[decision.symbol]
-                    size = decision.size_fraction if decision.size_fraction is not None else candidate.size_fraction
-                    kelly = fractional_kelly(self.cfg)
-                    per_symbol = float(risk.get("max_fraction_per_symbol", risk["max_fraction_per_trade"]))
-                    size = min(size, candidate.size_fraction, float(risk["max_fraction_per_trade"]), per_symbol)
-                    if kelly is not None:
-                        size = min(size, kelly)
-                    room = float(risk["max_gross_exposure"]) - view.gross_exposure
-                    size = min(size, room)
-                    size = self._liquidity_size(size, decision.symbol, view.equity, liquidity)
-                    if size <= 0:
-                        rejected.append({"symbol": decision.symbol, "reason": "no exposure room"})
-                        continue
-                    if size * view.equity < float(risk["min_notional_tmn"]):
-                        rejected.append({
-                            "symbol": decision.symbol,
-                            "reason": "size after the liquidity cap is below the minimum order",
-                        })
-                        continue
-                    actions.append(
-                        Action(
-                            symbol=decision.symbol,
-                            side="BUY",
-                            order_type="LIMIT",
-                            size_fraction=size,
-                            reason=decision.rationale or candidate.setup,
-                            source=agent.source,
-                            price_direction="down",
-                            aggressive=False,
-                        )
-                    )
-                    entries_this_hour += 1
-                    # one new entry per cycle, even if the cap allows more
-                    break
+                    if any(item.side == "BUY" for item in actions):
+                        break
 
         return RiskResult(view=view, actions=actions, rejected=rejected)
+
+    def legal_menu(
+        self,
+        *,
+        portfolio: Portfolio,
+        candidates: list[Candidate],
+        marks: dict[str, float],
+        rules: dict[str, MarketRule],
+        unavailable: set[str],
+        now: datetime,
+        view: RiskView,
+        order_times: list[float],
+        cooldowns: dict[str, float],
+        now_unix: float,
+        liquidity: dict[str, Liquidity] | None = None,
+        features: list | None = None,
+        pending: dict | None = None,
+    ) -> list[MenuAction]:
+        """Actions the model is allowed to pick. Stops and liquidation stay off the list.
+
+        A kill switch or a liquidation phase leaves only HOLD. The flatten
+        itself is applied by plan() and is not something the model can vote down.
+        """
+        menu = [hold_action()]
+        if view.phase != "normal" or view.kill_switch:
+            return menu
+        risk = self.cfg["risk"]
+        entries_this_hour = _count_since(order_times, now_unix, 3600)
+        entry_cap = int(risk["max_entries_per_hour"])
+        order_cap = int(risk["max_orders_per_hour"])
+        for candidate in candidates:
+            probe = ParsedDecision(
+                action="BUY",
+                symbol=candidate.symbol,
+                size_fraction=None,
+                confidence=0.7,
+                veto=False,
+                rationale="quant candidate cleared the cost gate",
+            )
+            if self._reject_buy(
+                probe, {candidate.symbol: candidate}, portfolio, view, unavailable, rules,
+                cooldowns, now_unix, entries_this_hour, order_cap, entry_cap,
+            ):
+                continue
+            size, _why = self._sized_entry(probe, candidate, view, liquidity)
+            if size is None:
+                continue
+            menu.append(
+                MenuAction(
+                    id=f"buy_{candidate.symbol}",
+                    kind="BUY",
+                    symbol=candidate.symbol,
+                    size_fraction=size,
+                    summary=f"BUY {candidate.symbol} at the maker bid, size {size:.4f} of equity",
+                )
+            )
+        for symbol, position in portfolio.positions.items():
+            price = marks.get(symbol, position.entry_price)
+            if self._forced_exit(symbol, position, price, now_unix, view):
+                continue
+            if not self._close_condition(symbol, features):
+                continue
+            menu.append(
+                MenuAction(
+                    id=f"sell_{symbol}",
+                    kind="SELL",
+                    symbol=symbol,
+                    size_fraction=1.0,
+                    summary=f"SELL {symbol}, the full position, at the maker offer",
+                )
+            )
+            menu.append(
+                MenuAction(
+                    id=f"reduce_{symbol}",
+                    kind="REDUCE",
+                    symbol=symbol,
+                    size_fraction=0.5,
+                    summary=f"REDUCE {symbol} by half at the maker offer",
+                )
+            )
+        for client_id, meta in (pending or {}).items():
+            if not isinstance(meta, dict) or meta.get("side") not in {"BUY", "SELL"}:
+                continue
+            symbol = str(meta.get("symbol") or "")
+            menu.append(
+                MenuAction(
+                    id=f"cancel_{client_id}",
+                    kind="CANCEL",
+                    symbol=symbol,
+                    summary=f"CANCEL order {client_id}",
+                    client_order_id=str(client_id),
+                )
+            )
+        return menu
+
+    def _append_buy(
+        self,
+        decision,
+        actions,
+        rejected,
+        candidate_by_symbol,
+        portfolio,
+        view,
+        unavailable,
+        rules,
+        cooldowns,
+        now_unix,
+        entries_this_hour,
+        order_cap,
+        entry_cap,
+        liquidity,
+        source,
+        menu_size: bool,
+    ) -> None:
+        rejection = self._reject_buy(
+            decision,
+            candidate_by_symbol,
+            portfolio,
+            view,
+            unavailable,
+            rules,
+            cooldowns,
+            now_unix,
+            entries_this_hour,
+            order_cap,
+            entry_cap,
+        )
+        if rejection:
+            rejected.append(rejection)
+            return
+        candidate = candidate_by_symbol[decision.symbol]
+        fresh, why = self._sized_entry(
+            ParsedDecision(
+                action="BUY",
+                symbol=decision.symbol,
+                size_fraction=None if menu_size else decision.size_fraction,
+                confidence=decision.confidence,
+                veto=False,
+                rationale=decision.rationale,
+            ),
+            candidate,
+            view,
+            liquidity,
+        )
+        if fresh is None:
+            rejected.append({"symbol": decision.symbol, "reason": why})
+            return
+        size = fresh
+        if menu_size:
+            # The menu size is already post-Kelly and post-liquidity. Take the
+            # smaller of that quote and a fresh check. Do not scale twice.
+            offered = decision.size_fraction if decision.size_fraction is not None else fresh
+            size = min(float(offered), fresh)
+        if size <= 0:
+            rejected.append({"symbol": decision.symbol, "reason": "no exposure room"})
+            return
+        if size * view.equity < float(self.cfg["risk"]["min_notional_tmn"]):
+            rejected.append({
+                "symbol": decision.symbol,
+                "reason": "size after the liquidity cap is below the minimum order",
+            })
+            return
+        actions.append(
+            Action(
+                symbol=decision.symbol,
+                side="BUY",
+                order_type="LIMIT",
+                size_fraction=size,
+                reason=decision.rationale or candidate.setup,
+                source=source,
+                price_direction="down",
+                aggressive=False,
+            )
+        )
+
+    def _sized_entry(self, decision, candidate, view, liquidity) -> tuple[float | None, str]:
+        """Post-cap, post-Kelly, post-liquidity fraction. None when it cannot trade."""
+        risk = self.cfg["risk"]
+        size = decision.size_fraction if decision.size_fraction is not None else candidate.size_fraction
+        kelly = fractional_kelly(self.cfg)
+        per_symbol = float(risk.get("max_fraction_per_symbol", risk["max_fraction_per_trade"]))
+        size = min(size, candidate.size_fraction, float(risk["max_fraction_per_trade"]), per_symbol)
+        if kelly is not None:
+            size = min(size, kelly)
+        room = float(risk["max_gross_exposure"]) - view.gross_exposure
+        size = min(size, room)
+        size = self._liquidity_size(size, decision.symbol, view.equity, liquidity)
+        if size <= 0:
+            return None, "no exposure room"
+        if size * view.equity < float(risk["min_notional_tmn"]):
+            return None, "size after the liquidity cap is below the minimum order"
+        return size, ""
+
+    def _close_condition(self, symbol: str, features: list | None) -> bool:
+        """Early exit the quant layer already allowed: close under the slow EMA and a negative 24h return."""
+        if not features:
+            return False
+        row = next((item for item in features if getattr(item, "symbol", None) == symbol), None)
+        if row is None or row.ema_slow is None or row.roc_trend is None:
+            return False
+        return float(row.close) < float(row.ema_slow) and float(row.roc_trend) < 0
 
     def _forced_exit(self, symbol, position, price, now_unix, view) -> Action | None:
         risk = self.cfg["risk"]

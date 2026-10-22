@@ -11,6 +11,11 @@ and stripped once if the model returns HTTP 400. Spend uses usage.cost.
 A disk ledger caps calls per hour, calls for the run, spend per Tehran day,
 and total spend. Near the cap the router steps down to a cheaper tier.
 Cache hits, cap hits, timeouts, and bad JSON use the deterministic fallback.
+
+Shadow and live also pass a menu of actions the risk layer already accepted.
+The model then returns one id. Invalid menu output is HOLD and does not fall
+through to the quant candidate. A missing key or a failed request still uses
+the deterministic fallback.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+from trader.strategy.menu import MenuAction, hold_action, parse_menu_choice
 from trader.strategy.parser import AgentDecision, ParsedDecision, extract_json, parse_agent_output
 from trader.strategy.router import choose_tier
 from trader.strategy.signals import Candidate, SymbolFeatures
@@ -51,6 +57,12 @@ Rules:
 
 Schema:
 {"veto_all": false, "regime": "trend|chop|hostile", "comment": "short", "decisions": [{"action": "BUY|SELL|CLOSE|HOLD", "symbol": "BTCTMN", "size_fraction": null, "confidence": 0.7, "veto": false, "rationale": "..."}]}
+"""
+
+MENU_PROMPT = """You choose one action from a menu the risk layer already validated.
+Reply with one JSON object and nothing else:
+{"action_id": "hold", "rationale": "one short sentence citing a number in the state"}
+Use an id from the menu. Leave size, price, and symbol as written. If unsure, pick hold.
 """
 
 
@@ -315,6 +327,18 @@ def _cycle_key(features, candidates, positions, now: float) -> str:
     return hashlib.sha256(json.dumps(payload).encode()).hexdigest()[:24]
 
 
+def _menu_key(features, positions, now: float, menu: list[MenuAction]) -> str:
+    """Cache a menu pick for the hour. A new id on the menu is a new call."""
+    payload = {
+        "hour": int(now // 3600),
+        "menu": [item.id for item in menu],
+        "bars": [(row.symbol, row.bar_time, row.signal) for row in features],
+        "positions": [row.get("symbol") for row in positions],
+    }
+    digest = hashlib.sha256(json.dumps(payload).encode()).hexdigest()[:24]
+    return "menu:" + digest
+
+
 def _price(usage: dict, settings: dict, model: str) -> dict:
     """Prefer BoxAPI usage.cost. Fall back to the token estimate only when it is absent."""
     prompt = int(usage.get("prompt_tokens") or 0)
@@ -441,7 +465,10 @@ class TradingAgent:
         risk_state: dict,
         now: float,
         use_llm: bool = True,
+        menu: list[MenuAction] | None = None,
     ) -> AgentDecision:
+        if menu is not None and use_llm and self.settings.get("enabled", True):
+            return self._decide_menu(features, candidates, positions, risk_state, now, menu)
         if not use_llm or not self.settings.get("enabled", True):
             decision = fallback_decision(candidates)
             decision.comment = "LLM disabled for this mode. " + decision.comment
@@ -494,6 +521,154 @@ class TradingAgent:
         decision = self._parse_or_fallback(raw, candidates)
         decision.usage = usage
         return decision
+
+    def _decide_menu(
+        self,
+        features: list[SymbolFeatures],
+        candidates: list[Candidate],
+        positions: list[dict],
+        risk_state: dict,
+        now: float,
+        menu: list[MenuAction],
+    ) -> AgentDecision:
+        if not menu:
+            menu = [hold_action()]
+        rows = [item.as_log() for item in menu]
+        kinds = {item.kind for item in menu}
+        if kinds <= {"HOLD"}:
+            decision = self._menu_decision(menu, menu[0] if menu else None, "menu is hold only", "")
+            decision.error = ""
+            decision.usage = {"skipped": "menu is hold only", "tier": "routine"}
+            decision.menu = rows
+            return decision
+        task = "trade" if "BUY" in kinds else "signal"
+        spec = choose_tier(task, self.settings, self.budget.spent_usd(), self.budget.spent_today(now))
+        user = self._menu_prompt(features, positions, risk_state, menu)
+        key = _menu_key(features, positions, now, menu)
+        hit = self.budget.peek(key, now)
+        if hit and hit.get("content"):
+            decision = self._choice_or_hold(hit["content"], menu)
+            decision.source = "llm_cache" if decision.menu_bound else decision.source
+            decision.usage = {
+                "cached": True,
+                "model": hit.get("model") or spec["model"],
+                "tier": hit.get("tier") or spec["tier"],
+                "reasoning_effort": hit.get("reasoning_effort"),
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "usd": 0.0,
+                "cost_source": "cache",
+                "spent_usd": round(self.budget.spent_usd(), 6),
+            }
+            decision.menu = rows
+            return decision
+        allowed, reason = self.budget.allow(now)
+        if not allowed:
+            log.info("LLM skipped: %s", reason)
+            decision = fallback_decision(candidates)
+            decision.comment = f"LLM cap: {reason}. " + decision.comment
+            decision.usage = {
+                "skipped": reason,
+                "tier": spec["tier"],
+                "model": spec["model"],
+                "downgraded": spec["downgraded"],
+                "spent_usd": round(self.budget.spent_usd(), 6),
+            }
+            decision.menu = rows
+            return decision
+        raw, usage = self.llm.complete(MENU_PROMPT, user, spec)
+        if not raw:
+            decision = fallback_decision(candidates)
+            decision.usage = usage
+            decision.error = str(usage.get("error") or usage.get("skipped") or "")
+            decision.menu = rows
+            return decision
+        self.budget.remember(key, raw, usage, now)
+        decision = self._choice_or_hold(raw, menu)
+        decision.usage = usage
+        decision.menu = rows
+        return decision
+
+    def _choice_or_hold(self, raw: str, menu: list[MenuAction]) -> AgentDecision:
+        chosen, note = parse_menu_choice(raw, menu)
+        if note:
+            decision = self._menu_decision(menu, next((item for item in menu if item.kind == "HOLD"), None), note, raw)
+            decision.error = note
+            return decision
+        return self._menu_decision(menu, chosen, "", raw)
+
+    def _menu_decision(self, menu: list[MenuAction], chosen: MenuAction | None, note: str, raw: str) -> AgentDecision:
+        action = chosen if chosen is not None else menu[0]
+        rationale = note or ""
+        if raw and not note:
+            try:
+                rationale = str(extract_json(raw).get("rationale") or "").strip()
+            except (ValueError, json.JSONDecodeError, TypeError):
+                rationale = ""
+        if action.kind == "HOLD":
+            text = rationale or note or "hold"
+            decisions = [ParsedDecision("HOLD", "", None, 1.0, False, text)]
+        elif action.kind == "BUY":
+            decisions = [ParsedDecision("BUY", action.symbol, action.size_fraction, 0.7, False, rationale)]
+        elif action.kind == "SELL":
+            decisions = [ParsedDecision("SELL", action.symbol, 1.0, 0.7, False, rationale)]
+        elif action.kind == "REDUCE":
+            decisions = [ParsedDecision("SELL", action.symbol, action.size_fraction if action.size_fraction is not None else 0.5, 0.7, False, rationale)]
+        elif action.kind == "CANCEL":
+            decisions = [ParsedDecision(
+                "CANCEL", action.symbol, None, 0.7, False, rationale, client_order_id=action.client_order_id,
+            )]
+        else:
+            decisions = [ParsedDecision("HOLD", "", None, 1.0, False, "invalid output")]
+            action = next((item for item in menu if item.kind == "HOLD"), action)
+            note = "invalid output"
+        return AgentDecision(
+            source="llm",
+            veto_all=False,
+            regime="menu",
+            comment=rationale or note,
+            decisions=decisions,
+            raw=(raw or "")[:2000],
+            error=note,
+            menu_bound=True,
+            picked_id=action.id if action.kind != "HOLD" or not note else "hold",
+            menu=[item.as_log() for item in menu],
+        )
+
+    def _menu_prompt(self, features, positions, risk_state, menu: list[MenuAction]) -> str:
+        payload = {
+            "risk": {
+                "equity": risk_state.get("equity"),
+                "drawdown": risk_state.get("drawdown"),
+                "daily_drawdown": risk_state.get("daily_drawdown"),
+                "gross_exposure": risk_state.get("gross_exposure"),
+                "phase": risk_state.get("phase"),
+            },
+            "positions": [
+                {
+                    "symbol": row.get("symbol"),
+                    "qty": row.get("qty"),
+                    "entry_price": row.get("entry_price"),
+                }
+                for row in positions
+            ],
+            "state": [
+                {
+                    "symbol": row.symbol,
+                    "close": row.close,
+                    "ema_slow": row.ema_slow,
+                    "roc_24h": row.roc_trend,
+                    "roc_4h": row.roc_pullback,
+                    "spread_bps": row.spread_bps,
+                    "imbalance": row.imbalance,
+                    "liquidity_scale": None if row.liquidity is None else row.liquidity.scale,
+                    "depth_100_tmn": None if row.liquidity is None else row.liquidity.depth_100_tmn,
+                }
+                for row in features
+            ],
+            "menu": [item.as_log() for item in menu],
+        }
+        return json.dumps(payload, ensure_ascii=False)
 
     def apply_sentiment(self, mood, now: float, allow_network: bool) -> list[dict]:
         """Tier0 headline score. A cache hit is free. Network runs only when allowed.

@@ -18,6 +18,7 @@ class ParsedDecision:
     confidence: float
     veto: bool
     rationale: str
+    client_order_id: str = ""
 
 
 @dataclass
@@ -30,6 +31,9 @@ class AgentDecision:
     raw: str = ""
     error: str = ""
     usage: dict = field(default_factory=dict)
+    menu_bound: bool = False
+    picked_id: str = ""
+    menu: list = field(default_factory=list)
 
     def as_log(self) -> dict:
         return {
@@ -39,6 +43,9 @@ class AgentDecision:
             "comment": self.comment,
             "error": self.error,
             "usage": self.usage,
+            "menu_bound": self.menu_bound,
+            "picked_id": self.picked_id,
+            "menu": self.menu,
             "decisions": [vars(item) for item in self.decisions],
         }
 

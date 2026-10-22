@@ -239,10 +239,27 @@ def _cycle(
     state["peak_equity"] = view.peak_equity
     state["kill_switch"] = view.kill_switch
     state["kill_reason"] = view.kill_reason
+    liquidity = {row.symbol: row.liquidity for row in features if row.liquidity is not None}
+    menu = risk.legal_menu(
+        portfolio=portfolio,
+        candidates=candidates,
+        marks=marks,
+        rules=rules,
+        unavailable=unavailable,
+        now=now,
+        view=view,
+        order_times=state["order_times"],
+        cooldowns={k: float(v) for k, v in state["cooldowns"].items()},
+        now_unix=now_unix,
+        liquidity=liquidity,
+        features=features,
+        pending=state.get("pending") or {},
+    )
     decision = agent.decide(
         features, candidates,
         [p.to_dict() for p in portfolio.positions.values()],
         view.compact(), now_unix,
+        menu=menu,
     )
     planned = risk.plan(
         portfolio=portfolio,
@@ -256,12 +273,22 @@ def _cycle(
         order_times=state["order_times"],
         cooldowns={k: float(v) for k, v in state["cooldowns"].items()},
         now_unix=now_unix,
-        liquidity={row.symbol: row.liquidity for row in features if row.liquidity is not None},
+        liquidity=liquidity,
+        features=features,
     )
     fills = []
     requests = []
     pending_symbols = {row.get("symbol") for row in state.get("pending", {}).values()}
     for action in planned.actions:
+        if action.source == "cancel":
+            cancelled = _cancel_resting(client, state, action, send_orders)
+            if cancelled is None:
+                planned.rejected.append({"symbol": action.symbol, "reason": "cancel ignored; order is not working"})
+            else:
+                requests.append(cancelled)
+                if cancelled.get("error"):
+                    planned.rejected.append({"symbol": action.symbol, "reason": cancelled["error"]})
+            continue
         if action.symbol in pending_symbols:
             planned.rejected.append({"symbol": action.symbol, "reason": "an order for this symbol is already working"})
             continue
@@ -314,11 +341,49 @@ def _cycle(
     })
     save_state(state_path, state)
     log.info(
-        "%s equity=%.0f exposure=%.1f%% phase=%s candidates=%s actions=%s source=%s tier=%s",
+        "%s equity=%.0f exposure=%.1f%% phase=%s candidates=%s actions=%s source=%s tier=%s pick=%s",
         mode, equity, view.gross_exposure * 100, view.phase, len(candidates),
         len(planned.actions), decision.source, (decision.usage or {}).get("tier") or "-",
+        decision.picked_id or "-",
     )
     log.info("cycle latency %.0f ms", latency_ms)
+
+
+def _order_qty(position_qty: float, size_fraction: float | None, qty_decimals: int) -> float:
+    """Full position unless the action is a partial reduce."""
+    fraction = 1.0 if size_fraction is None else float(size_fraction)
+    if fraction >= 0.999:
+        return position_qty
+    qty = float(round_qty(position_qty * fraction, qty_decimals))
+    if qty <= 0 or qty > position_qty:
+        return position_qty
+    return qty
+
+
+def _cancel_resting(client, state, action, send_orders) -> dict | None:
+    client_id = action.client_order_id
+    pending = state.setdefault("pending", {})
+    meta = pending.get(client_id)
+    if not isinstance(meta, dict):
+        return None
+    if send_orders:
+        try:
+            client.cancel_order(client_id)
+        except WallexError as exc:
+            log.warning("cancel %s failed: %s", client_id, exc)
+            return {
+                "op": "cancel",
+                "client_id": client_id,
+                "symbol": meta.get("symbol"),
+                "error": str(exc),
+            }
+    pending.pop(client_id, None)
+    return {
+        "op": "cancel",
+        "client_id": client_id,
+        "symbol": meta.get("symbol"),
+        "side": meta.get("side"),
+    }
 
 
 def _execute(cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees, feature=None):
@@ -397,6 +462,7 @@ def _execute(cfg, client, portfolio, action, books, marks, rules, state, send_or
     position = portfolio.positions.get(action.symbol)
     if position is None:
         return None, None
+    sell_qty = _order_qty(position.qty, action.size_fraction, rule.qty_decimals)
     aggressive = action.aggressive or action.order_type == "MARKET"
     use_market = aggressive and rule.market_orders_enabled and action.order_type == "MARKET"
     if not use_market and not aggressive:
@@ -409,7 +475,7 @@ def _execute(cfg, client, portfolio, action, books, marks, rules, state, send_or
         direction = "up"
         price = float(round_price(raw, rule.price_decimals, direction))
         prepared = client.prepare_order(
-            symbol=action.symbol, side="SELL", order_type="LIMIT", quantity=position.qty,
+            symbol=action.symbol, side="SELL", order_type="LIMIT", quantity=sell_qty,
             price=price, client_id=client_id, rule=rule, price_direction=direction,
         )
         request = prepared.redacted()
@@ -417,7 +483,7 @@ def _execute(cfg, client, portfolio, action, books, marks, rules, state, send_or
         order_type = "LIMIT"
     elif use_market:
         prepared = client.prepare_order(
-            symbol=action.symbol, side="SELL", order_type="MARKET", quantity=position.qty,
+            symbol=action.symbol, side="SELL", order_type="MARKET", quantity=sell_qty,
             price=None, client_id=client_id, rule=rule, price_direction="down",
         )
         request = prepared.redacted()
@@ -433,7 +499,7 @@ def _execute(cfg, client, portfolio, action, books, marks, rules, state, send_or
             direction = "up"
         price = float(round_price(raw, rule.price_decimals, direction))
         prepared = client.prepare_order(
-            symbol=action.symbol, side="SELL", order_type="LIMIT", quantity=position.qty,
+            symbol=action.symbol, side="SELL", order_type="LIMIT", quantity=sell_qty,
             price=price, client_id=client_id, rule=rule, price_direction=direction,
         )
         request = prepared.redacted()
@@ -442,7 +508,7 @@ def _execute(cfg, client, portfolio, action, books, marks, rules, state, send_or
     if send_orders:
         client.place_order(
             symbol=action.symbol, side="SELL", order_type=order_type,
-            quantity=position.qty, price=None if use_market else price,
+            quantity=sell_qty, price=None if use_market else price,
             client_id=client_id, rule=rule, price_direction="down" if aggressive else "up",
         )
         filled = _consume_live_order(client, client_id)
@@ -451,23 +517,23 @@ def _execute(cfg, client, portfolio, action, books, marks, rules, state, send_or
             fill = portfolio.sell(
                 symbol=action.symbol, price=filled.executed_price or price, fee_rate=fee,
                 reason=action.reason, client_id=client_id, order_type=order_type,
-                qty=min(filled.executed_qty, portfolio.positions[action.symbol].qty),
+                qty=min(filled.executed_qty, sell_qty, portfolio.positions[action.symbol].qty),
             )
         elif not aggressive:
             state.setdefault("pending", {})[client_id] = {
-                "symbol": action.symbol, "side": "SELL", "price": price, "fee": fee,
+                "symbol": action.symbol, "side": "SELL", "price": price, "qty": sell_qty, "fee": fee,
                 "reason": action.reason, "order_type": order_type, "created": time.time(),
             }
         return fill, request
     if not aggressive:
         state.setdefault("pending", {})[client_id] = {
-            "symbol": action.symbol, "side": "SELL", "price": price, "fee": fee,
+            "symbol": action.symbol, "side": "SELL", "price": price, "qty": sell_qty, "fee": fee,
             "reason": action.reason, "order_type": order_type, "created": time.time(),
         }
         return None, request
     fill = portfolio.sell(
         symbol=action.symbol, price=price, fee_rate=fee, reason=action.reason,
-        client_id=client_id, order_type=order_type,
+        client_id=client_id, order_type=order_type, qty=sell_qty,
     )
     return fill, request
 
@@ -530,9 +596,11 @@ def _sync_paper(cfg, portfolio: Portfolio, state: dict, books: dict) -> None:
         elif book and price > 0 and meta.get("side") == "SELL" and book.best_ask and book.best_ask > price:
             position = portfolio.positions.get(meta["symbol"])
             if position is not None:
+                raw_qty = meta.get("qty")
                 portfolio.sell(
                     symbol=meta["symbol"], price=price, fee_rate=float(meta.get("fee") or 0),
                     reason=meta.get("reason") or "paper maker fill", client_id=client_id, order_type="LIMIT",
+                    qty=float(raw_qty) if raw_qty else None,
                 )
             filled = True
         if filled or age > 600:

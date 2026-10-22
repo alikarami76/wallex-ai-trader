@@ -9,7 +9,7 @@ flowchart TD
   public["Wallex public REST<br/>markets, package bans, depth, UDF candles"]
   private["Wallex private REST<br/>balances, orders, fees"]
   quant["Quant layer<br/>72h momentum, 24h trend, 4h pullback, book imbalance"]
-  agent["BoxAPI router<br/>tier0 sentiment, tier2 only after the cost gate"]
+  agent["BoxAPI router<br/>picks one id from the risk menu"]
   risk["Risk manager<br/>quarter-Kelly, stops, daily max-loss, liquidation"]
   exec["Execution<br/>maker bid with inventory skew, market stop"]
   journal["JSONL decisions, trades CSV, equity CSV, state.json"]
@@ -23,7 +23,7 @@ flowchart TD
   risk --> journal
 ```
 
-Backtest, shadow, and live call `evaluate_symbol`, `TradingAgent.decide`, and `RiskManager.plan`. Only the fill model changes.
+Backtest, shadow, and live call `evaluate_symbol`, `TradingAgent.decide`, and `RiskManager.plan`. Only the fill model changes. Shadow and live ask the risk layer for a menu before the model speaks, then check the pick again.
 
 ## Buy
 
@@ -64,13 +64,19 @@ BoxAPI `POST /chat/completions` goes through one router. The quant layer is stil
 
 | Tier | When | Model | Effort |
 | --- | --- | --- | --- |
-| routine (tier0) | Flat cycle, headline scoring | `gpt-6-luna` (or `gpt-5.4-mini`) | low |
-| signal (tier1) | A position is open and no new candidate cleared the cost gate | `gpt-6-luna` | medium |
-| trade (tier2) | A quant candidate exists, so the cost gate already passed | `gpt-6-sol` | high |
+| routine (tier0) | Flat cycle, headline scoring. A menu that is only HOLD skips the call | `gpt-6-luna` (or `gpt-5.4-mini`) | low |
+| signal (tier1) | The menu has a sell, a reduction, or a cancel, and no buy | `gpt-6-luna` | medium |
+| trade (tier2) | The menu contains a BUY, so the cost gate already passed | `gpt-6-sol` | high |
 
-Trade decisions are open, close, or size. Every candidate and open position goes in one compact JSON prompt. The reply is one JSON object: regime, optional `veto_all`, and decisions with action, symbol, size fraction, confidence, and rationale. Headline scoring is a separate short call, cached for 15 minutes, and it runs on a flat cycle so it does not sit in front of a trade. A failed score leaves the lexicon number in place.
+Shadow and live hand the model a compact state and a menu. The menu is built by the same checks that size an order: HOLD, BUY at the maker bid with the post-Kelly post-liquidity size, SELL or REDUCE when close is under the slow EMA and the 24-hour return is negative, and CANCEL for a resting maker order. Stops, the kill switch, and liquidation are applied by the risk layer and are not on the menu. A kill or a liquidation phase leaves the menu as HOLD, and that cycle does not call the model.
 
-This is a meta-label, not a signal (López de Prado, 2018): the primary model proposes the bet, and the secondary model only accepts, rejects, or shrinks it. If the model abstains, the top quant candidate is still eligible. `regime: hostile` or `veto_all: true` blocks every new entry. An explicit BUY confirms that symbol only and does not fall through to a different name. A per-symbol `veto: true` drops that name.
+The reply is one JSON object, `{"action_id", "rationale"}`. The id has to be on the menu. Bad JSON, an unknown id, or an empty rationale is HOLD. That HOLD does not fall through to the quant candidate. A missing key, a spend cap, or a failed request still uses the deterministic fallback, so the bot keeps trading. `plan()` sizes the pick again and can veto it. The decision log stores the menu, `picked_id`, and `menu_bound`.
+
+The shape of this loop — code proposes the legal actions, the model classifies, risk can still refuse — is the open-source pattern in [beebots](https://github.com/imikerussell/beebots) and [jev-loop](https://github.com/snafu4/jev-loop). The model on this bot is the BoxAPI router above.
+
+Headline scoring stays a separate short call, cached for 15 minutes, on a flat cycle. A failed score leaves the lexicon number in place. The backtest keeps `use_llm=False` and does not build a menu, so an abstaining deterministic pass can still take the top quant candidate. That path is unchanged.
+
+This is a meta-label, not a signal (López de Prado, 2018): the primary model proposes the bet, and the secondary model only accepts, rejects, or shrinks it. On the no-menu path, if the model abstains, the top quant candidate is still eligible. `regime: hostile` or `veto_all: true` blocks every new entry. An explicit BUY confirms that symbol only and does not fall through to a different name. A per-symbol `veto: true` drops that name.
 
 The model may also close a held name when close is below the slow EMA and the 24-hour return has turned negative. It may not invent a symbol, raise size, loosen a stop, or override the kill switch. A BUY confirmation with confidence below 0.55 is dropped. `temperature` and `response_format` are omitted. `reasoning_effort` is sent. If the model answers HTTP 400, the same request is retried once without that field. `LLM_MODEL`, when set, pins every tier to that one model.
 
@@ -220,4 +226,4 @@ Check these before sending real orders:
 
 ## خلاصه فارسی
 
-ربات فقط روی جفت‌های تومانی مجاز پلن ۱۸۳ معامله می‌کند و فهرست بازارهای ممنوع را در شروع می‌گیرد. سیگنال، پولبک در روند صعودی ساعتی است و فقط وقتی فعال می‌شود که هزینه رفت‌وبرگشت کارمزد را پوشش بدهد. عمق دفتر سفارش، اسپرد، و حجم معاملات اگر ناگهان بد شوند ورود را می‌بندند و اندازه را بعد از کلی کوچک می‌کنند؛ خروج اجباریِ آرام منتظر نقدشوندگی می‌ماند و از ۲۳:۲۰ دیگر منتظر نمی‌ماند. شاخص ترس و طمع و امتیاز اخبار به‌عنوان ورودی به فیلتر رژیم داده می‌شوند؛ در آزمون تاریخی، بستن ورود در طمع شدید (۸۰ به بالا) هیچ معامله‌ای را عوض نکرد و در نتیجه خاموش ماند. مدل ارزان (`gpt-6-luna` با تلاش کم) امتیاز اخبار را می‌دهد و مدل قوی‌تر (`gpt-6-sol`) فقط وقتی صدا زده می‌شود که سیگنال کمی از دروازهٔ هزینه گذشته باشد. هزینه از `usage.cost` خوانده می‌شود و نزدیک سقف ۲٫۵۰ دلار مدل به ردهٔ ارزان‌تر برمی‌گردد. اگر سقف هزینه یا خطا پیش بیاید، لایه قطعی جایگزین می‌شود. حد ضرر، سقف حجم، و خروج اجباری قبل از ۲۳:۳۰ روز ۲۳ اکتبر ۲۰۲۶ به وقت تهران خارج از اختیار مدل هستند.
+ربات فقط روی جفت‌های تومانی مجاز پلن ۱۸۳ معامله می‌کند و فهرست بازارهای ممنوع را در شروع می‌گیرد. سیگنال، پولبک در روند صعودی ساعتی است و فقط وقتی فعال می‌شود که هزینه رفت‌وبرگشت کارمزد را پوشش بدهد. عمق دفتر سفارش، اسپرد، و حجم معاملات اگر ناگهان بد شوند ورود را می‌بندند و اندازه را بعد از کلی کوچک می‌کنند؛ خروج اجباریِ آرام منتظر نقدشوندگی می‌ماند و از ۲۳:۲۰ دیگر منتظر نمی‌ماند. شاخص ترس و طمع و امتیاز اخبار به‌عنوان ورودی به فیلتر رژیم داده می‌شوند؛ در آزمون تاریخی، بستن ورود در طمع شدید (۸۰ به بالا) هیچ معامله‌ای را عوض نکرد و در نتیجه خاموش ماند. مدل ارزان (`gpt-6-luna` با تلاش کم) امتیاز اخبار را می‌دهد و مدل قوی‌تر (`gpt-6-sol`) فقط وقتی صدا زده می‌شود که خریدِ ازپیش‌تأییدشده روی منو باشد. در هر چرخه مدل یکی از اقدام‌های معتبر (نگه‌داشتن، خرید، فروش، کاهش، لغو سفارش) را با شناسه انتخاب می‌کند؛ خروجی نامعتبر یعنی نگه‌داشتن، و لایه ریسک حق وتو را نگه می‌دارد. این شکل از حلقهٔ تصمیم از پروژه‌های متن‌باز beebots و jev-loop گرفته شده و مدل خودِ BoxAPI است. هزینه از `usage.cost` خوانده می‌شود و نزدیک سقف ۲٫۵۰ دلار مدل به ردهٔ ارزان‌تر برمی‌گردد. اگر سقف هزینه یا خطا پیش بیاید، لایه قطعی جایگزین می‌شود. حد ضرر، سقف حجم، و خروج اجباری قبل از ۲۳:۳۰ روز ۲۳ اکتبر ۲۰۲۶ به وقت تهران خارج از اختیار مدل هستند.
