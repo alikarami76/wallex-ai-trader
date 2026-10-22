@@ -52,9 +52,12 @@ def parse_menu_choice(text: str, menu: list[MenuAction]) -> tuple[MenuAction, st
         payload = extract_json(text or "")
     except (ValueError, json.JSONDecodeError, TypeError):
         return hold, "invalid output"
+    if payload.get("veto") is True or payload.get("veto_all") is True:
+        return hold, "veto"
     action_id = str(payload.get("action_id") or "").strip()
     rationale = str(payload.get("rationale") or "").strip()
     chosen = by_id.get(action_id) or folded.get(action_id.lower())
     if chosen is None or not rationale:
         return hold, "invalid output"
+    # A size on the JSON cannot replace the menu size. The caller keeps `chosen`.
     return chosen, ""

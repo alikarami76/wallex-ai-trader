@@ -116,16 +116,20 @@ class DustFlattenTests(unittest.TestCase):
         }
         action = Action("BTCTMN", "SELL", "LIMIT", 1.0, "liquidation flatten (passive)", "liquidation", "up")
         client = WallexClient(dry_run=True, api_key="test")
+        state = {"client_seq": 0}
+        blocks = []
         result = _try_dust_flatten(
             cfg, client, portfolio, action, {}, {"BTCTMN": 100}, {"BTCTMN": rule},
-            {"client_seq": 0}, False, {}, set(),
+            state, False, {}, set(), ops_state="FLATTEN", guard_blocks=blocks,
         )
         self.assertIsNotNone(result)
         fills, requests, residual = result
-        self.assertIsNone(residual)
-        self.assertEqual([fill.side for fill in fills], ["BUY", "SELL"])
-        self.assertNotIn("BTCTMN", portfolio.positions)
-        self.assertTrue(all(row["method"] == "POST" and row["url"].endswith("/v1/account/orders") for row in requests))
+        self.assertEqual(fills, [])
+        self.assertEqual(requests, [])
+        self.assertIn("BTCTMN", portfolio.positions)
+        self.assertIn("order_guard", residual["reason"])
+        self.assertEqual(state["client_seq"], 0)
+        self.assertEqual(blocks[0]["symbol"], "BTCTMN")
 
     def test_shadow_reports_residual_when_the_topup_cannot_be_funded(self):
         portfolio = _portfolio(1_000, qty=100)

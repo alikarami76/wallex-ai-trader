@@ -22,7 +22,14 @@ from trader.engine.dust import FORCED_FLATTEN, apply_paper, plan_dust_flatten
 from trader.engine.journal import Journal
 from trader.engine.portfolio import Portfolio
 from trader.engine.state import load_state, save_state
-from trader.engine.universe import explain_universe, select_universe, symbol_block
+from trader.engine.universe import (
+    allowlist_symbols,
+    base_asset,
+    explain_universe,
+    hard_deny_bases,
+    select_universe,
+    symbol_block,
+)
 from trader.engine.ops import (
     Facts,
     apply_frozen_cost_gate,
@@ -49,7 +56,8 @@ from trader.strategy.quotes import execution_cost, inventory_skew, maker_buy_lim
 from trader.strategy.signals import build_candidates, evaluate_symbol
 from trader.timeutil import iso, now_tehran
 from trader.types import Bar, MarketRule
-from trader.wallex.client import WallexClient, WallexError
+from trader.order_guard import OrderIntent, assess
+from trader.wallex.client import SPOT_ORDER_PATH, WallexClient, WallexError
 from trader.wallex.mcp import WallexMcp
 from trader.wallex.precision import OrderRejected, round_price, round_qty
 
@@ -242,7 +250,7 @@ def _emit_contract(
     directory, cfg, state, ops, facts, now, mode, send_orders, equity, portfolio,
     view, universe, unavailable, features, decision, planned, requests, fills, residuals,
     latency_ms, allowed, cutoff_reason, adjustment_rows, order_errors, order_rejects,
-    entry_taker_fills, cancel_errors, b9_skips, maker_rate, taker_rate, hurdle,
+    entry_taker_fills, cancel_errors, b9_skips, maker_rate, taker_rate, hurdle, guard_blocks=None,
 ) -> None:
     """Append the contract logs. Rows are stamped and secrets are presence-only."""
     ops["cycle_seq"] = int(ops.get("cycle_seq") or 0) + 1
@@ -292,7 +300,17 @@ def _emit_contract(
         below_min = "b9" in reasons or "notional" in reasons
         extra_gates["min_notional"] = (not below_min, None, cfg["risk"].get("min_notional_tmn"))
         trace = gate_trace(gates_from_feature(compact, cfg, {"symbol": row.symbol, "gates": extra_gates}))
-        blocked = first_block(trace)
+        guard_hit = next((item for item in (guard_blocks or []) if item.get("symbol") == row.symbol), None)
+        if guard_hit:
+            trace.append({
+                "gate": "order_guard",
+                "pass": False,
+                "value": guard_hit.get("reason"),
+                "threshold": None,
+            })
+            blocked = "order_guard"
+        else:
+            blocked = first_block(trace)
         if blocked:
             block_counts[blocked] = block_counts.get(blocked, 0) + 1
         if compact.get("expected_gross") and compact.get("round_trip_cost"):
@@ -358,6 +376,30 @@ def _emit_contract(
                 "hold_minutes": round((time.time() - position.entry_time) / 60, 1),
             },
         })
+    seen_symbols = {row.get("symbol") for row in symbol_rows}
+    for item in guard_blocks or []:
+        if item.get("symbol") in seen_symbols:
+            continue
+        seen_symbols.add(item.get("symbol"))
+        symbol_rows.append({
+            "record": "symbol",
+            "cycle_id": cycle_id,
+            "symbol": item.get("symbol"),
+            "gate_trace": [{
+                "gate": "order_guard",
+                "pass": False,
+                "value": item.get("reason"),
+                "threshold": None,
+            }],
+            "first_block": "order_guard",
+            "cost_gate": None,
+            "llm": None,
+            "risk": {"verdict": "reject", "size_before": None, "size_after": None, "reason_codes": ["order_guard"]},
+            "liquidity": None,
+            "order": None,
+            "position_after": None,
+        })
+        block_counts["order_guard"] = block_counts.get("order_guard", 0) + 1
     if b9_skips:
         adjustment_rows = list(adjustment_rows) + [{
             "action": "A0_NO_CHANGE",
@@ -649,6 +691,7 @@ def _cycle(
     entry_taker_fills = 0
     cancel_errors = 0
     pending_symbols = {row.get("symbol") for row in state.get("pending", {}).values()}
+    guard_blocks: list[dict] = []
     for action in planned.actions:
         if action.source == "cancel":
             cancelled = _cancel_resting(client, state, action, send_orders)
@@ -665,6 +708,7 @@ def _cycle(
             continue
         dust = _try_dust_flatten(
             cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees, unavailable,
+            ops_state=ops["state"], guard_blocks=guard_blocks,
         )
         if dust is not None:
             dust_fills, dust_requests, residual = dust
@@ -682,10 +726,18 @@ def _cycle(
                 journal.trade(_trade_row(fill, now, mode))
             continue
         try:
+            before_guard = len(guard_blocks)
             fill, request = _execute(
                 cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees,
                 feature_by_symbol.get(action.symbol), unavailable,
+                ops_state=ops["state"], guard_blocks=guard_blocks,
             )
+            if len(guard_blocks) > before_guard:
+                planned.rejected.append({
+                    "symbol": action.symbol,
+                    "reason": f"order_guard: {guard_blocks[-1]['reason']}",
+                })
+                continue
         except (WallexError, OrderRejected) as exc:
             order_rejects += 1
             order_errors.append({
@@ -728,7 +780,7 @@ def _cycle(
         journal.directory, cfg, state, ops, facts, now, mode, send_orders, equity, portfolio,
         view, universe, unavailable, features, decision, planned, requests, fills, residuals,
         latency_ms, allowed, cutoff_reason, pre_rows + post_rows, order_errors, order_rejects,
-        entry_taker_fills, cancel_errors, b9_skips, maker_rate, taker_rate, hurdle,
+        entry_taker_fills, cancel_errors, b9_skips, maker_rate, taker_rate, hurdle, guard_blocks,
     )
     journal.decision({
         "timestamp": iso(now),
@@ -815,7 +867,66 @@ def _cancel_resting(client, state, action, send_orders) -> dict | None:
     }
 
 
-def _try_dust_flatten(cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees, unavailable):
+def _note_guard(guard_blocks, symbol: str, reason: str, side: str) -> None:
+    if guard_blocks is None:
+        return
+    guard_blocks.append({"symbol": symbol, "side": side, "reason": reason})
+    log.info("order_guard blocked %s %s: %s", side, symbol, reason)
+
+
+def _position_notionals(portfolio, marks: dict, symbol: str) -> tuple[float, float]:
+    gross = 0.0
+    named = 0.0
+    for held, position in portfolio.positions.items():
+        price = marks.get(held, position.entry_price)
+        notional = position.qty * price
+        gross += notional
+        if held == symbol:
+            named = notional
+    return named, gross
+
+
+def _order_guard_reason(
+    cfg, portfolio, marks, *, symbol, side, order_type, qty, price, post_only, ops_state, unavailable, rule,
+) -> str | None:
+    """None when the order may be requested. Otherwise the guard's reason."""
+    mark = marks.get(symbol) or (rule.last_price if rule is not None else 0) or 0
+    symbol_notional, gross = _position_notionals(portfolio, marks, symbol)
+    equity = portfolio.equity(marks) if marks or portfolio.positions else portfolio.cash
+    held = portfolio.positions.get(symbol)
+    intent = OrderIntent(
+        symbol=symbol,
+        side=side,
+        order_type=order_type,
+        qty=float(qty),
+        price=None if price is None else float(price),
+        mark=float(mark or 0),
+        endpoint=SPOT_ORDER_PATH,
+        post_only=bool(post_only),
+        ops_state=str(ops_state or ""),
+        held_qty=0.0 if held is None else float(held.qty),
+        symbol_notional_tmn=symbol_notional,
+        gross_notional_tmn=gross,
+        equity_tmn=float(equity),
+        quote="" if rule is None else str(rule.quote_asset or ""),
+        base=base_asset(symbol, rule),
+        allowlist=tuple(allowlist_symbols(cfg)),
+        deny_bases=tuple(sorted(hard_deny_bases(cfg))),
+        unavailable=tuple(sorted(unavailable or ())),
+        size_cap=float((cfg.get("risk") or {}).get("max_fraction_per_symbol") or (cfg.get("risk") or {}).get("max_fraction_per_trade") or 0.12),
+        gross_cap=float((cfg.get("risk") or {}).get("max_gross_exposure", 0.30)),
+        min_notional_tmn=float((cfg.get("risk") or {}).get("min_notional_tmn", 50_000)),
+    )
+    verdict = assess(intent)
+    if verdict.ok:
+        return None
+    return verdict.reason
+
+
+def _try_dust_flatten(
+    cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees, unavailable,
+    ops_state="SHADOW", guard_blocks=None,
+):
     """Flatten a forced exit that is under the minimum notional.
 
     Returns None when the held coin already clears the minimum and the normal
@@ -859,6 +970,19 @@ def _try_dust_flatten(cfg, client, portfolio, action, books, marks, rules, state
     buy_fills = []
     try:
         if plan.kind == "topup":
+            blocked = _order_guard_reason(
+                cfg, portfolio, marks, symbol=action.symbol, side="BUY", order_type="LIMIT",
+                qty=plan.buy_qty, price=float(buy_price), post_only=False, ops_state=ops_state,
+                unavailable=unavailable, rule=rule,
+            )
+            if blocked:
+                _note_guard(guard_blocks, action.symbol, blocked, "BUY")
+                return [], [], {
+                    "symbol": action.symbol,
+                    "qty": position.qty,
+                    "mark_tmn": round(position.qty * float(mark or 0), 2),
+                    "reason": f"order_guard: {blocked}",
+                }
             buy_id = _next_id(state)
             buy_response = client.place_order(
                 symbol=action.symbol, side="BUY", order_type="LIMIT", quantity=plan.buy_qty,
@@ -894,8 +1018,23 @@ def _try_dust_flatten(cfg, client, portfolio, action, books, marks, rules, state
         held = portfolio.positions.get(action.symbol)
         if held is None:
             return buy_fills, requests, None
-        sell_id = _next_id(state)
         order_type = "MARKET" if rule.market_orders_enabled else "LIMIT"
+        sell_qty_preview = float(round_qty(held.qty, rule.qty_decimals))
+        sell_price_preview = None if order_type == "MARKET" else float(sell_price)
+        blocked = _order_guard_reason(
+            cfg, portfolio, marks, symbol=action.symbol, side="SELL", order_type=order_type,
+            qty=sell_qty_preview, price=sell_price_preview, post_only=order_type == "LIMIT" and not action.aggressive,
+            ops_state=ops_state, unavailable=unavailable, rule=rule,
+        )
+        if blocked:
+            _note_guard(guard_blocks, action.symbol, blocked, "SELL")
+            return buy_fills, requests, {
+                "symbol": action.symbol,
+                "qty": held.qty,
+                "mark_tmn": round(held.qty * float(mark or 0), 2),
+                "reason": f"order_guard: {blocked}",
+            }
+        sell_id = _next_id(state)
         sell_qty = float(round_qty(held.qty, rule.qty_decimals))
         sell_response = client.place_order(
             symbol=action.symbol, side="SELL", order_type=order_type, quantity=sell_qty,
@@ -951,19 +1090,22 @@ def _cancel_quiet(client: WallexClient, client_id: str) -> None:
         log.warning("cancel %s failed: %s", client_id, exc)
 
 
-def _execute(cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees, feature=None, unavailable=None):
+def _execute(
+    cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees,
+    feature=None, unavailable=None, ops_state="SHADOW", guard_blocks=None,
+):
     rule: MarketRule | None = rules.get(action.symbol)
     if rule is None:
         raise OrderRejected(f"no market rules for {action.symbol}")
     book = books.get(action.symbol)
     mark = marks.get(action.symbol) or rule.last_price
     maker, taker = _fee_pair(cfg, rule, account_fees.get(action.symbol))
-    client_id = _next_id(state)
     skew = _quote_skew(cfg, portfolio, marks, feature)
     if action.side == "BUY":
         blocked = symbol_block(action.symbol, cfg, unavailable or set(), rule)
         if blocked:
-            raise OrderRejected(blocked)
+            _note_guard(guard_blocks, action.symbol, blocked, "BUY")
+            return None, None
         maker_entry = cfg["execution"]["entry"] != "marketable_limit" and not action.aggressive
         if maker_entry:
             raw_price = maker_buy_limit(
@@ -981,6 +1123,15 @@ def _execute(cfg, client, portfolio, action, books, marks, rules, state, send_or
         price = float(round_price(raw_price, rule.price_decimals, direction))
         notional = portfolio.equity(marks) * action.size_fraction
         qty = float(round_qty(notional / price, rule.qty_decimals))
+        blocked_guard = _order_guard_reason(
+            cfg, portfolio, marks, symbol=action.symbol, side="BUY", order_type="LIMIT",
+            qty=qty, price=price, post_only=maker_entry, ops_state=ops_state,
+            unavailable=unavailable, rule=rule,
+        )
+        if blocked_guard:
+            _note_guard(guard_blocks, action.symbol, blocked_guard, "BUY")
+            return None, None
+        client_id = _next_id(state)
         prepared = client.prepare_order(
             symbol=action.symbol, side="BUY", order_type="LIMIT", quantity=qty, price=price,
             client_id=client_id, rule=rule, price_direction=direction,
@@ -1033,6 +1184,22 @@ def _execute(cfg, client, portfolio, action, books, marks, rules, state, send_or
     sell_qty = _order_qty(position.qty, action.size_fraction, rule.qty_decimals)
     aggressive = action.aggressive or action.order_type == "MARKET"
     use_market = aggressive and rule.market_orders_enabled and action.order_type == "MARKET"
+    if use_market:
+        guard_type, guard_price, guard_post = "MARKET", None, False
+    elif aggressive:
+        guard_type, guard_price, guard_post = "LIMIT", None, False
+    else:
+        guard_type, guard_price, guard_post = "LIMIT", None, True
+    # Price is filled in below. The notional check uses the mark when the limit is not known yet.
+    blocked_guard = _order_guard_reason(
+        cfg, portfolio, marks, symbol=action.symbol, side="SELL", order_type=guard_type,
+        qty=sell_qty, price=guard_price if guard_price is not None else (None if use_market or aggressive else mark),
+        post_only=guard_post, ops_state=ops_state, unavailable=unavailable, rule=rule,
+    )
+    if blocked_guard:
+        _note_guard(guard_blocks, action.symbol, blocked_guard, "SELL")
+        return None, None
+    client_id = _next_id(state)
     if not use_market and not aggressive:
         raw = maker_sell_limit(
             book.best_bid if book else None,
