@@ -114,12 +114,14 @@ liquidation:
   min_hours_to_enter: 8
 
 llm:
-  # BoxAPI (OpenAI-compatible). The key stays in LLM_API_KEY.
+  # BoxAPI is OpenRouter-like (https://ai.boxapi.ir/ai/v1). Prefer prefixed ids.
+  # Bare ids such as gpt-6-luna also answer; the client rewrites the verified ones.
   # Leave LLM_MODEL empty to use the tiers below. Setting it pins every tier to that model.
-  # Also allowed: gpt-5-mini, gpt-5.4-mini, gpt-5.6-sol, gpt-6-luna, gpt-6-sol, gpt-6.1-sol.
-  # Temperature is omitted unless send_temperature is true. Spend uses usage.cost when present.
+  # Temperature is omitted unless send_temperature is true.
+  # A completion cap is sent as max_completion_tokens. gpt-6-luna rejects max_tokens.
   # reasoning_effort is sent and dropped once if the model returns HTTP 400.
-  model: gpt-6-luna
+  # Spend is response usage.cost. /key and /credits are a shared upstream account, not our balance.
+  model: openai/gpt-6-luna
   enabled: true
   timeout_seconds: 20
   routine_timeout_seconds: 8
@@ -127,29 +129,42 @@ llm:
   temperature: 0.1
   send_response_format: false
   tiers:
-    routine: # tier0, flat-cycle headline scoring. Alternate model: gpt-5.4-mini
-      model: gpt-6-luna
+    routine: # tier0, flat-cycle headline scoring
+      model: openai/gpt-6-luna
       reasoning_effort: low
-    signal: # tier1, open-position review when no new candidate cleared the cost gate
-      model: gpt-6-luna
+    signal: # tier1, sell / reduce / cancel, no new buy
+      model: openai/gpt-6-luna
       reasoning_effort: medium
-    trade: # tier2, open/close/size, only after the quant cost gate
-      model: gpt-6-sol
+    trade: # tier2, default decision when a buy is legal and the book is flat
+      model: openai/gpt-6-luna
+      reasoning_effort: medium
+    stakes: # tier3, rare: a buy while already exposed, or the day is already down 0.75%
+      model: openai/gpt-6-sol
       reasoning_effort: high
-  # $3 competition budget. Hard stop at $2.50 total and $1.25 per Tehran day.
+  # $3 competition budget. The ledger is the sum of usage.cost. Hard stop at $2.50.
   # At $2.00 total or $1.00 today the router steps down one tier; inside $0.20 of a cap it uses routine.
+  # At the hard cap the call is skipped and the deterministic fallback runs.
+  competition_budget_usd: 3.00
   max_llm_calls_per_hour: 8
   max_llm_calls_total: 160
   max_spend_usd: 2.50
   max_spend_usd_per_day: 1.25
   downgrade_spend_usd: 2.00
   downgrade_daily_usd: 1.00
+  high_stakes_exposure: 0.0
+  high_stakes_daily_drawdown: 0.0075
   min_interval_seconds: 1
   max_retries: 3
   retry_backoff_seconds: 0.5
-  assumed_input_usd_per_million: 0.50
-  assumed_output_usd_per_million: 2.00
-  assumed_usd_per_call_if_usage_missing: 0.08
+  # List prices are per model (see STRATEGY). These two are the luna list, used only for an unknown model.
+  # Missing usage.cost is list price times price_markup (measured bills run about 15% above list).
+  # Reasoning tokens bill as output. A call with no usage at all is priced as ~3k in + ~500 out.
+  assumed_input_usd_per_million: 0.10
+  assumed_output_usd_per_million: 0.50
+  price_markup: 1.15
+  typical_prompt_tokens: 3000
+  typical_completion_tokens: 500
+  assumed_usd_per_call_if_usage_missing: 0.0006325
   cache_seconds: 3600
   sentiment_cache_seconds: 900
   usage_path: data/llm_usage.json

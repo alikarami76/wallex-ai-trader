@@ -4,8 +4,8 @@ import unittest
 from pathlib import Path
 
 from trader.sentiment import SentimentSnapshot
-from trader.strategy.agent import LlmHTTPError, TradingAgent, llm_settings, request_body
-from trader.strategy.router import choose_tier
+from trader.strategy.agent import LlmHTTPError, TradingAgent, _price, adapt_rejected_body, llm_settings, request_body
+from trader.strategy.router import choose_tier, quoted_call_usd
 from trader.strategy.signals import Candidate, SymbolFeatures
 
 
@@ -72,34 +72,45 @@ class RouterTests(unittest.TestCase):
 
         return TradingAgent({"llm": settings}, post=wrapped, sleep=lambda _seconds: None)
 
-    def test_trade_tier_is_sol_and_only_after_a_candidate(self):
+    def test_default_decision_is_luna_and_sol_is_high_stakes(self):
         calls = {}
 
         def post(url, headers, body, timeout=None):
             return _reply(), {"prompt_tokens": 20, "completion_tokens": 10, "cost": "3e-6", "model": body["model"]}
 
         agent = self._agent(post, calls)
-        decision = agent.decide([_feature()], [_candidate()], [], {"equity": 1}, 1_700_000_000)
+        decision = agent.decide([_feature()], [_candidate()], [], {"equity": 1, "gross_exposure": 0}, 1_700_000_000)
         self.assertEqual(calls["n"], 1)
-        self.assertEqual(calls["bodies"][0]["model"], "gpt-6-sol")
-        self.assertEqual(calls["bodies"][0]["reasoning_effort"], "high")
+        self.assertEqual(calls["bodies"][0]["model"], "openai/gpt-6-luna")
+        self.assertEqual(calls["bodies"][0]["reasoning_effort"], "medium")
         self.assertNotIn("temperature", calls["bodies"][0])
+        self.assertNotIn("max_tokens", calls["bodies"][0])
         self.assertEqual(decision.usage["tier"], "trade")
-        self.assertEqual(decision.usage["model"], "gpt-6-sol")
+        self.assertEqual(decision.usage["model"], "openai/gpt-6-luna")
         self.assertEqual(decision.usage["cost_source"], "usage.cost")
         self.assertAlmostEqual(decision.usage["usd"], 3e-6)
+        self.assertAlmostEqual(decision.usage["spent_usd"], 3e-6)
+        self.assertEqual(decision.usage["budget_usd"], 3.0)
         self.assertEqual(decision.usage["prompt_tokens"], 20)
 
         held = agent.decide([_feature()], [], [{"symbol": "BTCTMN"}], {"equity": 1}, 1_700_003_000)
-        self.assertEqual(calls["bodies"][-1]["model"], "gpt-6-luna")
+        self.assertEqual(calls["bodies"][-1]["model"], "openai/gpt-6-luna")
         self.assertEqual(calls["bodies"][-1]["reasoning_effort"], "medium")
         self.assertEqual(held.usage["tier"], "signal")
+
+        stressed = agent.decide(
+            [_feature()], [_candidate()], [{"symbol": "ETHTMN"}],
+            {"equity": 1, "gross_exposure": 0.08}, 1_700_006_000,
+        )
+        self.assertEqual(calls["bodies"][-1]["model"], "openai/gpt-6-sol")
+        self.assertEqual(calls["bodies"][-1]["reasoning_effort"], "high")
+        self.assertEqual(stressed.usage["tier"], "stakes")
 
     def test_downgrade_steps_toward_the_cheap_tier(self):
         settings = llm_settings({})
         cheap = choose_tier("trade", settings, spent_total=2.05, spent_today=0.1)
         self.assertEqual(cheap["tier"], "signal")
-        self.assertEqual(cheap["model"], "gpt-6-luna")
+        self.assertEqual(cheap["model"], "openai/gpt-6-luna")
         self.assertTrue(cheap["downgraded"])
         forced = choose_tier("trade", settings, spent_total=2.35, spent_today=0.1)
         self.assertEqual(forced["tier"], "routine")
@@ -154,7 +165,7 @@ class RouterTests(unittest.TestCase):
         calls = {}
 
         def post(url, headers, body, timeout=None):
-            self.assertEqual(body["model"], "gpt-6-luna")
+            self.assertEqual(body["model"], "openai/gpt-6-luna")
             self.assertEqual(body["reasoning_effort"], "low")
             self.assertLessEqual(timeout, 8)
             return json.dumps({"scores": {"BTCTMN": -0.4}}), {
@@ -180,9 +191,85 @@ class RouterTests(unittest.TestCase):
         self.assertTrue(again[0]["cached"])
 
     def test_request_effort_is_optional(self):
-        body = request_body("gpt-6-luna", [], llm_settings({}), "low")
+        body = request_body("openai/gpt-6-luna", [], llm_settings({}), "low")
         self.assertEqual(body["reasoning_effort"], "low")
-        self.assertNotIn("reasoning_effort", request_body("gpt-6-luna", [], llm_settings({})))
+        self.assertNotIn("max_tokens", body)
+        self.assertNotIn("reasoning_effort", request_body("openai/gpt-6-luna", [], llm_settings({})))
+        capped = request_body("openai/gpt-6-luna", [], llm_settings({"llm": {"max_tokens": 800}}), None)
+        self.assertEqual(capped["max_completion_tokens"], 800)
+        self.assertNotIn("max_tokens", capped)
+
+    def test_list_price_for_a_typical_decision(self):
+        settings = llm_settings({})
+        self.assertAlmostEqual(quoted_call_usd("openai/gpt-6-luna", settings), 0.0006325)
+        self.assertAlmostEqual(quoted_call_usd("gpt-6-sol", settings), 0.01265)
+        luna = _price(
+            {"prompt_tokens": 3000, "completion_tokens": 100, "reasoning_tokens": 400},
+            settings,
+            "openai/gpt-6-luna",
+        )
+        # 400 reasoning tokens sit above the 100 completion tokens, so output bills 500.
+        self.assertEqual(luna["cost_source"], "estimated_tokens")
+        self.assertAlmostEqual(luna["usd"], 0.0006325)
+        exact = _price(
+            {"cost": "0.0007", "prompt_tokens": 9000, "completion_tokens": 9000},
+            settings,
+            "openai/gpt-6-sol",
+        )
+        self.assertEqual(exact["cost_source"], "usage.cost")
+        self.assertAlmostEqual(exact["usd"], 0.0007)
+
+    def test_hard_cap_degrades_then_stops(self):
+        settings = llm_settings({})
+        full = choose_tier("stakes", settings, spent_total=0.0, spent_today=0.0)
+        self.assertEqual(full["tier"], "stakes")
+        self.assertEqual(full["model"], "openai/gpt-6-sol")
+        self.assertFalse(full["downgraded"])
+        stepped = choose_tier("stakes", settings, spent_total=2.05, spent_today=0.1)
+        self.assertEqual(stepped["tier"], "trade")
+        self.assertEqual(stepped["model"], "openai/gpt-6-luna")
+        self.assertTrue(stepped["downgraded"])
+        cheap = choose_tier("stakes", settings, spent_total=2.35, spent_today=0.1)
+        self.assertEqual(cheap["tier"], "routine")
+        self.assertEqual(cheap["model"], "openai/gpt-6-luna")
+
+        def post(url, headers, body, timeout=None):
+            raise AssertionError("the hard cap must stop the call")
+
+        agent = self._agent(post, max_spend_usd=2.50, max_llm_calls_per_hour=10, max_spend_usd_per_day=3)
+        agent.budget.calls.append({"ts": 1_700_000_000, "usd": 2.50})
+        decision = agent.decide([_feature()], [_candidate()], [], {"equity": 1}, 1_700_000_100)
+        self.assertEqual(decision.source, "fallback")
+        self.assertIn("cap", decision.usage["skipped"])
+        self.assertIn("DETERMINISTIC_FALLBACK", decision.decisions[0].rationale)
+        self.assertAlmostEqual(decision.usage["spent_usd"], 2.50)
+        self.assertEqual(decision.usage["budget_usd"], 3.0)
+        self.assertEqual(decision.usage["cap_usd"], 2.50)
+
+    def test_max_tokens_400_retries_as_max_completion_tokens(self):
+        calls = {}
+
+        def post(url, headers, body, timeout=None):
+            if "max_tokens" in body:
+                raise LlmHTTPError(400, "Unsupported parameter: max_tokens")
+            self.assertEqual(body.get("max_completion_tokens"), 400)
+            self.assertNotIn("max_tokens", body)
+            return _reply(), {"prompt_tokens": 4, "completion_tokens": 4, "cost": 0.000001, "model": body["model"]}
+
+        agent = self._agent(post, calls)
+        content, usage, error = agent.llm._send(
+            "https://ai.boxapi.ir/ai/v1/chat/completions",
+            {},
+            {"model": "openai/gpt-6-luna", "max_tokens": 400, "messages": []},
+            5,
+        )
+        self.assertEqual(error, "")
+        self.assertTrue(content)
+        self.assertEqual(calls["n"], 2)
+        rewritten = {"model": "openai/gpt-6-luna", "max_tokens": 50}
+        self.assertEqual(adapt_rejected_body(rewritten, "Unsupported parameter: max_tokens"), "max_completion_tokens")
+        self.assertEqual(rewritten["max_completion_tokens"], 50)
+        self.assertNotIn("max_tokens", rewritten)
 
 
 if __name__ == "__main__":

@@ -347,8 +347,9 @@ class MenuAgentTests(unittest.TestCase):
             [_feature()], [candidate()], [], {"equity": 5_000_000, "phase": "normal"},
             1_700_000_000, menu=self._buy_menu(),
         )
-        self.assertEqual(calls["bodies"][0]["model"], "gpt-6-sol")
-        self.assertEqual(calls["bodies"][0]["reasoning_effort"], "high")
+        self.assertEqual(calls["bodies"][0]["model"], "openai/gpt-6-luna")
+        self.assertEqual(calls["bodies"][0]["reasoning_effort"], "medium")
+        self.assertNotIn("max_tokens", calls["bodies"][0])
         self.assertIn("action_id", calls["bodies"][0]["messages"][0]["content"])
         self.assertTrue(decision.menu_bound)
         self.assertEqual(decision.picked_id, "buy_BTCTMN")
@@ -374,11 +375,31 @@ class MenuAgentTests(unittest.TestCase):
             MenuAction("cancel_SC1", "CANCEL", "BTCTMN", summary="CANCEL order SC1", client_order_id="SC1"),
         ]
         decision = agent.decide([_feature()], [], [{"symbol": "BTCTMN"}], {"phase": "normal"}, 1_700_000_000, menu=menu)
-        self.assertEqual(calls["bodies"][0]["model"], "gpt-6-luna")
+        self.assertEqual(calls["bodies"][0]["model"], "openai/gpt-6-luna")
         self.assertEqual(calls["bodies"][0]["reasoning_effort"], "medium")
         self.assertEqual(decision.usage["tier"], "signal")
         self.assertEqual(decision.decisions[0].action, "SELL")
         self.assertAlmostEqual(decision.decisions[0].size_fraction, 0.5)
+
+    def test_a_buy_while_already_exposed_uses_sol(self):
+        calls = {}
+
+        def post(url, headers, body, timeout=None):
+            return json.dumps({"action_id": "buy_BTCTMN", "rationale": "second name, day is still flat"}), {
+                "prompt_tokens": 20, "completion_tokens": 10, "cost": "0.013", "model": body["model"],
+            }
+
+        agent = self._agent(post, calls)
+        decision = agent.decide(
+            [_feature()], [candidate()], [{"symbol": "ETHTMN"}],
+            {"equity": 5_000_000, "gross_exposure": 0.08, "phase": "normal"},
+            1_700_000_000, menu=self._buy_menu(),
+        )
+        self.assertEqual(calls["bodies"][0]["model"], "openai/gpt-6-sol")
+        self.assertEqual(calls["bodies"][0]["reasoning_effort"], "high")
+        self.assertEqual(decision.usage["tier"], "stakes")
+        self.assertEqual(decision.usage["cost_source"], "usage.cost")
+        self.assertEqual(decision.decisions[0].action, "BUY")
 
     def test_invalid_output_holds_and_a_dead_model_falls_back(self):
         calls = {}

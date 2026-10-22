@@ -82,7 +82,7 @@ class SentimentTests(unittest.TestCase):
         )
         self.assertEqual(priced["cost_source"], "usage.cost")
         self.assertAlmostEqual(priced["usd"], 3e-6)
-        self.assertEqual(llm_settings({})["model"], "gpt-6-luna")
+        self.assertEqual(llm_settings({})["model"], "openai/gpt-6-luna")
 
 
 if __name__ == "__main__":

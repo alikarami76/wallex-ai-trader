@@ -2,15 +2,21 @@
 
 BoxAPI is OpenAI-compatible. One chat completion per decision, routed by job:
 
-- routine (tier0): headline sentiment on a flat cycle, gpt-6-luna at low effort
+- routine (tier0): headline sentiment on a flat cycle, openai/gpt-6-luna at low effort
 - signal (tier1): review an open position when nothing new passed the cost gate
-- trade (tier2): open, close, or size, and only when a quant candidate exists
+- trade (tier2): the default decision, openai/gpt-6-luna, when a buy is legal
+- stakes (tier3): openai/gpt-6-sol, and only when that buy is high-stakes
 
-Temperature is omitted unless the config asks for it. reasoning_effort is sent
-and stripped once if the model returns HTTP 400. Spend uses usage.cost.
-A disk ledger caps calls per hour, calls for the run, spend per Tehran day,
-and total spend. Near the cap the router steps down to a cheaper tier.
-Cache hits, cap hits, timeouts, and bad JSON use the deterministic fallback.
+Temperature is omitted unless the config asks for it. A completion cap is sent
+as max_completion_tokens, never max_tokens. reasoning_effort is sent and
+stripped once if the model returns HTTP 400. Spend uses usage.cost. A missing
+cost is estimated from the 2026-10-22 list price plus 15%, with reasoning
+tokens billed as output. A disk ledger caps calls per hour, calls for the run,
+spend per Tehran day, and total spend. Near the cap the router steps down to
+a cheaper tier, and at the cap it stops calling. The running total is logged
+against the $3 competition budget. /key and /credits are a shared upstream
+account, so the ledger is the balance. Cache hits, cap hits, timeouts, and
+bad JSON use the deterministic fallback.
 
 Shadow and live also pass a menu of actions the risk layer already accepted.
 The model then returns one id. Invalid menu output is HOLD and does not fall
@@ -32,7 +38,7 @@ from pathlib import Path
 
 from trader.strategy.menu import MenuAction, hold_action, parse_menu_choice
 from trader.strategy.parser import AgentDecision, ParsedDecision, extract_json, parse_agent_output
-from trader.strategy.router import choose_tier
+from trader.strategy.router import canonical_model, choose_tier, high_stakes, list_prices, quoted_call_usd
 from trader.strategy.signals import Candidate, SymbolFeatures
 from trader.timeutil import TEHRAN
 from trader.wallex.mcp import WallexMcp
@@ -78,9 +84,15 @@ def llm_settings(cfg: dict) -> dict:
     raw.setdefault("max_spend_usd_per_day", 1.25)
     raw.setdefault("downgrade_spend_usd", 2.0)
     raw.setdefault("downgrade_daily_usd", 1.0)
-    raw.setdefault("assumed_input_usd_per_million", 0.50)
-    raw.setdefault("assumed_output_usd_per_million", 2.00)
-    raw.setdefault("assumed_usd_per_call_if_usage_missing", 0.08)
+    raw.setdefault("assumed_input_usd_per_million", 0.10)
+    raw.setdefault("assumed_output_usd_per_million", 0.50)
+    raw.setdefault("price_markup", 1.15)
+    raw.setdefault("assumed_usd_per_call_if_usage_missing", 0.0006325)
+    raw.setdefault("competition_budget_usd", 3.0)
+    raw.setdefault("high_stakes_exposure", 0.0)
+    raw.setdefault("high_stakes_daily_drawdown", 0.0075)
+    raw.setdefault("typical_prompt_tokens", 3000)
+    raw.setdefault("typical_completion_tokens", 500)
     raw.setdefault("cache_seconds", 3600)
     raw.setdefault("sentiment_cache_seconds", 900)
     raw.setdefault("usage_path", "data/llm_usage.json")
@@ -89,20 +101,41 @@ def llm_settings(cfg: dict) -> dict:
     raw.setdefault("retry_backoff_seconds", 0.5)
     raw.setdefault("routine_timeout_seconds", 8)
     raw.setdefault("enabled", True)
-    raw.setdefault("model", "gpt-6-luna")
+    raw.setdefault("model", "openai/gpt-6-luna")
     return raw
 
 
 def request_body(model: str, messages: list[dict], settings: dict, reasoning_effort: str | None = None) -> dict:
-    """Body for POST /chat/completions. Temperature is off unless configured."""
+    """Body for POST /chat/completions. Temperature is off unless configured.
+
+    gpt-6-luna rejects max_tokens. A cap, including one configured under the
+    old name, is sent as max_completion_tokens.
+    """
     body: dict = {"model": model, "messages": messages}
     if reasoning_effort:
         body["reasoning_effort"] = reasoning_effort
+    limit = settings.get("max_completion_tokens")
+    if not limit and settings.get("max_tokens"):
+        limit = settings.get("max_tokens")
+    if limit:
+        body["max_completion_tokens"] = int(limit)
     if settings.get("send_temperature"):
         body["temperature"] = float(settings.get("temperature", 0.1))
     if settings.get("send_response_format"):
         body["response_format"] = {"type": "json_object"}
     return body
+
+
+def adapt_rejected_body(body: dict, detail: str) -> str:
+    """Rewrite one field a model rejected. Empty string means nothing to change."""
+    text = (detail or "").lower()
+    if "reasoning_effort" in body and "reasoning_effort" in text:
+        body.pop("reasoning_effort", None)
+        return "reasoning_effort"
+    if "max_tokens" in body and "max_tokens" in text:
+        body["max_completion_tokens"] = body.pop("max_tokens")
+        return "max_completion_tokens"
+    return ""
 
 
 class LlmHTTPError(Exception):
@@ -172,6 +205,27 @@ class LlmBudget:
 
     def remember(self, key: str, content: str, usage: dict, now: float) -> None:
         self.calls.append({"ts": now, **usage})
+        spent = round(self.spent_usd(), 8)
+        budget = float(self.settings.get("competition_budget_usd", 3.0))
+        cap = float(self.settings.get("max_spend_usd", 2.5))
+        usage["spent_usd"] = spent
+        usage["budget_usd"] = budget
+        usage["cap_usd"] = cap
+        self.calls[-1]["spent_usd"] = spent
+        log.info(
+            "llm call model=%s tier=%s effort=%s prompt_tokens=%s completion_tokens=%s reasoning_tokens=%s usd=%.8f spent=%.8f/%.2f cap=%.2f source=%s",
+            usage.get("model"),
+            usage.get("tier") or "-",
+            usage.get("reasoning_effort") or "-",
+            usage.get("prompt_tokens"),
+            usage.get("completion_tokens"),
+            usage.get("reasoning_tokens") or 0,
+            float(usage.get("usd") or 0),
+            spent,
+            budget,
+            cap,
+            usage.get("cost_source") or "-",
+        )
         self.cache[key] = {
             "ts": now,
             "content": content,
@@ -203,7 +257,7 @@ class LlmClient:
 
     def model_name(self) -> str:
         chosen = (os.getenv("LLM_MODEL") or "").strip()
-        return chosen or str(self.settings.get("model") or "gpt-6-luna")
+        return canonical_model(chosen or str(self.settings.get("model") or "openai/gpt-6-luna"))
 
     def configured(self) -> bool:
         return bool(os.getenv("LLM_BASE_URL") and os.getenv("LLM_API_KEY") and self.model_name())
@@ -241,23 +295,13 @@ class LlmClient:
         usage["requested_tier"] = spec.get("requested_tier") or tier
         usage["downgraded"] = bool(spec.get("downgraded"))
         usage["reasoning_effort"] = body.get("reasoning_effort", "omitted")
-        log.info(
-            "llm call tier=%s model=%s effort=%s prompt_tokens=%s completion_tokens=%s usd=%.8f source=%s",
-            tier or "-",
-            usage.get("model"),
-            usage.get("reasoning_effort"),
-            usage.get("prompt_tokens"),
-            usage.get("completion_tokens"),
-            usage.get("usd") or 0,
-            usage.get("cost_source"),
-        )
         return content, usage
 
     def _send(self, url: str, headers: dict, body: dict, timeout: float) -> tuple[str | None, dict, str]:
         """Pace, then retry 429/5xx. A 400 that names reasoning_effort is retried once without it."""
         retries = max(1, int(self.settings.get("max_retries", 3)))
         backoff = float(self.settings.get("retry_backoff_seconds", 0.5))
-        stripped = False
+        adapted = 0
         last = "llm request failed"
         attempt = 0
         while attempt < retries:
@@ -271,12 +315,13 @@ class LlmClient:
                 return content, usage, ""
             except LlmHTTPError as exc:
                 last = str(exc)
-                if exc.code == 400 and not stripped and "reasoning_effort" in body:
-                    body.pop("reasoning_effort", None)
-                    stripped = True
-                    attempt -= 1
-                    log.info("LLM rejected reasoning_effort; retrying without it")
-                    continue
+                if exc.code == 400 and adapted < 2:
+                    note = adapt_rejected_body(body, exc.detail)
+                    if note:
+                        adapted += 1
+                        attempt -= 1
+                        log.info("LLM rejected %s; retrying with the compatible body", note)
+                        continue
                 if (exc.code == 429 or exc.code >= 500) and attempt < retries:
                     self._sleep(backoff * (2 ** (attempt - 1)))
                     continue
@@ -311,6 +356,7 @@ class LlmClient:
         return choice, {
             "prompt_tokens": int(raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens") or 0),
             "completion_tokens": int(raw_usage.get("completion_tokens") or raw_usage.get("output_tokens") or 0),
+            "reasoning_tokens": _reasoning_tokens(raw_usage),
             "cost": raw_usage.get("cost"),
             "model": body.get("model"),
         }
@@ -339,27 +385,52 @@ def _menu_key(features, positions, now: float, menu: list[MenuAction]) -> str:
     return "menu:" + digest
 
 
+def _reasoning_tokens(raw_usage: dict) -> int:
+    if raw_usage.get("reasoning_tokens") is not None:
+        try:
+            return int(raw_usage.get("reasoning_tokens") or 0)
+        except (TypeError, ValueError):
+            return 0
+    details = raw_usage.get("completion_tokens_details") or raw_usage.get("output_tokens_details") or {}
+    if isinstance(details, dict) and details.get("reasoning_tokens") is not None:
+        try:
+            return int(details.get("reasoning_tokens") or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _billed_output_tokens(completion: int, reasoning: int) -> int:
+    """Reasoning bills as output. A nested count already inside completion is not added twice."""
+    if reasoning > completion:
+        return completion + reasoning
+    return max(completion, reasoning)
+
+
 def _price(usage: dict, settings: dict, model: str) -> dict:
-    """Prefer BoxAPI usage.cost. Fall back to the token estimate only when it is absent."""
+    """Prefer BoxAPI usage.cost. Estimate from the list price only when it is absent."""
     prompt = int(usage.get("prompt_tokens") or 0)
     completion = int(usage.get("completion_tokens") or 0)
+    reasoning = int(usage.get("reasoning_tokens") or 0)
+    output = _billed_output_tokens(completion, reasoning)
     cost = usage.get("cost")
+    name = usage.get("model") or model
     if cost is not None and cost != "":
         usd = float(cost)
         source = "usage.cost"
-    elif prompt or completion:
-        usd = (
-            prompt / 1_000_000 * float(settings["assumed_input_usd_per_million"])
-            + completion / 1_000_000 * float(settings["assumed_output_usd_per_million"])
-        )
+    elif prompt or output:
+        incoming, outgoing = list_prices(name, settings)
+        markup = float(settings.get("price_markup", 1.15))
+        usd = (prompt / 1_000_000 * incoming + output / 1_000_000 * outgoing) * markup
         source = "estimated_tokens"
     else:
-        usd = float(settings["assumed_usd_per_call_if_usage_missing"])
+        usd = quoted_call_usd(name, settings)
         source = "flat_fallback"
     return {
-        "model": usage.get("model") or model,
+        "model": name,
         "prompt_tokens": prompt,
         "completion_tokens": completion,
+        "reasoning_tokens": reasoning,
         "usd": round(usd, 8),
         "cost_source": source,
     }
@@ -457,6 +528,13 @@ class TradingAgent:
         self._mcp_note = ""
         self._mcp_note_at = 0.0
 
+    def _budget_note(self) -> dict:
+        return {
+            "spent_usd": round(self.budget.spent_usd(), 8),
+            "budget_usd": float(self.settings.get("competition_budget_usd", 3.0)),
+            "cap_usd": float(self.settings.get("max_spend_usd", 2.5)),
+        }
+
     def decide(
         self,
         features: list[SymbolFeatures],
@@ -477,7 +555,7 @@ class TradingAgent:
             decision = fallback_decision(candidates)
             decision.usage = {"skipped": "nothing to rank", "tier": "routine"}
             return decision
-        task = "trade" if candidates else "signal"
+        task = "stakes" if candidates and high_stakes(risk_state, self.settings) else ("trade" if candidates else "signal")
         spec = choose_tier(task, self.settings, self.budget.spent_usd(), self.budget.spent_today(now))
         self._maybe_refresh_mcp(candidates, now)
         user = self._prompt(features, candidates, positions, risk_state)
@@ -500,7 +578,11 @@ class TradingAgent:
             return decision
         allowed, reason = self.budget.allow(now)
         if not allowed:
-            log.info("LLM skipped: %s", reason)
+            note = self._budget_note()
+            log.info(
+                "LLM skipped: %s spent=%.8f/%.2f cap=%.2f",
+                reason, note["spent_usd"], note["budget_usd"], note["cap_usd"],
+            )
             decision = fallback_decision(candidates)
             decision.comment = f"LLM cap: {reason}. " + decision.comment
             decision.usage = {
@@ -508,7 +590,7 @@ class TradingAgent:
                 "tier": spec["tier"],
                 "model": spec["model"],
                 "downgraded": spec["downgraded"],
-                "spent_usd": round(self.budget.spent_usd(), 6),
+                **note,
             }
             return decision
         raw, usage = self.llm.complete(SYSTEM_PROMPT, user, spec)
@@ -541,7 +623,7 @@ class TradingAgent:
             decision.usage = {"skipped": "menu is hold only", "tier": "routine"}
             decision.menu = rows
             return decision
-        task = "trade" if "BUY" in kinds else "signal"
+        task = "stakes" if "BUY" in kinds and high_stakes(risk_state, self.settings) else ("trade" if "BUY" in kinds else "signal")
         spec = choose_tier(task, self.settings, self.budget.spent_usd(), self.budget.spent_today(now))
         user = self._menu_prompt(features, positions, risk_state, menu)
         key = _menu_key(features, positions, now, menu)
@@ -564,7 +646,11 @@ class TradingAgent:
             return decision
         allowed, reason = self.budget.allow(now)
         if not allowed:
-            log.info("LLM skipped: %s", reason)
+            note = self._budget_note()
+            log.info(
+                "LLM skipped: %s spent=%.8f/%.2f cap=%.2f",
+                reason, note["spent_usd"], note["budget_usd"], note["cap_usd"],
+            )
             decision = fallback_decision(candidates)
             decision.comment = f"LLM cap: {reason}. " + decision.comment
             decision.usage = {
@@ -572,7 +658,7 @@ class TradingAgent:
                 "tier": spec["tier"],
                 "model": spec["model"],
                 "downgraded": spec["downgraded"],
-                "spent_usd": round(self.budget.spent_usd(), 6),
+                **note,
             }
             decision.menu = rows
             return decision

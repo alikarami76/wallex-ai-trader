@@ -19,9 +19,18 @@ cp .env.example .env
 | `WALLEX_SUBACCOUNT_ID` | optional | Sent as `sub-account-client-id` when the credit sub-account key needs it. |
 | `LLM_BASE_URL` | live/shadow AI | Default `https://ai.boxapi.ir/ai/v1`. |
 | `LLM_API_KEY` | live/shadow AI | BoxAPI bearer token. Empty means the deterministic fallback. |
-| `LLM_MODEL` | live/shadow AI | Leave empty to use the tier table: routine `gpt-6-luna` low, signal `gpt-6-luna` medium, trade `gpt-6-sol` high. Set it to pin every tier. Also allowed: `gpt-5-mini`, `gpt-5.4-mini`, `gpt-5.6-sol`, `gpt-6.1-sol`. |
+| `LLM_MODEL` | live/shadow AI | Leave empty to use the tier table. Default decision model is `openai/gpt-6-luna`. `openai/gpt-6-sol` is only the rare high-stakes tier. Set `LLM_MODEL` to pin every tier. Bare ids such as `gpt-6-luna` also work; the client prefers the prefixed form. |
 
-The client omits `temperature` unless `llm.send_temperature: true` in the YAML. `reasoning_effort` is sent and retried once without the field on HTTP 400. Spend uses `usage.cost`. Caps in `config/default.yaml`: `max_spend_usd: 2.50`, `max_spend_usd_per_day: 1.25`, with a downgrade to the cheaper tier near those caps. The competition budget is $3.
+The client omits `temperature` unless `llm.send_temperature: true`. A completion cap is sent as `max_completion_tokens` (`gpt-6-luna` rejects `max_tokens`). `reasoning_effort` is retried once without the field on HTTP 400. Each call logs `usage.cost` and the running total against the $3 budget. The hard cap defaults to $2.50: the router steps down a tier near it, then stops and uses the deterministic fallback. `/key` and `/credits` report a shared upstream account, so the bot does not use them as its balance.
+
+List price per 1M tokens, checked on BoxAPI on 2026-10-22. A decision is about 3,000 input tokens and 500 output tokens. Live bills run about 15% above list, and reasoning tokens bill as output.
+
+| Model | List in / out | ~3k + ~500, list | With ~15% |
+| --- | --- | --- | --- |
+| `openai/gpt-6-luna` | $0.10 / $0.50 | $0.00055 | ≈ $0.0006 |
+| `openai/gpt-6-sol`, `openai/gpt-6.1-sol` | $2 / $10 | $0.011 | ≈ $0.013 |
+| `openai/gpt-6-astra` | $10 / $50 | $0.055 | ≈ $0.063 |
+| `openai/gpt-5-nano` | $0.05 / $0.40 | $0.00035 | ≈ $0.0004 |
 
 ## Commands
 

@@ -64,9 +64,10 @@ BoxAPI `POST /chat/completions` goes through one router. The quant layer is stil
 
 | Tier | When | Model | Effort |
 | --- | --- | --- | --- |
-| routine (tier0) | Flat cycle, headline scoring. A menu that is only HOLD skips the call | `gpt-6-luna` (or `gpt-5.4-mini`) | low |
-| signal (tier1) | The menu has a sell, a reduction, or a cancel, and no buy | `gpt-6-luna` | medium |
-| trade (tier2) | The menu contains a BUY, so the cost gate already passed | `gpt-6-sol` | high |
+| routine (tier0) | Flat cycle, headline scoring. A menu that is only HOLD skips the call | `openai/gpt-6-luna` | low |
+| signal (tier1) | The menu has a sell, a reduction, or a cancel, and no buy | `openai/gpt-6-luna` | medium |
+| trade (tier2) | The menu contains a BUY and the book is flat. This is the default decision | `openai/gpt-6-luna` | medium |
+| stakes (tier3) | A BUY while gross exposure is already positive, or the Tehran-day drawdown is already at least 0.75% | `openai/gpt-6-sol` | high |
 
 Shadow and live hand the model a compact state and a menu. The menu is built by the same checks that size an order: HOLD, BUY at the maker bid with the post-Kelly post-liquidity size, SELL or REDUCE when close is under the slow EMA and the 24-hour return is negative, and CANCEL for a resting maker order. Stops, the kill switch, and liquidation are applied by the risk layer and are not on the menu. A kill or a liquidation phase leaves the menu as HOLD, and that cycle does not call the model.
 
@@ -78,15 +79,17 @@ Headline scoring stays a separate short call, cached for 15 minutes, on a flat c
 
 This is a meta-label, not a signal (López de Prado, 2018): the primary model proposes the bet, and the secondary model only accepts, rejects, or shrinks it. On the no-menu path, if the model abstains, the top quant candidate is still eligible. `regime: hostile` or `veto_all: true` blocks every new entry. An explicit BUY confirms that symbol only and does not fall through to a different name. A per-symbol `veto: true` drops that name.
 
-The model may also close a held name when close is below the slow EMA and the 24-hour return has turned negative. It may not invent a symbol, raise size, loosen a stop, or override the kill switch. A BUY confirmation with confidence below 0.55 is dropped. `temperature` and `response_format` are omitted. `reasoning_effort` is sent. If the model answers HTTP 400, the same request is retried once without that field. `LLM_MODEL`, when set, pins every tier to that one model.
+The model may also close a held name when close is below the slow EMA and the 24-hour return has turned negative. It may not invent a symbol, raise size, loosen a stop, or override the kill switch. A BUY confirmation with confidence below 0.55 is dropped. `temperature` and `response_format` are omitted. A completion cap is `max_completion_tokens`. `gpt-6-luna` rejects `max_tokens`, and a 400 that names that field is retried once with the supported name. `reasoning_effort` is sent. If the model answers HTTP 400, the same request is retried once without that field. `LLM_MODEL`, when set, pins every tier to that one model. Prefixed ids are preferred; `gpt-6-luna` and `openai/gpt-6-luna` both answer.
 
-Budget, because the whole competition is $3:
+Budget, because the whole competition is $3. The balance is the local sum of `usage.cost`. BoxAPI `/key` and `/credits` show a shared upstream account, so they are not our balance.
+
+List price per 1M tokens on 2026-10-22: luna $0.10 / $0.50, sol and gpt-6.1-sol $2 / $10, astra $10 / $50, gpt-5-nano $0.05 / $0.40. A decision is about 3,000 input tokens and 500 output tokens, so luna is about $0.00055 on the list and about $0.0006 after the measured 15% markup. Sol is about $0.011 on the list and about $0.013 after markup. Reasoning tokens bill as output. When `usage.cost` is missing, the estimate uses that list price times 1.15.
 
 - hard stop at `max_spend_usd: 2.50` and `max_spend_usd_per_day: 1.25` (Tehran day), using `usage.cost` when BoxAPI sends it,
-- at $2.00 total or $1.00 today the router steps down one tier; inside $0.20 of either cap it uses the routine tier,
+- at $2.00 total or $1.00 today the router steps down one tier; inside $0.20 of either cap it uses the routine tier; at the hard cap the call is not sent,
 - `max_llm_calls_per_hour: 8`, `max_llm_calls_total: 160`, at least 1 second between calls, and exponential backoff on HTTP 429 and 5xx,
-- assumed prices $0.50 / million input tokens and $2.00 / million output tokens, or $0.08 if the response has no usage,
-- model, tier, token counts, and USD are stored on the decision (`agent.usage` and `llm_calls`) and in `data/llm_usage.json`,
+- each paid call logs model, tier, tokens, reasoning tokens, that call's USD, and `spent/3.00` next to the $2.50 cap,
+- model, tier, token counts, USD, `spent_usd`, and `budget_usd` are stored on the decision (`agent.usage` and `llm_calls`) and in `data/llm_usage.json`,
 - timeout, HTTP error, bad JSON, a missing key, or a cap all fall back to the deterministic ranking. The source field is `llm`, `llm_cache`, or `fallback`.
 
 Backtest sets `use_llm=False`. A key in the environment cannot spend money during a historical run.
@@ -159,7 +162,7 @@ python3 -m trader --mode shadow --config config/default.yaml --duration 900 --in
 Two inputs, both optional. A failed source is logged and skipped. The decision cycle still runs.
 
 - **Fear & Greed** (alternative.me). Level 0–100 and the one-day change. In the backtest the value is the latest point whose timestamp is at least one day before the bar, so the bot does not read an index that was not published yet. Live uses the newest published point.
-- **Headlines.** CoinDesk and Cointelegraph RSS, plus CryptoPanic and Reddit when those public endpoints answer. Titles are matched to the coin (`bitcoin` for BTCTMN, and the same for the other TMN names) and scored with a fixed positive/negative word list. The score is in [−1, 1]. The change is versus the previous cached score. Headlines are not in the backtest, because the feeds are not a point-in-time archive. On a flat live or shadow cycle the router may rescore the same titles with tier0 (`gpt-6-luna`, low effort), cached for 15 minutes. If that call fails or the budget is tight, the lexicon score stays.
+- **Headlines.** CoinDesk and Cointelegraph RSS, plus CryptoPanic and Reddit when those public endpoints answer. Titles are matched to the coin (`bitcoin` for BTCTMN, and the same for the other TMN names) and scored with a fixed positive/negative word list. The score is in [−1, 1]. The change is versus the previous cached score. Headlines are not in the backtest, because the feeds are not a point-in-time archive. On a flat live or shadow cycle the router may rescore the same titles with tier0 (`openai/gpt-6-luna`, low effort), cached for 15 minutes. If that call fails or the budget is tight, the lexicon score stays.
 
 Both the level and the change are fields on each symbol's feature payload, so the regime filter can see them. A missing field is not itself a veto.
 
@@ -226,4 +229,4 @@ Check these before sending real orders:
 
 ## خلاصه فارسی
 
-ربات فقط روی جفت‌های تومانی مجاز پلن ۱۸۳ معامله می‌کند و فهرست بازارهای ممنوع را در شروع می‌گیرد. سیگنال، پولبک در روند صعودی ساعتی است و فقط وقتی فعال می‌شود که هزینه رفت‌وبرگشت کارمزد را پوشش بدهد. عمق دفتر سفارش، اسپرد، و حجم معاملات اگر ناگهان بد شوند ورود را می‌بندند و اندازه را بعد از کلی کوچک می‌کنند؛ خروج اجباریِ آرام منتظر نقدشوندگی می‌ماند و از ۲۳:۲۰ دیگر منتظر نمی‌ماند. شاخص ترس و طمع و امتیاز اخبار به‌عنوان ورودی به فیلتر رژیم داده می‌شوند؛ در آزمون تاریخی، بستن ورود در طمع شدید (۸۰ به بالا) هیچ معامله‌ای را عوض نکرد و در نتیجه خاموش ماند. مدل ارزان (`gpt-6-luna` با تلاش کم) امتیاز اخبار را می‌دهد و مدل قوی‌تر (`gpt-6-sol`) فقط وقتی صدا زده می‌شود که خریدِ ازپیش‌تأییدشده روی منو باشد. در هر چرخه مدل یکی از اقدام‌های معتبر (نگه‌داشتن، خرید، فروش، کاهش، لغو سفارش) را با شناسه انتخاب می‌کند؛ خروجی نامعتبر یعنی نگه‌داشتن، و لایه ریسک حق وتو را نگه می‌دارد. این شکل از حلقهٔ تصمیم از پروژه‌های متن‌باز beebots و jev-loop گرفته شده و مدل خودِ BoxAPI است. هزینه از `usage.cost` خوانده می‌شود و نزدیک سقف ۲٫۵۰ دلار مدل به ردهٔ ارزان‌تر برمی‌گردد. اگر سقف هزینه یا خطا پیش بیاید، لایه قطعی جایگزین می‌شود. حد ضرر، سقف حجم، و خروج اجباری قبل از ۲۳:۳۰ روز ۲۳ اکتبر ۲۰۲۶ به وقت تهران خارج از اختیار مدل هستند.
+ربات فقط روی جفت‌های تومانی مجاز پلن ۱۸۳ معامله می‌کند و فهرست بازارهای ممنوع را در شروع می‌گیرد. سیگنال، پولبک در روند صعودی ساعتی است و فقط وقتی فعال می‌شود که هزینه رفت‌وبرگشت کارمزد را پوشش بدهد. عمق دفتر سفارش، اسپرد، و حجم معاملات اگر ناگهان بد شوند ورود را می‌بندند و اندازه را بعد از کلی کوچک می‌کنند؛ خروج اجباریِ آرام منتظر نقدشوندگی می‌ماند و از ۲۳:۲۰ دیگر منتظر نمی‌ماند. شاخص ترس و طمع و امتیاز اخبار به‌عنوان ورودی به فیلتر رژیم داده می‌شوند؛ در آزمون تاریخی، بستن ورود در طمع شدید (۸۰ به بالا) هیچ معامله‌ای را عوض نکرد و در نتیجه خاموش ماند. مدل پیش‌فرض تصمیم `openai/gpt-6-luna` است (حدود ۰٫۰۰۰۶ دلار برای هر تصمیم). `openai/gpt-6-sol` فقط برای خریدِ پرریسک است، وقتی از قبل موقعیت باز است یا افت روزانه به ۰٫۷۵٪ رسیده باشد. در هر چرخه مدل یکی از اقدام‌های معتبر (نگه‌داشتن، خرید، فروش، کاهش، لغو سفارش) را با شناسه انتخاب می‌کند؛ خروجی نامعتبر یعنی نگه‌داشتن، و لایه ریسک حق وتو را نگه می‌دارد. این شکل از حلقهٔ تصمیم از پروژه‌های متن‌باز beebots و jev-loop گرفته شده و مدل خودِ BoxAPI است. هزینه از `usage.cost` خوانده می‌شود و نزدیک سقف ۲٫۵۰ دلار مدل به ردهٔ ارزان‌تر برمی‌گردد. اگر سقف هزینه یا خطا پیش بیاید، لایه قطعی جایگزین می‌شود. حد ضرر، سقف حجم، و خروج اجباری قبل از ۲۳:۳۰ روز ۲۳ اکتبر ۲۰۲۶ به وقت تهران خارج از اختیار مدل هستند.
