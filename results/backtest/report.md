@@ -4,9 +4,9 @@
 
 | Metric | Value |
 | --- | --- |
-| PnL after fees (mark-to-market) | -6,639 TMN (-0.133%) |
+| PnL after fees (mark-to-market) | -6,288 TMN (-0.126%) |
 | PnL after fees (realized) | -349 TMN |
-| Sharpe (annualized from the equity spacing) | -1.19 |
+| Sharpe (annualized from the equity spacing) | -1.13 |
 | Max drawdown | 0.436% |
 | Hit rate | 58.8% (17 closed trades) |
 | Decision latency | n/a |
@@ -14,7 +14,7 @@
 | Other | Value |
 | --- | --- |
 | Starting equity | 5,000,000 TMN |
-| Ending equity | 4,993,361 TMN |
+| Ending equity | 4,993,712 TMN |
 | Average closed-trade PnL | -21 TMN |
 | Fees paid | 11,736 TMN |
 | Fills | 36 |
@@ -32,12 +32,12 @@ The return is mark-to-market in toman, including fees. Hit rate counts a closed 
 
 ## Walk-forward and deflated Sharpe
 
-Full sample: per-bar Sharpe -0.0127, selection hurdle 0.0484 at N=6, deflated Sharpe probability 0.0502.
+Full sample: per-bar Sharpe -0.0121, selection hurdle 0.0484 at N=6, deflated Sharpe probability 0.0522.
 
 | Fold | Return | Realized PnL | Fees | Fold DSR |
 | --- | --- | --- | --- | --- |
-| 1 | 0.136% | 6809.93 | 9182.35 | 0.1745 |
-| 2 | -0.159% | -7957.95 | 1909.83 | 0.0015 |
-| 3 | -0.16% | -8024.62 | 2566.83 | 0.0027 |
+| 1 | 0.136% | 6809.93 | 9182.35 | 0.1729 |
+| 2 | -0.154% | -7682.49 | 1285.48 | 0.0001 |
+| 3 | -0.153% | -7674.41 | 2567.89 | 0.0034 |
 
 Folds use the same frozen parameters and a fresh 5,000,000 TMN. The deflated Sharpe probability is Bailey and López de Prado (2014): the chance the observed per-bar Sharpe beats the expected maximum of N null trials, after skew and kurtosis. It is not an annualized Sharpe.

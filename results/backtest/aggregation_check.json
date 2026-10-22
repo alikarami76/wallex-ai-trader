@@ -1,7 +1,7 @@
 {
   "ok": true,
   "symbol": "BTCTMN",
-  "minute_bars": 2879,
+  "minute_bars": 2880,
   "minute_spacing_seconds": 60.0,
   "aggregated_hourly": 49,
   "native_hourly": 48,

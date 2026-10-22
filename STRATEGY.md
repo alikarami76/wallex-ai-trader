@@ -135,6 +135,8 @@ Both the level and the change are fields on each symbol's feature payload, so th
 
 The only hard rule that was tested is pre-specified: block a new entry when lagged Fear & Greed is at least 80 (extreme greed), on the view that a pullback in a crowded market is more likely to become a larger decline. It is kept only if the with-gate backtest beats the without-gate backtest by at least 0.05 percentage points of return, does not worsen max drawdown by more than 0.10 points, and still closes at least 8 trades. Otherwise the number stays an input and the gate stays off. The comparison is `results/backtest/sentiment_ablation.json`. Thresholds were not searched.
 
+On the 2026-10-22 hourly window the lagged index ranged from 53 to 78. It never reached 80, so the gate bound zero times. With and without the gate the books are the same: ending equity 4,993,712 TMN, return −0.126%, max drawdown 0.436%, realized PnL −349 TMN, fees 11,736 TMN, 17 closed trades. `gate_helps` is false, and `sentiment.block_extreme_greed` stays false. The level and the daily change are still attached on every feature row (695 rows, none missing) and are passed to the regime filter. Headline scores are live-only. From this network CoinDesk and Cointelegraph RSS answer; CryptoPanic and Reddit return 403 and are skipped.
+
 ## Literature
 
 | Piece | Source | What the bot uses |
@@ -158,17 +160,17 @@ The report's desk block is PnL after fees (mark-to-market and realized), annuali
 
 | Desk metric | Value |
 | --- | --- |
-| PnL after fees, mark-to-market | −6,639 TMN (−0.133%) |
+| PnL after fees, mark-to-market | −6,288 TMN (−0.126%) |
 | PnL after fees, realized | −349 TMN |
-| Sharpe (annualized) | −1.19 |
+| Sharpe (annualized) | −1.13 |
 | Max drawdown | 0.436% |
 | Hit rate | 58.8% (17 closed trades) |
 | Fees | 11,736 TMN |
-| Deflated Sharpe probability | 0.050 (per-bar Sharpe −0.0127, hurdle 0.048 at N=6) |
+| Deflated Sharpe probability | 0.052 (per-bar Sharpe −0.0121, hurdle 0.048 at N=6) |
 
-Walk-forward, frozen parameters, fresh 5,000,000 TMN each fold: +0.136%, −0.159%, −0.160%. The first fold is the only one with a positive deflated-Sharpe probability, and even that is 0.17. The rule does not clear the Bailey and López de Prado hurdle. Parameters were not changed after seeing this. Two buys were still open on the last bar, which is why mark-to-market PnL is worse than realized PnL. Candle aggregation for BTCTMN matched native hourly closes (median absolute error 0).
+Fear & Greed was attached on every bar (lagged, range 53–78). The extreme-greed gate was left off because the ablation did not change a single trade. Walk-forward, frozen parameters, fresh 5,000,000 TMN each fold: +0.136%, −0.154%, −0.153%. Fold deflated-Sharpe probabilities are 0.173, 0.000, and 0.003. The rule does not clear the Bailey and López de Prado hurdle. Parameters were not changed after seeing this. Open buys on the last bar are why mark-to-market PnL is worse than realized PnL. Candle aggregation for BTCTMN matched native hourly closes (median absolute error 0). The series used for the ablation is `results/backtest/fear_greed.json`.
 
-The same day's shadow (`--duration 720 --interval 45`, no API key) ran 15 fallback cycles from 16:12 to 16:24 Asia/Tehran. No candidate cleared the gates, so there were no orders. Equity stayed 5,000,000 TMN. Median decision latency was 4.3 seconds, mostly the `/v2/depth/all` fetch. The Wallex MCP candle tool responded. Zero errors.
+The same day's shadow (`--duration 720 --interval 45`, no API key) ran 15 fallback cycles from 16:12 to 16:24 Asia/Tehran, before the sentiment fields were on the cycle log. No candidate cleared the gates, so there were no orders. Equity stayed 5,000,000 TMN. Median decision latency was 4.3 seconds, mostly the `/v2/depth/all` fetch. The Wallex MCP candle tool responded. Zero errors. A later short shadow records the sentiment payload (Fear & Greed plus which headline sources answered).
 
 ## Research, and what was not tuned
 
@@ -193,4 +195,4 @@ Check these before sending real orders:
 
 ## خلاصه فارسی
 
-ربات فقط روی جفت‌های تومانی مجاز پلن ۱۸۳ معامله می‌کند و فهرست بازارهای ممنوع را در شروع می‌گیرد. سیگنال، پولبک در روند صعودی ساعتی است و فقط وقتی فعال می‌شود که هزینه رفت‌وبرگشت کارمزد را پوشش بدهد. مدل زبانی حداکثر یک بار در هر چرخه همه نمادها را با هم رتبه‌بندی یا رد می‌کند و اگر سقف هزینه یا خطا پیش بیاید، لایه قطعی جایگزین می‌شود. حد ضرر، سقف حجم، و خروج اجباری قبل از ۲۳:۳۰ روز ۲۳ اکتبر ۲۰۲۶ به وقت تهران خارج از اختیار مدل هستند.
+ربات فقط روی جفت‌های تومانی مجاز پلن ۱۸۳ معامله می‌کند و فهرست بازارهای ممنوع را در شروع می‌گیرد. سیگنال، پولبک در روند صعودی ساعتی است و فقط وقتی فعال می‌شود که هزینه رفت‌وبرگشت کارمزد را پوشش بدهد. شاخص ترس و طمع و امتیاز اخبار به‌عنوان ورودی به فیلتر رژیم داده می‌شوند؛ در آزمون تاریخی، بستن ورود در طمع شدید (۸۰ به بالا) هیچ معامله‌ای را عوض نکرد و در نتیجه خاموش ماند. مدل پیش‌فرض `gpt-6-luna` است و هزینهٔ دقیق از فیلد `usage.cost` خوانده می‌شود. مدل زبانی حداکثر یک بار در هر چرخه همه نمادها را با هم رتبه‌بندی یا رد می‌کند و اگر سقف هزینه یا خطا پیش بیاید، لایه قطعی جایگزین می‌شود. حد ضرر، سقف حجم، و خروج اجباری قبل از ۲۳:۳۰ روز ۲۳ اکتبر ۲۰۲۶ به وقت تهران خارج از اختیار مدل هستند.

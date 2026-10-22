@@ -99,6 +99,10 @@ class Candidate:
             "roc_24h": round(self.roc_trend, 5),
             "roc_4h": round(self.roc_pullback, 5),
             "close": self.close,
+            "fear_greed": self.facts.get("fear_greed"),
+            "fear_greed_change": self.facts.get("fear_greed_change"),
+            "news_score": self.facts.get("news_score"),
+            "news_change": self.facts.get("news_change"),
         }
 
 
