@@ -1,7 +1,9 @@
-"""Optional Telegram alerts. Off unless both env vars are set.
+"""Optional Telegram alerts and the trade log.
 
-The trading loop never waits on the network. A missing token or chat id is a
-no-op. The bot token is not written to logs.
+Watchdog-style alerts use TELEGRAM_ALERT_BOT_TOKEN and TELEGRAM_ALERT_CHAT_ID.
+Trade decisions use the same bot token and TELEGRAM_TRADES_CHAT_ID. Either
+path is a no-op when its chat id is unset. The trading loop never waits on
+the network. The bot token is not written to logs.
 """
 
 from __future__ import annotations
@@ -79,9 +81,17 @@ def _credentials() -> tuple[str, str]:
     )
 
 
+def _trade_credentials() -> tuple[str, str]:
+    """Same bot as alerts. The trade channel is a different chat."""
+    return (
+        os.getenv("TELEGRAM_ALERT_BOT_TOKEN", "").strip(),
+        os.getenv("TELEGRAM_TRADES_CHAT_ID", "").strip(),
+    )
+
+
 def post_text(text: str, *, post=None, limit: int = 700) -> bool:
-    """Queue one decision note. No rate limit. False when unconfigured or the send failed."""
-    token, chat = _credentials()
+    """Queue one decision note. No rate limit. False when the trade channel is unset."""
+    token, chat = _trade_credentials()
     if not token or not chat or not str(text).strip():
         return False
     cleaned = _scrub(str(text))
@@ -158,7 +168,7 @@ def send_skips(*, mode: str, when, rows: list[tuple[str, str]], post=None, now: 
     try:
         if not rows:
             return False
-        token, chat = _credentials()
+        token, chat = _trade_credentials()
         if not token or not chat:
             return False
         moment = time.monotonic() if now is None else float(now)
@@ -228,6 +238,7 @@ def _scrub(text: str) -> str:
     for name in (
         "TELEGRAM_ALERT_BOT_TOKEN",
         "TELEGRAM_ALERT_CHAT_ID",
+        "TELEGRAM_TRADES_CHAT_ID",
         "WALLEX_API_KEY",
         "WALLEX_SUBACCOUNT_ID",
         "LLM_API_KEY",
