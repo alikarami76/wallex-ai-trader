@@ -44,6 +44,7 @@ from trader.engine.ops import (
     key_presence,
     load_ops,
     llm_override_warning,
+    _note_row,
     next_client_id,
     set_log_context,
     stamp,
@@ -57,10 +58,17 @@ from trader.strategy.quotes import execution_cost, inventory_skew, maker_buy_lim
 from trader.strategy.signals import build_candidates, evaluate_symbol
 from trader.timeutil import iso, now_tehran
 from trader.types import Bar, MarketRule
-from trader.alerts import report_cycle
+from trader.alerts import notify, report_cycle
 from trader.order_guard import OrderIntent, assess
 from trader.scorecard import seal_signals
-from trader.wallex.client import SPOT_ORDER_PATH, WallexClient, WallexError
+from trader.wallex.client import (
+    FATAL_WALLEX_CODES,
+    SPOT_ORDER_PATH,
+    WallexClient,
+    WallexError,
+    fill_totals,
+    subaccount_blocked,
+)
 from trader.wallex.mcp import WallexMcp
 from trader.wallex.precision import OrderRejected, round_price, round_qty
 
@@ -170,6 +178,7 @@ def _run_loop(
     unavailable = _load_bans(client, int(cfg["exchange"]["package_id"]))
     account_fees: dict[str, tuple[float, float]] = {}
     if api_key:
+        _check_subaccount(client, send_orders)
         try:
             account_fees = client.get_fees()
             ops = load_ops(state)
@@ -724,6 +733,9 @@ def _cycle(
                     })
                     continue
             except (WallexError, OrderRejected) as exc:
+                fatal = isinstance(exc, WallexError) and exc.code in FATAL_WALLEX_CODES
+                if fatal:
+                    _halt_fatal(state, exc)
                 order_rejects += 1
                 order_errors.append({
                     "endpoint": "/v1/account/orders",
@@ -732,16 +744,22 @@ def _cycle(
                     "message": str(exc),
                 })
                 rejected.append({"symbol": action.symbol, "reason": str(exc)})
+                if fatal:
+                    return
                 continue
             if request:
                 requests.append(request)
+            for extra in state.pop("_extra_fills", []):
+                fills.append(extra)
+                state["order_times"].append(now_unix)
+                journal.trade(_trade_row(extra, now, mode))
             if fill:
                 fills.append(fill)
                 state["order_times"].append(now_unix)
                 journal.trade(_trade_row(fill, now, mode))
                 if fill.side == "SELL" and action.source == "stop":
                     state["cooldowns"][action.symbol] = now_unix + float(cfg["risk"]["cooldown_after_stop_seconds"])
-                if fill.side == "BUY" and (action.order_type == "MARKET" or action.aggressive):
+                if fill.side == "BUY" and _entry_was_taker(action, request):
                     entry_taker_fills += 1
                 if fill.side == "SELL" and str(ops["state"]) in {"FLATTEN", "KILLED"}:
                     _note_unsellable_remainder(state, portfolio, marks, action.symbol, float(cfg["risk"]["min_notional_tmn"]))
@@ -1238,15 +1256,25 @@ def _try_dust_flatten(
                 return fills, requests, plan.residual(action.symbol, portfolio.positions[action.symbol].qty)
             return fills, requests, None
         filled = _wait_fill(client, sell_id)
-        if filled is None or filled.executed_qty <= 0 or action.symbol not in portfolio.positions:
+        if (filled is None or filled.executed_qty <= 0 or action.symbol not in portfolio.positions) and not (
+            order_type == "MARKET" and _market_needs_fallback(filled, sell_qty)
+        ):
             left_qty = portfolio.positions[action.symbol].qty if action.symbol in portfolio.positions else held.qty
             return buy_fills, requests, plan.residual(action.symbol, left_qty)
-        fill = portfolio.sell(
-            symbol=action.symbol, price=filled.executed_price or paper_sell, fee_rate=taker,
-            reason=reason, client_id=sell_id, order_type=order_type,
-            qty=min(filled.executed_qty, sell_qty, portfolio.positions[action.symbol].qty),
-        )
+        fill = None
+        if filled and filled.executed_qty > 0 and action.symbol in portfolio.positions:
+            fill = portfolio.sell(
+                symbol=action.symbol, price=filled.executed_price or paper_sell, fee_rate=taker,
+                reason=reason, client_id=sell_id, order_type=order_type,
+                qty=min(filled.executed_qty, sell_qty, portfolio.positions[action.symbol].qty),
+            )
         fills = buy_fills + ([] if fill is None else [fill])
+        if order_type == "MARKET" and _market_needs_fallback(filled, sell_qty):
+            extra = _aggressive_fallback(
+                cfg, client, portfolio, action, book, marks, rule, state, taker,
+            )
+            if extra is not None:
+                fills.append(extra)
         left = portfolio.positions.get(action.symbol)
         residual = None if left is None else plan.residual(action.symbol, left.qty)
         if residual:
@@ -1257,6 +1285,220 @@ def _try_dust_flatten(
         payload = plan.residual(action.symbol, left.qty if left else position.qty)
         payload["reason"] = f"residual coin; dust flatten failed: {exc}"
         return buy_fills, requests, payload
+
+
+def _pending_meta(symbol, side, price, qty, fee, reason, order_type) -> dict:
+    return {
+        "symbol": symbol,
+        "side": side,
+        "price": price,
+        "qty": qty,
+        "fee": fee,
+        "reason": reason,
+        "order_type": order_type,
+        "created": time.time(),
+        "applied_qty": 0.0,
+        "applied_quote": 0.0,
+        "applied_base_fee": 0.0,
+        "applied_quote_fee": 0.0,
+    }
+
+
+def _partial_buy(order, requested: float) -> bool:
+    if order is None or str(order.side or "").upper() not in {"", "BUY"}:
+        return False
+    done = float(order.executed_qty or 0)
+    target = float(order.orig_qty or requested or 0)
+    return done > 0 and target > done + 1e-12
+
+
+def _market_needs_fallback(order, requested: float) -> bool:
+    """Wallex cancels a market order when the book moves more than about 2%."""
+    if order is None:
+        return False
+    status = str(order.status or "").upper()
+    if status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
+        return True
+    return float(order.executed_qty or 0) + 1e-9 < float(requested) and not order.active
+
+
+def _entry_was_taker(action, request) -> bool:
+    role = request.get("liquidity") if isinstance(request, dict) else None
+    if role == "taker":
+        return True
+    if role == "maker":
+        return False
+    return action.order_type == "MARKET" or action.aggressive
+
+
+def _halt_fatal(state: dict, exc: WallexError) -> None:
+    ops = load_ops(state)
+    before = ops.get("state")
+    ops["state"] = "HALT"
+    ops["fatal_exchange_code"] = exc.code
+    ops.setdefault("_queued", []).append(_note_row(
+        ops, action="A1_HALT_ENTRIES", before=str(before), after="HALT", playbook="WALLEX",
+        note=f"Wallex error {exc.code} is fatal. Entries halted.",
+        param="fatal_exchange_code", old=None, new=exc.code,
+    ))
+    notify(f"fatal:{exc.code}", f"Wallex error {exc.code}: trading halted")
+    log.error("fatal wallex code %s; HALT", exc.code)
+
+
+def _check_subaccount(client: WallexClient, send_orders: bool) -> None:
+    try:
+        status = client.account_status()
+    except WallexError as exc:
+        if send_orders:
+            raise SystemExit(f"refusing to arm live: sub-account check failed: {exc}")
+        log.warning("sub-account check failed: %s", exc)
+        return
+    if status:
+        log.info(
+            "sub-account title=%s clientId=%s isActive=%s isSuspend=%s tmn=%s",
+            status.get("title"),
+            status.get("clientId"),
+            status.get("isActive"),
+            status.get("isSuspend"),
+            status.get("tmn_available"),
+        )
+    if not send_orders:
+        return
+    reason = subaccount_blocked(status, client.subaccount_id)
+    if reason:
+        raise SystemExit(f"refusing to arm live: {reason}")
+
+
+def _book_pending(portfolio: Portfolio, meta: dict, order, client_id: str):
+    price_hint = float(meta.get("price") or order.price or 0)
+    return _apply_fill_delta(
+        portfolio,
+        side=str(meta.get("side") or order.side or "").upper(),
+        symbol=meta.get("symbol") or order.symbol,
+        order=order,
+        meta=meta,
+        totals=fill_totals(order),
+        stop_price=price_hint * 0.955 if price_hint else 0,
+        setup="uptrend_pullback",
+        reason=meta.get("reason") or "resting order fill",
+        client_id=client_id,
+        order_type=order.order_type or meta.get("order_type") or "LIMIT",
+        fee_rate=float(meta.get("fee") or 0),
+        when=int(time.time()),
+    )
+
+
+def _delta_from(meta: dict, totals: dict) -> dict:
+    return {
+        "qty": max(0.0, float(totals["qty"]) - float(meta.get("applied_qty") or 0)),
+        "quote": max(0.0, float(totals["quote"]) - float(meta.get("applied_quote") or 0)),
+        "base_fee": max(0.0, float(totals["base_fee"]) - float(meta.get("applied_base_fee") or 0)),
+        "quote_fee": max(0.0, float(totals["quote_fee"]) - float(meta.get("applied_quote_fee") or 0)),
+    }
+
+
+def _remember_fill(meta: dict, totals: dict) -> None:
+    meta["applied_qty"] = float(totals["qty"])
+    meta["applied_quote"] = float(totals["quote"])
+    meta["applied_base_fee"] = float(totals["base_fee"])
+    meta["applied_quote_fee"] = float(totals["quote_fee"])
+    if totals.get("liquidity"):
+        meta["liquidity"] = totals["liquidity"]
+
+
+def _fill_price(order, meta: dict, delta: dict) -> float:
+    if order is not None and order.executed_price:
+        return float(order.executed_price)
+    if delta["qty"] > 0 and delta["quote"] > 0:
+        return delta["quote"] / delta["qty"]
+    return float(meta.get("price") or 0)
+
+
+def _apply_fill_delta(
+    portfolio, *, side, symbol, order, meta, totals, stop_price, setup, reason, client_id, order_type, fee_rate, when,
+):
+    delta = _delta_from(meta, totals)
+    if delta["qty"] <= 1e-12:
+        _remember_fill(meta, totals)
+        return None
+    price = _fill_price(order, meta, delta)
+    if price <= 0 or not symbol:
+        return None
+    fill = None
+    if side == "BUY":
+        kwargs = {}
+        rate = fee_rate
+        if totals.get("from_fills"):
+            kwargs = {
+                "quote_spent": delta["quote"],
+                "base_fee": delta["base_fee"],
+                "quote_fee": delta["quote_fee"],
+            }
+            rate = 0.0
+        if symbol in portfolio.positions:
+            fill = portfolio.top_up(
+                symbol=symbol, price=price, qty=delta["qty"], fee_rate=rate,
+                reason=reason, client_id=client_id, order_type=order_type, **kwargs,
+            )
+        else:
+            fill = portfolio.buy(
+                symbol=symbol, price=price, qty=delta["qty"], fee_rate=rate, time=when,
+                stop_price=stop_price or price, setup=setup or "uptrend_pullback",
+                reason=reason, client_id=client_id, order_type=order_type, **kwargs,
+            )
+    elif symbol in portfolio.positions:
+        if totals.get("from_fills"):
+            fill = portfolio.sell(
+                symbol=symbol, price=price, fee_rate=0, reason=reason, client_id=client_id,
+                order_type=order_type, qty=delta["qty"], proceeds_tmn=delta["quote"],
+                fee_tmn_paid=delta["quote_fee"],
+            )
+        else:
+            fill = portfolio.sell(
+                symbol=symbol, price=price, fee_rate=fee_rate, reason=reason, client_id=client_id,
+                order_type=order_type, qty=delta["qty"],
+            )
+    if fill is not None or delta["qty"] <= 1e-12:
+        _remember_fill(meta, totals)
+    return fill
+
+
+def _aggressive_fallback(cfg, client, portfolio, action, book, marks, rule, state, fee):
+    """Replace a cancelled or partial market exit with a limit through the bid."""
+    position = portfolio.positions.get(action.symbol)
+    if position is None or rule is None:
+        return None
+    mark = float(marks.get(action.symbol) or (book.mid if book is not None else 0) or rule.last_price or 0)
+    floor = float((cfg.get("risk") or {}).get("min_notional_tmn") or 50_000)
+    left = float(round_qty(position.qty, rule.qty_decimals))
+    if left <= 0 or left * mark + 1e-6 < floor:
+        log.info("%s market remainder is below 50000 TMN at the mark; no fallback order", action.symbol)
+        return None
+    raw = (book.best_bid if book is not None and book.best_bid else mark) * (1 - 0.003)
+    price = float(round_price(raw, rule.price_decimals, "down"))
+    if price <= 0:
+        return None
+    blocked = _order_guard_reason(
+        cfg, portfolio, marks, symbol=action.symbol, side="SELL", order_type="LIMIT",
+        qty=left, price=price, post_only=False, ops_state="FLATTEN", unavailable=set(), rule=rule,
+    )
+    if blocked:
+        log.info("aggressive fallback for %s refused: %s", action.symbol, blocked)
+        return None
+    client_id = _next_id(state)
+    client.place_order(
+        symbol=action.symbol, side="SELL", order_type="LIMIT", quantity=left, price=price,
+        client_id=client_id, rule=rule, price_direction="down", maker=False,
+    )
+    filled = _wait_fill(client, client_id)
+    if filled is None or filled.executed_qty <= 0 or action.symbol not in portfolio.positions:
+        return None
+    meta = _pending_meta(action.symbol, "SELL", price, left, fee, action.reason, "LIMIT")
+    return _apply_fill_delta(
+        portfolio, side="SELL", symbol=action.symbol, order=filled, meta=meta,
+        totals=fill_totals(filled), stop_price=0, setup="", reason=action.reason,
+        client_id=client_id, order_type="LIMIT", fee_rate=fee, when=int(time.time()),
+    )
 
 
 def _wait_fill(client: WallexClient, client_id: str):
@@ -1324,31 +1566,42 @@ def _execute(
         )
         request = prepared.redacted()
         if send_orders:
-            client.place_order(
+            response = client.place_order(
                 symbol=action.symbol, side="BUY", order_type="LIMIT", quantity=qty, price=price,
-                client_id=client_id, rule=rule, price_direction=direction,
+                client_id=client_id, rule=rule, price_direction=direction, maker=maker_entry,
             )
+            if response.get("liquidity"):
+                request = {**request, "liquidity": response["liquidity"]}
             filled = _consume_live_order(client, client_id)
+            fee_paid = taker if not maker_entry else maker
+            meta = _pending_meta(
+                action.symbol, "BUY", price, qty, fee_paid, action.reason, "LIMIT",
+            )
             fill = None
             if filled and filled.executed_qty > 0:
-                fill_price = filled.executed_price or price
-                fee_paid = taker if not maker_entry else maker
-                fill = portfolio.buy(
-                    symbol=action.symbol, price=fill_price, qty=filled.executed_qty, fee_rate=fee_paid,
-                    time=int(time.time()),
-                    stop_price=fill_price * (1 - float(cfg["risk"]["stop_loss_pct"])),
-                    setup="uptrend_pullback", reason=action.reason, client_id=client_id, order_type="LIMIT",
+                fill = _apply_fill_delta(
+                    portfolio, side="BUY", symbol=action.symbol, order=filled, meta=meta,
+                    totals=fill_totals(filled),
+                    stop_price=price * (1 - float(cfg["risk"]["stop_loss_pct"])),
+                    setup="uptrend_pullback", reason=action.reason, client_id=client_id,
+                    order_type="LIMIT", fee_rate=fee_paid, when=int(time.time()),
                 )
+                if _partial_buy(filled, qty):
+                    _cancel_quiet(client, client_id)
+                    again = _consume_live_order(client, client_id)
+                    if again is not None:
+                        extra = _apply_fill_delta(
+                            portfolio, side="BUY", symbol=action.symbol, order=again, meta=meta,
+                            totals=fill_totals(again),
+                            stop_price=price * (1 - float(cfg["risk"]["stop_loss_pct"])),
+                            setup="uptrend_pullback", reason=action.reason, client_id=client_id,
+                            order_type="LIMIT", fee_rate=fee_paid, when=int(time.time()),
+                        )
+                        fill = extra or fill
             elif maker_entry:
-                state.setdefault("pending", {})[client_id] = {
-                    "symbol": action.symbol, "side": "BUY", "price": price, "qty": qty,
-                    "fee": maker, "reason": action.reason, "order_type": "LIMIT", "created": time.time(),
-                }
+                state.setdefault("pending", {})[client_id] = meta
             else:
-                try:
-                    client.cancel_order(client_id)
-                except WallexError as exc:
-                    log.warning("cancel unfilled buy %s failed: %s", client_id, exc)
+                _cancel_quiet(client, client_id)
             return fill, request
         fee = taker if not maker_entry else maker
         if maker_entry:
@@ -1427,24 +1680,33 @@ def _execute(
         fee = taker if aggressive else maker
         order_type = "LIMIT"
     if send_orders:
-        client.place_order(
+        response = client.place_order(
             symbol=action.symbol, side="SELL", order_type=order_type,
             quantity=sell_qty, price=None if use_market else price,
             client_id=client_id, rule=rule, price_direction="down" if aggressive else "up",
+            maker=not aggressive and not use_market,
         )
-        filled = _consume_live_order(client, client_id)
+        if response.get("liquidity"):
+            request = {**request, "liquidity": response["liquidity"]}
+        filled = _wait_fill(client, client_id) if use_market else _consume_live_order(client, client_id)
+        meta = _pending_meta(action.symbol, "SELL", price, sell_qty, fee, action.reason, order_type)
         fill = None
         if filled and filled.executed_qty > 0 and action.symbol in portfolio.positions:
-            fill = portfolio.sell(
-                symbol=action.symbol, price=filled.executed_price or price, fee_rate=fee,
-                reason=action.reason, client_id=client_id, order_type=order_type,
-                qty=min(filled.executed_qty, sell_qty, portfolio.positions[action.symbol].qty),
+            fill = _apply_fill_delta(
+                portfolio, side="SELL", symbol=action.symbol, order=filled, meta=meta,
+                totals=fill_totals(filled), stop_price=0, setup="", reason=action.reason,
+                client_id=client_id, order_type=order_type, fee_rate=fee, when=int(time.time()),
             )
-        elif not aggressive:
-            state.setdefault("pending", {})[client_id] = {
-                "symbol": action.symbol, "side": "SELL", "price": price, "qty": sell_qty, "fee": fee,
-                "reason": action.reason, "order_type": order_type, "created": time.time(),
-            }
+        if use_market and _market_needs_fallback(filled, sell_qty):
+            extra = _aggressive_fallback(
+                cfg, client, portfolio, action, book, marks, rule, state, fee,
+            )
+            if extra is not None and fill is not None:
+                state.setdefault("_extra_fills", []).append(fill)
+                return extra, request
+            return extra or fill, request
+        if fill is None and not aggressive:
+            state.setdefault("pending", {})[client_id] = meta
         return fill, request
     if not aggressive:
         state.setdefault("pending", {})[client_id] = {
@@ -1460,40 +1722,30 @@ def _execute(
 
 
 def _sync_pending(client: WallexClient, portfolio: Portfolio, state: dict) -> None:
-    """Apply fills for resting exits and cancel them once they are done or stale."""
+    """Apply only the executedQty added since the last sync, then drop finished orders."""
     for client_id, meta in list(state.get("pending", {}).items()):
         order = _consume_live_order(client, client_id)
         if order is None:
             continue
-        if meta.get("side") == "BUY" and order.executed_qty > 0 and meta["symbol"] not in portfolio.positions:
-            fill_price = order.executed_price or float(meta.get("price") or 0)
-            if fill_price > 0:
-                portfolio.buy(
-                    symbol=meta["symbol"], price=fill_price, qty=order.executed_qty,
-                    fee_rate=float(meta.get("fee") or 0), time=int(time.time()),
-                    stop_price=fill_price * 0.955, setup="uptrend_pullback",
-                    reason=meta.get("reason") or "resting buy fill", client_id=client_id, order_type="LIMIT",
-                )
+        _book_pending(portfolio, meta, order, client_id)
+        partial_buy = _partial_buy(order, float(meta.get("qty") or order.orig_qty or 0))
+        age = time.time() - float(meta.get("created") or time.time())
+        finished = (not order.active) or str(order.status or "").upper() in {
+            "FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED",
+        }
+        if partial_buy and order.active:
+            _cancel_quiet(client, client_id)
+            again = _consume_live_order(client, client_id)
+            if again is not None:
+                _book_pending(portfolio, meta, again, client_id)
             state["pending"].pop(client_id, None)
             continue
-        position = portfolio.positions.get(meta["symbol"])
-        if order.executed_qty > 0 and position is not None:
-            portfolio.sell(
-                symbol=meta["symbol"],
-                price=order.executed_price or float(meta.get("price") or position.entry_price),
-                fee_rate=float(meta.get("fee") or 0),
-                reason=meta.get("reason") or "resting order fill",
-                client_id=client_id,
-                order_type=order.order_type or meta.get("order_type") or "LIMIT",
-                qty=min(order.executed_qty, position.qty),
-            )
-        age = time.time() - float(meta.get("created") or time.time())
-        if not order.active or age > 600:
+        if finished or age > 600:
             if order.active:
-                try:
-                    client.cancel_order(client_id)
-                except WallexError as exc:
-                    log.warning("cancel %s failed: %s", client_id, exc)
+                _cancel_quiet(client, client_id)
+                again = _consume_live_order(client, client_id)
+                if again is not None:
+                    _book_pending(portfolio, meta, again, client_id)
             state["pending"].pop(client_id, None)
 
 
@@ -1572,18 +1824,18 @@ def _reconcile(client: WallexClient, state: dict, rules: dict[str, MarketRule]) 
         portfolio.cash = tmn.available
     seen = set()
     for asset, balance in balances.items():
-        if asset == "TMN" or balance.available <= 0:
+        if asset == "TMN" or balance.total <= 0:
             continue
         symbol = asset if asset.endswith("TMN") else f"{asset}TMN"
         seen.add(symbol)
         if symbol in portfolio.positions:
-            portfolio.positions[symbol].qty = balance.available
+            portfolio.positions[symbol].qty = balance.total
             continue
         rule = rules.get(symbol)
         last = rule.last_price if rule else 0
         if last <= 0:
             continue
-        portfolio.positions[symbol] = portfolio.positions.get(symbol) or _adopt(symbol, balance.available, last)
+        portfolio.positions[symbol] = portfolio.positions.get(symbol) or _adopt(symbol, balance.total, last)
     for symbol in list(portfolio.positions):
         if symbol not in seen:
             log.info("reconcile dropped %s; exchange balance is zero", symbol)
@@ -1593,10 +1845,31 @@ def _reconcile(client: WallexClient, state: dict, rules: dict[str, MarketRule]) 
     except WallexError as exc:
         log.warning("open orders reconcile failed: %s", exc)
         open_orders = []
-    state["pending"] = {
-        order.client_order_id: {"symbol": order.symbol, "side": order.side, "status": order.status}
-        for order in open_orders
-    }
+    fee_rates: dict = {}
+    try:
+        fee_rates = client.get_fees()
+    except WallexError as exc:
+        log.warning("fee reconcile failed: %s", exc)
+    pending = {}
+    for order in open_orders:
+        maker_fee = fee_rates.get(order.symbol, (0.0025, 0.003))[0]
+        meta = _pending_meta(
+            order.symbol,
+            order.side,
+            order.price,
+            order.orig_qty,
+            maker_fee,
+            "reconciled open order",
+            order.order_type or "LIMIT",
+        )
+        meta["status"] = order.status
+        meta["origQty"] = order.orig_qty
+        if order.created_at is not None:
+            meta["created"] = order.created_at
+        meta["applied_qty"] = order.executed_qty
+        meta["applied_quote"] = order.executed_sum
+        pending[order.client_order_id] = meta
+    state["pending"] = pending
     log.info("reconciled cash=%s positions=%s open_orders=%s", portfolio.cash, list(portfolio.positions), len(open_orders))
 
 

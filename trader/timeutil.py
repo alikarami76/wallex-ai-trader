@@ -21,6 +21,36 @@ def parse_ts(value: str) -> datetime:
     return dt
 
 
+def exchange_epoch(value) -> float | None:
+    """UTC epoch seconds for an exchange clock.
+
+    ISO strings that end in Z are UTC. UDF history uses unix seconds. A
+    websocket timestamp above 1e10 is unix milliseconds.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith("Z") or text.endswith("+00:00") or text.endswith("-00:00"):
+            parsed = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number > 10_000_000_000:
+        number /= 1000.0
+    return number
+
+
 def to_tehran(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)

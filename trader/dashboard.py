@@ -195,9 +195,28 @@ def load_desk(directory: Path) -> dict:
     }
 
 
+# The prop package endpoint is not readable with an API key. PnL uses this base.
+LIVE_BASE_TMN = 5_000_000.0
+
+
+def pnl_against_base(equity) -> tuple[float | None, float | None]:
+    """Return (fraction, TMN) versus the 5,000,000 TMN starting base."""
+    if equity is None:
+        return None, None
+    try:
+        value = float(equity)
+    except (TypeError, ValueError):
+        return None, None
+    return value / LIVE_BASE_TMN - 1, value - LIVE_BASE_TMN
+
+
 def render_page(desk: dict, user: str = "") -> str:
     latest = desk["latest"]
-    pnl = latest.get("pnl_from_golive_pct")
+    pnl, pnl_tmn = pnl_against_base(latest.get("equity_tmn"))
+    if pnl is None:
+        pnl = latest.get("pnl_from_golive_pct")
+        pnl_tmn = latest.get("pnl_from_golive_tmn")
+    latest = {**latest, "pnl_from_golive_pct": pnl, "pnl_from_golive_tmn": pnl_tmn}
     spent = _num(latest.get("llm_usd_total"))
     go_live = latest.get("go_live_sha") or ""
     running = latest.get("git_sha") or ""

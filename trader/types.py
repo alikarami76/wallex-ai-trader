@@ -142,6 +142,8 @@ class OrderRecord:
     status: str
     active: bool
     fee: float = 0.0
+    created_at: float | None = None
+    liquidity: str | None = None
     raw: dict = field(default_factory=dict)
 
 

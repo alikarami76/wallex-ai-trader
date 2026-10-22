@@ -64,6 +64,8 @@ class World:
             self.llm_mode = "accept"
             self.llm_calls = 0
             self.order_posts = 0
+            self.market_auto_cancel = False
+            self.history_pages = 1
             self.private_calls = 0
             self.header_ok = 0
             self.header_missing = 0
@@ -172,12 +174,20 @@ class World:
         price = float(body["price"]) if body.get("price") not in (None, "") else None
         with self.lock:
             self.order_posts += 1
+            duplicate = client_id in self.orders
             stall = self.order_stalls > 0
             if stall:
                 self.order_stalls -= 1
                 fault = None
             else:
                 fault = self.order_faults.pop(0) if self.order_faults else None
+        if duplicate:
+            return 422, {
+                "success": False,
+                "code": 422,
+                "message": "duplicate client_id",
+                "result": {"error_code": 422},
+            }
         if stall:
             # Longer than the fault scenario's 1s client timeout, so the client
             # always sees a timeout and the later close of this socket is abandoned.
@@ -202,7 +212,26 @@ class World:
             fill_price = price if price > bid else bid
             fee_rate = MAKER_FEE if price >= ask else TAKER_FEE
         executed = 0.0 if fill_price is None else qty * ratio
+        if order_type == "MARKET" and self.market_auto_cancel:
+            executed = 0.0
+            fill_price = None
         status = "NEW" if executed <= 0 else ("FILLED" if executed + 1e-12 >= qty else "PARTIALLY_FILLED")
+        if order_type == "MARKET" and self.market_auto_cancel:
+            status = "CANCELED"
+        asset = self._asset(symbol)
+        fee_amount = 0.0 if fill_price is None else (
+            executed * fee_rate if side == "BUY" else executed * fill_price * fee_rate
+        )
+        fills = []
+        if executed > 0 and fill_price is not None:
+            fills.append({
+                "price": fill_price,
+                "quantity": executed,
+                "sum": executed * fill_price,
+                "fee": fee_amount,
+                "feeAsset": asset if side == "BUY" else "TMN",
+                "maker": fee_rate == MAKER_FEE,
+            })
         order = {
             "clientOrderId": client_id,
             "symbol": symbol,
@@ -214,8 +243,10 @@ class World:
             "executedSum": 0.0 if fill_price is None else executed * fill_price,
             "executedPrice": fill_price,
             "status": status,
-            "active": executed + 1e-12 < qty,
-            "fee": 0.0,
+            "active": status not in {"FILLED", "CANCELED"} and executed + 1e-12 < qty,
+            "fee": fee_amount,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "fills": fills,
         }
         with self.lock:
             self.orders[client_id] = order
@@ -364,7 +395,7 @@ class _Handler(BaseHTTPRequestHandler):
         query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
-        if path.startswith("/v1/account"):
+        if path.startswith("/v1/account") or path.startswith("/sub-accounts"):
             self._private_headers()
         try:
             status, payload = self._route(method, path, query, raw)
@@ -376,6 +407,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("x-ratelimit-limit", "100")
+        self.send_header("x-ratelimit-remaining", "80")
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -397,7 +430,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _route(self, method: str, path: str, query: dict, raw: bytes) -> tuple[int, dict]:
         world = self.world
-        if path.startswith("/v1/account") and (not self.headers.get("X-API-Key") or not self.headers.get("sub-account-client-id")):
+        if path.startswith("/v1/prop/user/packages"):
+            return 401, {"success": False, "code": 401, "message": "unauthorized"}
+        private = path.startswith("/v1/account") or path.startswith("/sub-accounts")
+        if private and (not self.headers.get("X-API-Key") or not self.headers.get("sub-account-client-id")):
             return 401, {"success": False, "message": "unauthorized"}
         if "margin" in path or "futures" in path or "otc" in path or "easy-trade" in path or "easytrade" in path:
             with world.lock:
@@ -447,8 +483,23 @@ class _Handler(BaseHTTPRequestHandler):
             return 200, world.fees()
         if path == "/v1/account/openOrders" and method == "GET":
             return 200, world.open_orders()
+        if path == "/sub-accounts" and method == "GET":
+            return 200, {
+                "success": True,
+                "result": [{
+                    "title": "hackathon",
+                    "clientId": "e2e-sub",
+                    "isActive": True,
+                    "isSuspend": False,
+                }],
+            }
+        if path == "/sub-accounts/transfers" and method == "GET":
+            return 200, {"success": True, "result": []}
         if path == "/v1/account/orders" and method == "GET":
-            return 200, world.open_orders()
+            page = int(query.get("page") or 1)
+            payload = world.open_orders()
+            payload["result_info"] = {"has_more_pages": page < int(world.history_pages), "page": page}
+            return 200, payload
         if path == "/v1/account/orders" and method == "POST":
             try:
                 body = json.loads(raw.decode() or "{}")

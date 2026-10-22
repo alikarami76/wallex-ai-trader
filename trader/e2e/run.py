@@ -318,8 +318,8 @@ def run_all(root: Path | None = None) -> int:
         world.reset()
         world.llm_mode = "accept"
         world.market_faults = [429, 503]
-        world.order_stalls = 1
-        world.order_faults = [429, 429, 429, 429]
+        # The order POST is not sent again after a 429. Adoption finds no order.
+        world.order_faults = [429]
         clock.unix = at(12, 0)
         directory = root / "g-faults"
         journals["faults"] = directory
@@ -330,9 +330,10 @@ def run_all(root: Path | None = None) -> int:
         need(0.4 in world.sleeps and 0.8 in world.sleeps, f"backoff sleeps {world.sleeps[:8]}")
         errors = [item for row in cycles_of(directory) for item in (row.get("errors") or [])]
         need(any(item.get("http_status") == 429 for item in errors), f"errors {errors}")
+        need(world.order_posts == 1, f"order POST was repeated {world.order_posts} times")
         need(machine(directory) == "HALT", machine(directory))
         need(not positions(directory), "a rejected entry left a position")
-        return "429 then 503 on markets, order timeout then 429, HALT"
+        return "429 then 503 on markets, one order 429 is not resent, HALT"
 
     def dust() -> str:
         world.reset()

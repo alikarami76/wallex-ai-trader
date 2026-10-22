@@ -14,6 +14,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+# Live PnL is measured from this base. The prop package endpoint is not called.
+LIVE_BASE_TMN = 5_000_000.0
+
+
+def pnl_against_base(equity: float) -> float:
+    """TMN gain or loss versus the 5,000,000 TMN starting base."""
+    return float(equity) - LIVE_BASE_TMN
+
+
 def build_report(log_dir: Path, out_dir: Path | None = None, title: str = "Wallex trader report") -> Path:
     log_dir = Path(log_dir)
     out_dir = Path(out_dir or log_dir)
@@ -114,6 +123,7 @@ def _stats(equity: list[dict], trades: list[dict], decisions: list[dict]) -> dic
         "agent_sources": sources,
         "errors": errors,
         "realized_pnl": realized,
+        "pnl_vs_base_tmn": None if not series else pnl_against_base(end),
         "latency_median_ms": latencies[len(latencies) // 2] if latencies else None,
         "latency_p95_ms": latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))] if latencies else None,
         "latency_samples": len(latencies),
@@ -290,6 +300,13 @@ def _walk_forward(out_dir: Path) -> str:
     return "\n".join(lines)
 
 
+def _base_pnl(stats: dict) -> str:
+    value = stats.get("pnl_vs_base_tmn")
+    if value is None:
+        return "n/a"
+    return f"{value:,.0f} TMN"
+
+
 def _markdown(title: str, stats: dict, out_dir: Path) -> str:
     sharpe = "n/a" if stats["sharpe"] is None else f"{stats['sharpe']:.2f}"
     sources = ", ".join(f"{key}={value}" for key, value in sorted(stats["agent_sources"].items())) or "none"
@@ -302,6 +319,7 @@ def _markdown(title: str, stats: dict, out_dir: Path) -> str:
 | Metric | Value |
 | --- | --- |
 | PnL after fees (mark-to-market) | {mtm:,.0f} TMN ({stats['return_pct']:.3f}%) |
+| PnL versus 5,000,000 TMN base | {_base_pnl(stats)} |
 | PnL after fees (realized) | {stats['realized_pnl']:,.0f} TMN |
 | Sharpe (annualized from the equity spacing) | {sharpe} |
 | Max drawdown | {stats['max_drawdown_pct']:.3f}% |

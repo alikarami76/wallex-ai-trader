@@ -21,8 +21,9 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
+from trader.timeutil import exchange_epoch
 from trader.types import Balance, Bar, BookLevel, MarketRule, OrderBook, OrderRecord, PreparedOrder
-from trader.wallex.precision import build_order_body
+from trader.wallex.precision import OrderRejected, build_order_body, round_qty
 
 log = logging.getLogger("trader.wallex")
 
@@ -38,8 +39,12 @@ _SPOT_GET_EXACT = {
     "/v1/account/fee",
     "/v1/account/openOrders",
     "/v1/account/orders",
+    "/sub-accounts",
+    "/sub-accounts/transfers",
 }
 _DENIED_SEGMENTS = ("margin", "leverage", "futures", "otc", "easy-trade", "easytrade", "credit-margin")
+# Account-level failures. The loop halts and alerts; it does not send the order again.
+FATAL_WALLEX_CODES = frozenset({1201, 1203})
 
 
 SPOT_ORDER_PATH = "/v1/account/orders"
@@ -83,6 +88,8 @@ def assert_spot_request(method: str, path: str) -> None:
     if method == "GET":
         if path in _SPOT_GET_EXACT:
             return
+        if path.startswith("/v1/prop/user/packages"):
+            raise WallexError(f"spot-only: refused GET {path}")
         if path.startswith("/v1/prop/packages/") and path.count("/") == 4:
             return
         if path.startswith("/v1/account/orders/") and "/" not in path[len("/v1/account/orders/"):]:
@@ -92,10 +99,17 @@ def assert_spot_request(method: str, path: str) -> None:
 
 
 class WallexError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None, payload: dict | None = None):
+    def __init__(
+        self,
+        message: str,
+        status: int | None = None,
+        payload: dict | None = None,
+        code: int | None = None,
+    ):
         super().__init__(message)
         self.status = status
         self.payload = payload or {}
+        self.code = _error_code(self.payload) if code is None else _coerce_code(code)
 
 
 @dataclass
@@ -173,6 +187,7 @@ class WallexClient:
         self.user_agent = user_agent
         self._public_limit = RateLimiter(5, 1.0)
         self._order_limit = RateLimiter(15, 10.0)
+        self._pace_until = 0.0
 
     def _headers(self, auth: bool, body: bool) -> dict[str, str]:
         headers = {"Accept": "application/json", "User-Agent": self.user_agent}
@@ -210,21 +225,31 @@ class WallexClient:
             return {"success": True, "dry_run": True, "result": {}, "request": prepared.redacted()}
 
         limiter = self._order_limit if is_order else self._public_limit
+        # A lost order POST is adopted by client id. Sending it again can double-fill.
+        order_post = method == "POST" and path.split("?", 1)[0].rstrip("/") == SPOT_ORDER_PATH
+        attempts = 1 if order_post else self.max_retries
+        client_id = str((body or {}).get("client_id") or "")
         last_error: Exception | None = None
-        for attempt in range(self.max_retries):
+        for attempt in range(attempts):
+            self._wait_pace()
             limiter.acquire()
             request = urllib.request.Request(url, data=payload, headers=headers, method=method)
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     raw = response.read().decode()
                     status = response.status
+                    self._note_rate(response.headers)
                 parsed = json.loads(raw) if raw else {}
                 if status >= 400 or (isinstance(parsed, dict) and parsed.get("success") is False):
-                    raise WallexError(
+                    error = WallexError(
                         f"{method} {path} failed: {parsed.get('message', status) if isinstance(parsed, dict) else status}",
                         status=status,
                         payload=parsed if isinstance(parsed, dict) else {},
                     )
+                    adopted = self._maybe_adopt(order_post, client_id, error)
+                    if adopted is not None:
+                        return adopted
+                    raise error
                 return parsed if isinstance(parsed, dict) else {"result": parsed}
             except WallexError:
                 raise
@@ -234,25 +259,72 @@ class WallexClient:
                     parsed = json.loads(detail) if detail else {}
                 except json.JSONDecodeError:
                     parsed = {"message": detail[:400]}
-                retryable = exc.code in {429, 500, 502, 503, 504}
+                self._note_rate(exc.headers)
                 last_error = WallexError(
-                    f"{method} {path} HTTP {exc.code}: {parsed.get('message', detail[:180])}",
+                    f"{method} {path} HTTP {exc.code}: {parsed.get('message', detail[:180]) if isinstance(parsed, dict) else detail[:180]}",
                     status=exc.code,
                     payload=parsed if isinstance(parsed, dict) else {},
                 )
-                if not retryable or attempt + 1 == self.max_retries:
+                adopted = self._maybe_adopt(order_post, client_id, last_error)
+                if adopted is not None:
+                    return adopted
+                retryable = exc.code in {429, 500, 502, 503, 504}
+                if order_post or not retryable or attempt + 1 == attempts:
                     raise last_error from exc
-                delay = min(8.0, 0.4 * (2**attempt))
+                delay = _retry_after_seconds(exc.headers)
+                if delay is None:
+                    delay = min(8.0, 0.4 * (2**attempt))
                 log.warning("retrying %s %s after HTTP %s (attempt %s)", method, path, exc.code, attempt + 1)
                 time.sleep(delay)
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
                 last_error = WallexError(f"{method} {path} network error: {exc}")
-                if attempt + 1 == self.max_retries:
+                adopted = self._maybe_adopt(order_post, client_id, last_error)
+                if adopted is not None:
+                    return adopted
+                if order_post or attempt + 1 == attempts:
                     raise last_error from exc
                 delay = min(8.0, 0.4 * (2**attempt))
                 log.warning("retrying %s %s after %s", method, path, exc)
                 time.sleep(delay)
         raise last_error or WallexError(f"{method} {path} failed")
+
+    def _wait_pace(self) -> None:
+        remaining = self._pace_until - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def _note_rate(self, headers) -> None:
+        """Back off when the remaining budget is under about 10% of the limit."""
+        if headers is None:
+            return
+        remaining = _header_float(headers, "x-ratelimit-remaining")
+        limit = _header_float(headers, "x-ratelimit-limit")
+        if remaining is None or limit is None or limit <= 0:
+            return
+        if remaining / limit < 0.10:
+            self._pace_until = max(self._pace_until, time.monotonic() + 1.0)
+
+    def _maybe_adopt(self, order_post: bool, client_id: str, error: WallexError) -> dict | None:
+        if not order_post or not client_id or not _adopt_status(error):
+            return None
+        log.warning("order POST for %s failed (%s); reading the order instead of sending it again", client_id, error.status or type(error).__name__)
+        return self._adopt_order(client_id)
+
+    def _adopt_order(self, client_id: str) -> dict | None:
+        try:
+            payload = self._request("GET", f"/v1/account/orders/{client_id}", auth=True)
+        except WallexError as exc:
+            log.warning("could not adopt order %s: %s", client_id, exc)
+            return None
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if not isinstance(result, dict):
+            return None
+        status = str(result.get("status") or "").upper()
+        if status in {"", "NOT_FOUND"} and not result.get("symbol"):
+            return None
+        if not result.get("clientOrderId") and not result.get("symbol"):
+            return None
+        return {"success": True, "adopted": True, "result": result}
 
     def get_markets(self) -> dict[str, MarketRule]:
         payload = self._request("GET", "/v1/markets")
@@ -325,9 +397,12 @@ class WallexClient:
         times = payload.get("t") or []
         bars: list[Bar] = []
         for i, ts in enumerate(times):
+            stamp = exchange_epoch(ts)
+            if stamp is None:
+                continue
             bars.append(
                 Bar(
-                    time=int(ts),
+                    time=int(stamp),
                     open=float(payload["o"][i]),
                     high=float(payload["h"][i]),
                     low=float(payload["l"][i]),
@@ -460,13 +535,50 @@ class WallexClient:
         return _parse_order((payload.get("result") or {}))
 
     def get_order_history(self, symbol: str | None = None, page: int = 1) -> list[OrderRecord]:
-        payload = self._request(
-            "GET",
-            "/v1/account/orders",
-            params={"market": symbol, "page": page, "per_page": 50},
-            auth=True,
-        )
-        return _parse_order_list(payload.get("result"))
+        orders: list[OrderRecord] = []
+        current = max(1, int(page))
+        for _ in range(50):
+            payload = self._request(
+                "GET",
+                "/v1/account/orders",
+                params={"market": symbol, "page": current, "per_page": 50},
+                auth=True,
+            )
+            orders.extend(_parse_order_list(payload.get("result")))
+            info = payload.get("result_info") if isinstance(payload, dict) else None
+            if not isinstance(info, dict) or not info.get("has_more_pages"):
+                break
+            current += 1
+        return orders
+
+    def get_subaccounts(self) -> list[dict]:
+        payload = self._request("GET", "/sub-accounts", auth=True)
+        return _dict_rows(payload, ("subAccounts", "sub_accounts", "data"))
+
+    def get_subaccount_transfers(self) -> list[dict]:
+        payload = self._request("GET", "/sub-accounts/transfers", auth=True)
+        return _dict_rows(payload, ("transfers", "data"))
+
+    def account_status(self) -> dict | None:
+        """The sub-account this key can see, plus the free TMN balance."""
+        rows = self.get_subaccounts()
+        chosen = match_subaccount(rows, self.subaccount_id)
+        if chosen is None and len(rows) == 1 and not self.subaccount_id:
+            chosen = rows[0]
+        balances = self.get_balances()
+        tmn = balances.get("TMN")
+        if chosen is None and tmn is None:
+            return None
+        row = chosen or {}
+        return {
+            "title": row.get("title") or row.get("name") or "",
+            "clientId": str(row.get("clientId") or row.get("client_id") or ""),
+            "isActive": row.get("isActive") if chosen else None,
+            "isSuspend": row.get("isSuspend") if chosen else None,
+            "tmn_available": None if tmn is None else tmn.available,
+            "rows": len(rows),
+            "matched": chosen is not None,
+        }
 
     def prepare_order(
         self,
@@ -516,6 +628,8 @@ class WallexClient:
         client_id: str,
         rule: MarketRule,
         price_direction: str,
+        maker: bool = False,
+        _balance_retry: bool = False,
     ) -> dict:
         assert_spot_order("POST", SPOT_ORDER_PATH)
         prepared = self.prepare_order(
@@ -538,12 +652,237 @@ class WallexClient:
                 "result": {"clientOrderId": client_id, "status": "DRY_RUN", "active": False},
                 "request": prepared.redacted(),
             }
-        response = self._request("POST", SPOT_ORDER_PATH, body=prepared.body, auth=True, is_order=True)
+        book = self.get_depth(symbol)
+        if maker:
+            _refuse_crossing_maker(side, price, book)
+        try:
+            response = self._request("POST", SPOT_ORDER_PATH, body=prepared.body, auth=True, is_order=True)
+        except WallexError as exc:
+            if exc.code == 1006 and str(side).upper() == "SELL" and not _balance_retry:
+                available = self._available_base(rule)
+                retry_qty = float(round_qty(available, rule.qty_decimals))
+                if 0 < retry_qty < float(quantity) - 1e-12:
+                    log.warning("sell %s rejected for balance; retrying once with %s", symbol, retry_qty)
+                    return self.place_order(
+                        symbol=symbol,
+                        side=side,
+                        order_type=order_type,
+                        quantity=retry_qty,
+                        price=price,
+                        client_id=client_id,
+                        rule=rule,
+                        price_direction=price_direction,
+                        maker=maker,
+                        _balance_retry=True,
+                    )
+            raise
         response["request"] = prepared.redacted()
+        result = response.get("result") if isinstance(response.get("result"), dict) else {}
+        response["liquidity"] = _liquidity(result, side, book)
         return response
+
+    def _available_base(self, rule: MarketRule) -> float:
+        balances = self.get_balances()
+        row = balances.get(rule.base_asset)
+        if row is None:
+            return 0.0
+        return float(row.available)
 
     def cancel_order(self, client_order_id: str) -> dict:
         return self._request("DELETE", f"/v1/account/orders/{client_order_id}", auth=True, is_order=True)
+
+
+def _error_code(payload: dict) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("code")
+    if raw is None and isinstance(payload.get("result"), dict):
+        raw = payload["result"].get("error_code")
+    return _coerce_code(raw)
+
+
+def _coerce_code(raw) -> int | None:
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _adopt_status(error: WallexError) -> bool:
+    """Timeouts, 5xx, 429, and duplicate-client 422 are read back. Other codes are not."""
+    if error.code in FATAL_WALLEX_CODES or error.code == 1006:
+        return False
+    status = error.status
+    if status is None:
+        return True
+    if status == 422 or status == 429 or status >= 500:
+        return True
+    return False
+
+
+def _header_float(headers, name: str) -> float | None:
+    if headers is None:
+        return None
+    raw = headers.get(name)
+    if raw is None:
+        raw = headers.get(name.title())
+    if raw is None:
+        return None
+    try:
+        return float(str(raw).split(",", 1)[0].strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _retry_after_seconds(headers) -> float | None:
+    raw = None if headers is None else headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _refuse_crossing_maker(side: str, price: float | None, book: OrderBook) -> None:
+    """There is no post-only flag. A maker quote that crosses the touch is not sent."""
+    if price is None or book is None:
+        raise OrderRejected("maker order has no book to check")
+    side = (side or "").upper()
+    if side == "BUY":
+        if book.best_ask is None or float(price) >= float(book.best_ask):
+            raise OrderRejected(f"maker BUY price {price} is at or above the best ask")
+    elif side == "SELL":
+        if book.best_bid is None or float(price) <= float(book.best_bid):
+            raise OrderRejected(f"maker SELL price {price} is at or below the best bid")
+
+
+def _liquidity(result: dict, side: str, book: OrderBook | None) -> str | None:
+    fills = result.get("fills") if isinstance(result, dict) else None
+    flags: list[bool] = []
+    if isinstance(fills, list):
+        for fill in fills:
+            if not isinstance(fill, dict):
+                continue
+            if "maker" in fill:
+                flags.append(bool(fill.get("maker")))
+            elif "isMaker" in fill:
+                flags.append(bool(fill.get("isMaker")))
+            else:
+                role = str(fill.get("liquidity") or "").lower()
+                if role in {"maker", "taker"}:
+                    flags.append(role == "maker")
+    if flags:
+        return "maker" if all(flags) else "taker"
+    if book is None:
+        return None
+    price = _num(result.get("executedPrice") if isinstance(result, dict) else None)
+    if price is None:
+        price = _num(result.get("price") if isinstance(result, dict) else None)
+    if price is None:
+        return None
+    side = (side or "").upper()
+    if side == "BUY" and book.best_ask is not None:
+        return "maker" if price < book.best_ask else "taker"
+    if side == "SELL" and book.best_bid is not None:
+        return "maker" if price > book.best_bid else "taker"
+    return None
+
+
+def match_subaccount(rows: list[dict], subaccount_id: str) -> dict | None:
+    wanted = str(subaccount_id or "")
+    if not wanted:
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cid = str(row.get("clientId") or row.get("client_id") or "")
+        if cid == wanted:
+            return row
+    return None
+
+
+def subaccount_blocked(status: dict | None, subaccount_id: str) -> str | None:
+    """Why a live arm must stop. None when the account can trade."""
+    if not status:
+        if subaccount_id:
+            return "WALLEX_SUBACCOUNT_ID is set and the sub-account list did not match"
+        return None
+    if subaccount_id and not status.get("matched"):
+        return "WALLEX_SUBACCOUNT_ID does not match a sub-account"
+    cid = str(status.get("clientId") or "")
+    if subaccount_id and cid and cid != str(subaccount_id):
+        return "WALLEX_SUBACCOUNT_ID does not match the sub-account clientId"
+    if status.get("isSuspend") in {True, 1, "1", "true", "True"}:
+        return "sub-account is suspended"
+    if "isActive" in status and status.get("isActive") in {False, 0, "0", "false", "False"}:
+        return "sub-account is inactive"
+    return None
+
+
+def _dict_rows(payload: dict, keys: tuple[str, ...]) -> list[dict]:
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if isinstance(result, list):
+        return [row for row in result if isinstance(row, dict)]
+    if isinstance(result, dict):
+        for key in keys:
+            rows = result.get(key)
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
+        if result.get("clientId") or result.get("client_id") or result.get("title"):
+            return [result]
+    return []
+
+
+def fill_totals(order: OrderRecord) -> dict:
+    """Cumulative qty, quote, and fees. BUY fees charged in the base asset stay in base_fee."""
+    fills = order.raw.get("fills") if isinstance(order.raw, dict) else None
+    qty = 0.0
+    quote = 0.0
+    base_fee = 0.0
+    quote_fee = 0.0
+    flags: list[bool] = []
+    found = False
+    if isinstance(fills, list):
+        for fill in fills:
+            if not isinstance(fill, dict):
+                continue
+            found = True
+            row_qty = _num(fill.get("quantity") if fill.get("quantity") is not None else fill.get("qty")) or 0.0
+            row_price = _num(fill.get("price")) or 0.0
+            row_sum = _num(fill.get("sum"))
+            if row_sum is None:
+                row_sum = _num(fill.get("executedSum"))
+            fee = _num(fill.get("fee")) or 0.0
+            asset = str(fill.get("feeAsset") or fill.get("fee_asset") or "").upper()
+            qty += row_qty
+            quote += row_sum if row_sum is not None else row_qty * row_price
+            if asset in {"TMN", "IRT"} or asset.endswith("TMN"):
+                quote_fee += fee
+            elif asset:
+                base_fee += fee
+            if "maker" in fill:
+                flags.append(bool(fill.get("maker")))
+            elif "isMaker" in fill:
+                flags.append(bool(fill.get("isMaker")))
+    if not found:
+        qty = float(order.executed_qty or 0)
+        quote = float(order.executed_sum or 0)
+        if quote <= 0 and order.executed_price and qty:
+            quote = float(order.executed_price) * qty
+    liquidity = order.liquidity
+    if flags:
+        liquidity = "maker" if all(flags) else "taker"
+    return {
+        "qty": qty,
+        "quote": quote,
+        "base_fee": base_fee,
+        "quote_fee": quote_fee,
+        "liquidity": liquidity,
+        "from_fills": found,
+    }
 
 
 def _num(value) -> float | None:
@@ -586,8 +925,19 @@ def _parse_order(row: dict) -> OrderRecord:
         status=str(row.get("status") or ""),
         active=bool(row.get("active")),
         fee=_num(row.get("fee")) or 0.0,
+        created_at=exchange_epoch(row.get("created_at") if row.get("created_at") is not None else row.get("createdAt")),
+        liquidity=_row_liquidity(row),
         raw=row,
     )
+
+
+def _row_liquidity(row: dict) -> str | None:
+    role = str(row.get("liquidity") or "").lower()
+    if role in {"maker", "taker"}:
+        return role
+    if "maker" in row and not isinstance(row.get("maker"), dict):
+        return "maker" if row.get("maker") else "taker"
+    return None
 
 
 def _parse_order_list(result) -> list[OrderRecord]:

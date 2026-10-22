@@ -112,17 +112,30 @@ class Portfolio:
         reason: str,
         client_id: str,
         order_type: str,
+        quote_spent: float | None = None,
+        base_fee: float = 0.0,
+        quote_fee: float = 0.0,
     ) -> Fill | None:
         if symbol in self.positions or qty <= 0 or price <= 0:
             return None
-        notional = price * qty
-        if notional > self.cash:
-            qty = self.cash / price
+        if quote_spent is None:
             notional = price * qty
-        if qty <= 0 or notional <= 0:
-            return None
-        base_qty = qty * (1 - fee_rate)
-        fee_tmn = notional * fee_rate
+            if notional > self.cash:
+                qty = self.cash / price
+                notional = price * qty
+            if qty <= 0 or notional <= 0:
+                return None
+            base_qty = qty * (1 - fee_rate)
+            fee_tmn = notional * fee_rate
+        else:
+            notional = float(quote_spent)
+            if notional <= 0 or notional > self.cash + 1e-6:
+                return None
+            base_qty = qty - float(base_fee)
+            if base_qty <= 0:
+                return None
+            fee_tmn = float(quote_fee) + float(base_fee) * price
+            fee_rate = fee_tmn / notional if notional else fee_rate
         self.cash -= notional
         self.fees_paid += fee_tmn
         self.positions[symbol] = Position(
@@ -160,15 +173,28 @@ class Portfolio:
         reason: str,
         client_id: str,
         order_type: str,
+        quote_spent: float | None = None,
+        base_fee: float = 0.0,
+        quote_fee: float = 0.0,
     ) -> Fill | None:
         """Add base to a held coin. Used only to lift dust over the minimum before a sell."""
         if qty <= 0 or price <= 0:
             return None
-        notional = price * qty
-        if notional > self.cash + 1e-6:
-            return None
-        base_qty = qty * (1 - fee_rate)
-        fee_tmn = notional * fee_rate
+        if quote_spent is None:
+            notional = price * qty
+            if notional > self.cash + 1e-6:
+                return None
+            base_qty = qty * (1 - fee_rate)
+            fee_tmn = notional * fee_rate
+        else:
+            notional = float(quote_spent)
+            if notional <= 0 or notional > self.cash + 1e-6:
+                return None
+            base_qty = qty - float(base_fee)
+            if base_qty <= 0:
+                return None
+            fee_tmn = float(quote_fee) + float(base_fee) * price
+            fee_rate = fee_tmn / notional if notional else fee_rate
         self.cash -= notional
         self.fees_paid += fee_tmn
         position = self.positions.get(symbol)
@@ -197,6 +223,8 @@ class Portfolio:
         client_id: str,
         order_type: str,
         qty: float | None = None,
+        proceeds_tmn: float | None = None,
+        fee_tmn_paid: float | None = None,
     ) -> Fill | None:
         position = self.positions.get(symbol)
         if position is None or price <= 0 or position.qty <= 0:
@@ -204,8 +232,13 @@ class Portfolio:
         sell_qty = position.qty if qty is None else min(qty, position.qty)
         if sell_qty <= 0:
             return None
-        gross = price * sell_qty
-        fee_tmn = gross * fee_rate
+        if proceeds_tmn is None and fee_tmn_paid is None:
+            gross = price * sell_qty
+            fee_tmn = gross * fee_rate
+        else:
+            gross = float(proceeds_tmn if proceeds_tmn is not None else price * sell_qty)
+            fee_tmn = float(fee_tmn_paid if fee_tmn_paid is not None else gross * fee_rate)
+            fee_rate = fee_tmn / gross if gross else fee_rate
         proceeds = gross - fee_tmn
         cost = position.cost_tmn * (sell_qty / position.qty)
         pnl = proceeds - cost

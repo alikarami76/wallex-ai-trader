@@ -64,6 +64,8 @@ class SpotPathTests(unittest.TestCase):
         assert_spot_request("GET", "/v1/account/orders/SC1")
         assert_spot_request("GET", "/v1/prop/packages/183")
         assert_spot_request("GET", "/v2/depth/all")
+        assert_spot_request("GET", "/sub-accounts")
+        assert_spot_request("GET", "/sub-accounts/transfers")
         refused = [
             ("POST", "/v1/account/margin/orders"),
             ("POST", "/v1/otc/orders"),
@@ -74,6 +76,8 @@ class SpotPathTests(unittest.TestCase):
             ("PUT", "/v1/account/orders"),
             ("POST", "/v1/account/orders/extra"),
             ("GET", "/v1/account/leverage"),
+            ("GET", "/v1/prop/user/packages/1"),
+            ("GET", "/v1/prop/user/packages/1/detail"),
         ]
         for method, path in refused:
             with self.assertRaises(WallexError, msg=path):
