@@ -437,10 +437,19 @@ def _state_panel(latest: dict, mismatch: bool, go_live: str, running: str) -> st
 
 def _book_panel(latest: dict, desk: dict, pnl) -> str:
     dust = latest.get("dust") or []
-    dust_text = ", ".join(
-        f"{_esc(item.get('symbol'))} {_num_text(item.get('notional_tmn'))}"
+    listed = ", ".join(
+        f"{_esc(item.get('symbol'))} {_num_text(item.get('dust_tmn', item.get('notional_tmn')))}"
         for item in dust if isinstance(item, dict)
     ) or "none"
+    total = latest.get("dust_tmn")
+    if total is None:
+        total = sum(
+            float(item.get("dust_tmn") or item.get("notional_tmn") or 0)
+            for item in dust if isinstance(item, dict)
+        )
+    dust_text = f"dust_tmn {_num_text(total)}"
+    if listed != "none":
+        dust_text = f"{dust_text} · {listed}"
     orders = latest.get("open_orders") or []
     order_text = ", ".join(_esc(item) for item in orders) or "none"
     position_rows = "".join(_position_row(item) for item in desk["positions"]) or "<tr><td colspan='3'>none</td></tr>"

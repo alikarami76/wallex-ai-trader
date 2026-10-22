@@ -269,11 +269,7 @@ def _emit_contract(
         llm_source = "fallback"
     minimum = int((cfg.get("ops") or {}).get("zscore_min_n", 18))
     ban_hash = text_hash("\n".join(sorted(unavailable))) if unavailable else ""
-    dust = []
-    for position in portfolio.positions.values():
-        notional = position.qty * position.entry_price
-        if notional < float(cfg["risk"]["min_notional_tmn"]):
-            dust.append({"symbol": position.symbol, "notional_tmn": round(notional, 2)})
+    dust, dust_tmn = _dust_report(state, portfolio, float(cfg["risk"]["min_notional_tmn"]))
     mode_label = "dry-run" if mode == "live" and not send_orders else mode
     golive = ops.get("go_live_equity")
     pnl_pct = None if not golive else (equity / float(golive) - 1)
@@ -445,6 +441,7 @@ def _emit_contract(
         "free_tmn": round(portfolio.cash, 2),
         "coin_notional_tmn": round(max(0.0, equity - portfolio.cash), 2),
         "dust": dust,
+        "dust_tmn": round(dust_tmn, 2),
         "pnl_from_golive_tmn": None if pnl_pct is None else round(equity - float(golive), 2),
         "pnl_from_golive_pct": pnl_pct,
         "daily_pnl_pct": (equity / view.day_start_equity - 1) if view.day_start_equity else None,
@@ -688,11 +685,13 @@ def _cycle(
                 requests.extend(dust_requests)
                 if residual:
                     residuals.append(residual)
-                    rejected.append({"symbol": action.symbol, "reason": residual["reason"]})
-                    log.warning(
-                        "residual %s qty=%s mark_tmn=%s %s",
-                        residual.get("symbol"), residual.get("qty"), residual.get("mark_tmn"), residual.get("reason"),
-                    )
+                    if not residual.get("repeat"):
+                        rejected.append({"symbol": action.symbol, "reason": residual["reason"]})
+                        log.warning(
+                            "dust %s qty=%s dust_tmn=%s %s",
+                            residual.get("symbol"), residual.get("qty"),
+                            residual.get("dust_tmn", residual.get("mark_tmn")), residual.get("reason"),
+                        )
                 for fill in dust_fills:
                     fills.append(fill)
                     state["order_times"].append(now_unix)
@@ -731,6 +730,8 @@ def _cycle(
                     state["cooldowns"][action.symbol] = now_unix + float(cfg["risk"]["cooldown_after_stop_seconds"])
                 if fill.side == "BUY" and (action.order_type == "MARKET" or action.aggressive):
                     entry_taker_fills += 1
+                if fill.side == "SELL" and str(ops["state"]) in {"FLATTEN", "KILLED"}:
+                    _note_unsellable_remainder(state, portfolio, marks, action.symbol, float(cfg["risk"]["min_notional_tmn"]))
 
     protective, _deferred = risk.protective_actions(
         portfolio=portfolio, marks=marks, view=view, now_unix=now_unix, liquidity=liquidity,
@@ -986,6 +987,60 @@ def _order_guard_reason(
     return verdict.reason
 
 
+def _dust_report(state, portfolio, min_notional: float) -> tuple[list[dict], float]:
+    """Logged unsellable dust, plus any other held coin still under the minimum."""
+    book = state.get("dust_book") or {}
+    dust = []
+    total = 0.0
+    seen = set()
+    for symbol, row in book.items():
+        value = float(row.get("dust_tmn") or 0)
+        dust.append({
+            "symbol": symbol,
+            "notional_tmn": round(value, 2),
+            "dust_tmn": round(value, 2),
+            "qty": row.get("qty"),
+        })
+        total += value
+        seen.add(symbol)
+    for position in portfolio.positions.values():
+        if position.symbol in seen:
+            continue
+        notional = position.qty * position.entry_price
+        if notional < min_notional:
+            dust.append({"symbol": position.symbol, "notional_tmn": round(notional, 2)})
+    return dust, total
+
+
+def _touch_dust(state, symbol: str, qty: float, notional: float) -> dict:
+    """Remember an unsellable remainder. A later cycle reports it and does not send an order."""
+    book = state.setdefault("dust_book", {})
+    fresh = symbol not in book
+    row = {
+        "symbol": symbol,
+        "qty": qty,
+        "dust_tmn": round(float(notional), 2),
+        "mark_tmn": round(float(notional), 2),
+        "notional_tmn": round(float(notional), 2),
+        "reason": "unsellable dust; a top-up buy is not used",
+        "repeat": not fresh,
+    }
+    book[symbol] = row
+    return row
+
+
+def _note_unsellable_remainder(state, portfolio, marks, symbol: str, min_notional: float) -> None:
+    left = portfolio.positions.get(symbol)
+    if left is None:
+        book = state.get("dust_book") or {}
+        book.pop(symbol, None)
+        return
+    mark = marks.get(symbol) or left.entry_price or 0
+    if left.qty * float(mark) + 1e-6 >= min_notional:
+        return
+    _touch_dust(state, symbol, left.qty, left.qty * float(mark))
+
+
 def _try_dust_flatten(
     cfg, client, portfolio, action, books, marks, rules, state, send_orders, account_fees, unavailable,
     ops_state="SHADOW", guard_blocks=None,
@@ -1010,6 +1065,7 @@ def _try_dust_flatten(
     _ignored, taker = _fee_pair(cfg, rule, account_fees.get(action.symbol))
     floor = float(rule.min_notional or cfg["risk"].get("min_notional_tmn") or 50_000)
     blocked = symbol_block(action.symbol, cfg, unavailable or set(), rule)
+    no_topup = str(ops_state) in {"FLATTEN", "KILLED"}
     plan = plan_dust_flatten(
         qty=position.qty,
         buy_price=float(buy_price),
@@ -1020,10 +1076,19 @@ def _try_dust_flatten(
         cash=portfolio.cash,
         buy_fee=taker,
         market_orders_enabled=bool(rule.market_orders_enabled),
-        buy_allowed=blocked is None,
+        buy_allowed=blocked is None and not no_topup,
+        allow_topup=not no_topup,
     )
     if plan.kind == "sell":
+        if no_topup:
+            rounded = float(round_qty(position.qty, int(rule.qty_decimals)))
+            if rounded <= 0 or rounded * float(sell_price) + 1e-6 < floor:
+                return [], [], _touch_dust(state, action.symbol, position.qty, plan.mark_tmn)
+            book = state.get("dust_book") or {}
+            book.pop(action.symbol, None)
         return None
+    if plan.kind == "dust":
+        return [], [], _touch_dust(state, action.symbol, position.qty, plan.mark_tmn)
     if plan.kind == "residual":
         return [], [], plan.residual(action.symbol, position.qty)
     slip = float(cfg["execution"].get("stop_slippage_bps", 5)) / 10_000

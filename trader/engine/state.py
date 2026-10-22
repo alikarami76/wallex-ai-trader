@@ -23,6 +23,7 @@ def load_state(path: Path, initial_cash: float) -> dict:
         payload.setdefault("client_seq", 1)
         payload.setdefault("liquidity", {})
         payload.setdefault("ops", {})
+        payload.setdefault("dust_book", {})
         return payload
     return fresh_state(initial_cash)
 
@@ -41,6 +42,7 @@ def fresh_state(initial_cash: float) -> dict:
         "client_seq": 1,
         "liquidity": {},
         "ops": {},
+        "dust_book": {},
     }
 
 
@@ -73,6 +75,7 @@ def save_state(path: Path, state: dict) -> None:
         "pending": state["pending"],
         "client_seq": state["client_seq"],
         "liquidity": _trim_liquidity(state.get("liquidity") or {}),
+        "dust_book": state.get("dust_book") or {},
         "ops": {
             key: value
             for key, value in (state.get("ops") or {}).items()

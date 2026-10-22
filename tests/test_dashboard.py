@@ -185,6 +185,8 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("do not render this prompt", html)
         self.assertIn("present", html)
         self.assertIn("Equity", html)
+        self.assertIn("dust_tmn", html)
+        self.assertIn("1,200.00", html)
         self.assertIn("Decision card", html)
         self.assertIn("First block", html)
         self.assertIn("half-spread", html)

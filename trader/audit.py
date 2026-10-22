@@ -74,6 +74,7 @@ def audit_summary(report: dict) -> str:
         f"order_failures: {len(report.get('order_failures') or [])}",
         f"secret_hits: {len(report.get('secret_hits') or [])}",
         f"fee_bill_tmn: {report.get('fee_bill_tmn')}",
+        f"dust_tmn: {report.get('dust_tmn', 0)}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -97,6 +98,7 @@ def build_audit(
     orders = _order_checks(files["decisions.jsonl"], config_hash)
     slippage = _slippage(fills)
     secrets = _secrets(log_dir)
+    dust_tmn = _dust_tmn(cycles)
     snapshot = _snapshot(wallex_snapshot, cash, coins, priced) if wallex_snapshot else None
     failures = []
     if any(item["drift_tmn"] > DRIFT_TMN for item in drift):
@@ -128,6 +130,7 @@ def build_audit(
         "fills": slippage,
         "fee_bill_tmn": round(sum(float(item.get("fee_tmn") or 0) for item in fills), 4),
         "secret_hits": secrets,
+        "dust_tmn": dust_tmn,
         "snapshot": snapshot,
         "rows": {name: len(rows) for name, rows in files.items()},
     }
@@ -146,6 +149,7 @@ def render_markdown(report: dict) -> str:
         "## Fee bill",
         "",
         f"Fee bill: {report['fee_bill_tmn']} TMN.",
+        f"Unsellable dust: {report.get('dust_tmn', 0)} TMN.",
         "",
         "## Fills",
         "",
@@ -192,6 +196,14 @@ def render_markdown(report: dict) -> str:
             lines.append(f"- {item}")
     lines.append("")
     return "\n".join(lines)
+
+
+def _dust_tmn(cycles: list[dict]) -> float:
+    """Latest logged unsellable dust. A journal without the field reports 0."""
+    for row in reversed(cycles):
+        if row.get("dust_tmn") is not None:
+            return round(float(row.get("dust_tmn") or 0), 2)
+    return 0.0
 
 
 def _cycle_rows(files: dict[str, list[dict]]) -> list[dict]:

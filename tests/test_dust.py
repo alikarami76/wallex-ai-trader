@@ -3,6 +3,7 @@ import unittest
 from trader.engine.dust import apply_paper, plan_dust_flatten
 from trader.engine.portfolio import Portfolio
 from trader.engine.runtime import _try_dust_flatten
+from trader.order_guard import OrderIntent, assess
 from trader.risk.manager import Action
 from trader.types import MarketRule
 from trader.wallex.client import WallexClient
@@ -105,7 +106,7 @@ class DustFlattenTests(unittest.TestCase):
             self.assertEqual(placed["request"]["method"], "POST")
             self.assertTrue(placed["request"]["url"].endswith("/v1/account/orders"))
 
-    def test_shadow_liquidation_tops_up_then_sells_on_the_spot_endpoint(self):
+    def test_flatten_and_killed_log_dust_and_never_buy(self):
         portfolio = _portfolio(200_000, qty=100)
         rule = MarketRule("BTCTMN", "BTC", "TMN", 0, 2, 0.01, 50_000, market_orders_enabled=True, last_price=100)
         cfg = {
@@ -116,20 +117,65 @@ class DustFlattenTests(unittest.TestCase):
         }
         action = Action("BTCTMN", "SELL", "LIMIT", 1.0, "liquidation flatten (passive)", "liquidation", "up")
         client = WallexClient(dry_run=True, api_key="test")
-        state = {"client_seq": 0}
+        state = {"client_seq": 4}
         blocks = []
-        result = _try_dust_flatten(
+        for ops_state in ("FLATTEN", "KILLED"):
+            result = _try_dust_flatten(
+                cfg, client, portfolio, action, {}, {"BTCTMN": 100}, {"BTCTMN": rule},
+                state, False, {}, set(), ops_state=ops_state, guard_blocks=blocks,
+            )
+            self.assertIsNotNone(result)
+            fills, requests, residual = result
+            self.assertEqual(fills, [])
+            self.assertEqual(requests, [])
+            self.assertIn("BTCTMN", portfolio.positions)
+            self.assertNotIn("order_guard", residual["reason"])
+            self.assertAlmostEqual(residual["dust_tmn"], 10_000)
+            self.assertEqual(state["client_seq"], 4)
+            self.assertEqual(blocks, [])
+        again = _try_dust_flatten(
             cfg, client, portfolio, action, {}, {"BTCTMN": 100}, {"BTCTMN": rule},
-            state, False, {}, set(), ops_state="FLATTEN", guard_blocks=blocks,
+            state, False, {}, set(), ops_state="KILLED", guard_blocks=blocks,
         )
-        self.assertIsNotNone(result)
-        fills, requests, residual = result
-        self.assertEqual(fills, [])
-        self.assertEqual(requests, [])
-        self.assertIn("BTCTMN", portfolio.positions)
-        self.assertIn("order_guard", residual["reason"])
-        self.assertEqual(state["client_seq"], 0)
-        self.assertEqual(blocks[0]["symbol"], "BTCTMN")
+        self.assertTrue(again[2]["repeat"])
+        self.assertEqual(again[1], [])
+        self.assertEqual(state["client_seq"], 4)
+        killed_buy = assess(OrderIntent(
+            symbol="BTCTMN", side="BUY", order_type="LIMIT", qty=600, price=100, mark=100,
+            endpoint="/v1/account/orders", post_only=True, ops_state="KILLED", held_qty=0,
+            symbol_notional_tmn=10_000, gross_notional_tmn=10_000, equity_tmn=210_000,
+            quote="TMN", base="BTC", allowlist=("BTCTMN",), deny_bases=(), unavailable=(),
+            size_cap=0.12, gross_cap=0.30, min_notional_tmn=50_000,
+        ))
+        self.assertFalse(killed_buy.ok)
+        self.assertIn("LIVE_ARMED", killed_buy.reason)
+
+    def test_flatten_sells_a_position_that_clears_the_minimum(self):
+        portfolio = _portfolio(10_000, qty=600)
+        rule = MarketRule("BTCTMN", "BTC", "TMN", 0, 2, 0.01, 50_000, market_orders_enabled=True, last_price=100)
+        cfg = {
+            "fees": {"maker_rate": 0.0025, "taker_rate": 0.003},
+            "execution": {"stop_slippage_bps": 5},
+            "risk": {"min_notional_tmn": 50_000},
+            "universe": {"allowlist": ["BTCTMN"]},
+        }
+        action = Action("BTCTMN", "SELL", "LIMIT", 1.0, "kill switch flatten", "kill", "down", True)
+        result = _try_dust_flatten(
+            cfg, WallexClient(dry_run=True, api_key="test"), portfolio, action, {},
+            {"BTCTMN": 100}, {"BTCTMN": rule}, {"client_seq": 0}, False, {}, set(),
+            ops_state="FLATTEN",
+        )
+        self.assertIsNone(result)
+
+    def test_disabled_topup_is_dust_even_when_cash_can_fund_it(self):
+        plan = plan_dust_flatten(
+            qty=100, buy_price=100, sell_price=100, min_notional=50_000, min_qty=0.01,
+            qty_decimals=2, cash=200_000, buy_fee=0.003,
+            market_orders_enabled=True, buy_allowed=True, allow_topup=False,
+        )
+        self.assertEqual(plan.kind, "dust")
+        self.assertEqual(plan.buy_qty, 0.0)
+        self.assertAlmostEqual(plan.mark_tmn, 10_000)
 
     def test_shadow_reports_residual_when_the_topup_cannot_be_funded(self):
         portfolio = _portfolio(1_000, qty=100)

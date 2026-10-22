@@ -357,15 +357,24 @@ def run_all(root: Path | None = None) -> int:
         directory = enter(world, clock, root, "i-kill")
         journals["kill"] = directory
         world.scale["BTCTMN"] = 0.30
+        posts = world.order_posts
         drive(world, directory, mode="live", cycles=1, send=True, authorize=True, override=True, fresh=False)
         need(machine(directory) == "KILLED", machine(directory))
-        blob = (directory / "decisions.jsonl").read_text(encoding="utf-8")
-        need("order_guard" in blob, "the crashed exit was not blocked")
-        need("BTCTMN" in positions(directory), "the crashed coin was sold")
-        killed = (
-            "KILLED, coin remains: a 2.5% position under the -1.5% gap is below 50,000 TMN, "
-            "so the exit tries a top-up buy and the guard refuses it outside LIVE_ARMED"
-        )
+        need(world.order_posts == posts, "KILLED posted a top-up or a retry")
+        last = cycles_of(directory)[-1]
+        dust_tmn = float(last.get("dust_tmn") or 0)
+        need(dust_tmn > 0, f"dust_tmn was not logged ({last.get('dust')})")
+        need("BTCTMN" in positions(directory), "the unsellable coin was dropped")
+        need(abs(float(last.get("coin_notional_tmn") or 0) - dust_tmn) < 500, "dust is missing from equity")
+        killed_buy = assess(OrderIntent(
+            symbol="BTCTMN", side="BUY", order_type="LIMIT", qty=0.2, price=1_000_000.0,
+            mark=1_000_000.0, endpoint="/v1/account/orders", post_only=True, ops_state="KILLED",
+            held_qty=0.0, symbol_notional_tmn=0.0, gross_notional_tmn=0.0, equity_tmn=5_000_000.0,
+            quote="TMN", base="BTC", allowlist=("BTCTMN",), deny_bases=(), unavailable=(),
+            size_cap=0.12, gross_cap=0.30,
+        ))
+        need(not killed_buy.ok and "LIVE_ARMED" in killed_buy.reason, killed_buy.reason)
+        killed = f"KILLED, no top-up, dust_tmn {dust_tmn:.0f}, buy still refused"
 
         directory = enter(world, clock, root, "i-halt")
         journals["halt"] = directory
@@ -382,7 +391,7 @@ def run_all(root: Path | None = None) -> int:
         drive(world, directory, mode="live", cycles=1, send=True, authorize=True, override=True, fresh=False)
         need(machine(directory) == "FLATTEN", machine(directory))
         need(flat_book(directory), f"flatten residual {remainder_tmn(directory):.4f} TMN")
-        return f"{killed}; {halted}; FLATTEN sold to TMN. A 2.5% position cannot reach the -3% global kill"
+        return f"{killed}; {halted}; FLATTEN sold to TMN"
 
     def cutoff() -> str:
         world.reset()
@@ -565,7 +574,7 @@ def run_all(root: Path | None = None) -> int:
 
     def dashboard() -> str:
         desk = root / "desk"
-        sources = [journals[name] for name in ("faults", "dip") if name in journals]
+        sources = [journals[name] for name in ("faults", "dip", "kill") if name in journals]
         need(sources, "desk journals missing")
         desk.mkdir(parents=True, exist_ok=True)
         for name in ("cycles.jsonl", "decisions.jsonl", "adjustments.jsonl"):
@@ -595,7 +604,7 @@ def run_all(root: Path | None = None) -> int:
             page = _get(f"http://{host}:{port}/", user="desk", password="desk-secret")
             need(page.status == 200, f"authed desk {page.status}")
             html = page.body
-            for label in ("Decision card", "Equity", "Wallex", "LLM spend", "Adjustments", "Checkpoint", "BTCTMN"):
+            for label in ("Decision card", "Equity", "Wallex", "LLM spend", "Adjustments", "Checkpoint", "BTCTMN", "dust_tmn"):
                 need(label in html, f"panel missing {label}")
             need("429" in html, "Wallex panel has no 429")
             need("desk-secret" not in html, "the desk echoed its password")

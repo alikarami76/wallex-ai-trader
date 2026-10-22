@@ -1,11 +1,12 @@
 """Dust below the 50,000 TMN minimum, at liquidation and other forced exits.
 
-A spot sell under the minimum is rejected by the exchange. The flatten buys
-enough extra base that the buy itself and the combined sell both clear the
-minimum, then sells the whole amount. Both orders are spot
-`POST /v1/account/orders`. OTC and instant convert are not used. When the
-top-up cannot be funded and the symbol cannot take a market order, the coin
-is left in inventory and reported.
+A spot sell under the minimum is rejected by the exchange. Outside FLATTEN
+and KILLED, the flatten can buy enough extra base that the buy itself and
+the combined sell both clear the minimum, then sell the whole amount. Both
+orders are spot `POST /v1/account/orders`. OTC and instant convert are not
+used. FLATTEN and KILLED never place that buy: a held coin that already
+clears the minimum is sold, and anything that cannot be sold is logged as
+dust instead of being retried.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ def plan_dust_flatten(
     buy_fee: float,
     market_orders_enabled: bool,
     buy_allowed: bool,
+    allow_topup: bool = True,
 ) -> DustPlan:
     """How to get this coin back to TMN.
 
@@ -55,7 +57,10 @@ def plan_dust_flatten(
     `topup` is a spot buy of at least the minimum, then a sell of the sum.
     `market` is a spot market sell, used when a top-up cannot be funded and
     the symbol allows market orders.
-    `residual` is reported and left on the book.
+    `dust` is an unsellable remainder. FLATTEN and KILLED pass
+    `allow_topup=False` and get this instead of a buy.
+    `residual` is reported and left on the book when a top-up was allowed
+    but could not be funded.
     """
     qty = float(qty)
     buy_price = float(buy_price or 0)
@@ -66,6 +71,13 @@ def plan_dust_flatten(
         return DustPlan("residual", sell_qty=max(qty, 0.0), mark_tmn=mark, reason="residual coin; no price to sell")
     if floor <= 0 or _clears(qty, sell_price, floor, min_qty):
         return DustPlan("sell", sell_qty=qty, mark_tmn=mark, reason="position clears the minimum order")
+    if not allow_topup:
+        return DustPlan(
+            "dust",
+            sell_qty=qty,
+            mark_tmn=mark,
+            reason="unsellable dust; a top-up buy is not used",
+        )
 
     fee = min(max(float(buy_fee or 0), 0.0), 0.05)
     keep = 1 - fee
