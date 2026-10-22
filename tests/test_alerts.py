@@ -8,7 +8,17 @@ from types import SimpleNamespace
 
 import trader.alerts as alerts
 import trader.engine.runtime as runtime
-from trader.alerts import _last_sent, notify, report_cycle, send_decision, send_skips, send_update
+from trader.alerts import (
+    _last_sent,
+    classify_hold,
+    format_hold,
+    notify,
+    report_cycle,
+    send_decision,
+    send_hold,
+    send_skips,
+    send_update,
+)
 from trader.engine.runtime import _relay_orders
 from trader.risk.manager import Action
 
@@ -17,6 +27,7 @@ class AlertTests(unittest.TestCase):
     def setUp(self):
         _last_sent.clear()
         alerts._skip_sent = None
+        alerts.reset_hold_notice()
         self._env = {
             "TELEGRAM_ALERT_BOT_TOKEN": os.environ.get("TELEGRAM_ALERT_BOT_TOKEN"),
             "TELEGRAM_ALERT_CHAT_ID": os.environ.get("TELEGRAM_ALERT_CHAT_ID"),
@@ -32,6 +43,7 @@ class AlertTests(unittest.TestCase):
                 os.environ[key] = value
         _last_sent.clear()
         alerts._skip_sent = None
+        alerts.reset_hold_notice()
 
     def _arm(self):
         os.environ["TELEGRAM_ALERT_BOT_TOKEN"] = "123456:secret-token"
@@ -104,6 +116,7 @@ class DecisionPostTests(unittest.TestCase):
     def setUp(self):
         _last_sent.clear()
         alerts._skip_sent = None
+        alerts.reset_hold_notice()
         self._env = {
             "TELEGRAM_ALERT_BOT_TOKEN": os.environ.get("TELEGRAM_ALERT_BOT_TOKEN"),
             "TELEGRAM_ALERT_CHAT_ID": os.environ.get("TELEGRAM_ALERT_CHAT_ID"),
@@ -122,6 +135,7 @@ class DecisionPostTests(unittest.TestCase):
                 os.environ[key] = value
         _last_sent.clear()
         alerts._skip_sent = None
+        alerts.reset_hold_notice()
 
     def _arm(self):
         os.environ["TELEGRAM_ALERT_BOT_TOKEN"] = "123456:secret-token"
@@ -312,6 +326,207 @@ class DecisionPostTests(unittest.TestCase):
             ),
             [],
         )
+
+
+class HoldPostTests(unittest.TestCase):
+    def setUp(self):
+        alerts.reset_hold_notice()
+        self._env = {
+            "TELEGRAM_ALERT_BOT_TOKEN": os.environ.get("TELEGRAM_ALERT_BOT_TOKEN"),
+            "TELEGRAM_ALERT_CHAT_ID": os.environ.get("TELEGRAM_ALERT_CHAT_ID"),
+            "TELEGRAM_TRADES_CHAT_ID": os.environ.get("TELEGRAM_TRADES_CHAT_ID"),
+        }
+        os.environ.pop("TELEGRAM_ALERT_BOT_TOKEN", None)
+        os.environ.pop("TELEGRAM_ALERT_CHAT_ID", None)
+        os.environ.pop("TELEGRAM_TRADES_CHAT_ID", None)
+        self.when = datetime(2026, 10, 23, 17, 31, tzinfo=timezone.utc)
+
+    def tearDown(self):
+        for key, value in self._env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        alerts.reset_hold_notice()
+
+    def _arm(self):
+        os.environ["TELEGRAM_ALERT_BOT_TOKEN"] = "123456:secret-token"
+        os.environ["TELEGRAM_TRADES_CHAT_ID"] = "-1003898687684"
+
+    def _capture(self):
+        calls = []
+
+        def post(url, body):
+            calls.append(json.loads(body.decode()))
+
+        return calls, post
+
+    def _features(self):
+        return [
+            SimpleNamespace(symbol="BTCTMN", blockers=["trend structure off", "24h return 0.20% below 1.00%"]),
+            SimpleNamespace(symbol="ETHTMN", blockers=["24h return -1.00% below 1.00%", "spread 40.0 bps too wide"]),
+            SimpleNamespace(symbol="SOLTMN", blockers=["24h return 0.10% below 1.00%"]),
+        ]
+
+    def test_filter_hold_names_the_main_gate_and_the_book(self):
+        reason, names = classify_hold(
+            features=self._features(),
+            candidates=[],
+            zscore_n=25,
+            zscore_min=18,
+            entries_allowed=True,
+            entries_blocked=False,
+            block_reason="",
+            cutoff_reason="",
+        )
+        self.assertEqual(names, [])
+        self.assertIn("no candidates passed the filters (3 symbols, main filter return_24h 3)", reason)
+        self.assertIn("ema 1", reason)
+        self.assertIn("spread 1", reason)
+        text = format_hold(
+            when=self.when, ops_state="LIVE_ARMED", reason=reason, cash=4_900_000, positions=[],
+        )
+        self.assertIn("2026-10-23 21:01 +0330", text)
+        self.assertIn("LIVE_ARMED", text)
+        self.assertIn("\nHOLD\n", text)
+        self.assertIn("cash 4,900,000.00 TMN · flat", text)
+
+    def test_ev_warmup_cutoff_and_llm_rationale(self):
+        ev, _names = classify_hold(
+            features=[SimpleNamespace(blockers=["edge 0.45% does not clear cost 0.72%"])],
+            candidates=[],
+            zscore_n=25,
+            zscore_min=18,
+            entries_allowed=True,
+            entries_blocked=False,
+            block_reason="",
+            cutoff_reason="",
+        )
+        self.assertTrue(ev.startswith("EV below the fee hurdle (1 symbols, ev 1)"))
+        warm, _names = classify_hold(
+            features=[],
+            candidates=[],
+            zscore_n=6,
+            zscore_min=18,
+            entries_allowed=False,
+            entries_blocked=True,
+            block_reason="zscore_warmup",
+            cutoff_reason="zscore_warmup",
+        )
+        self.assertEqual(warm, "warm-up not complete (6/18)")
+        blocked, names = classify_hold(
+            features=[],
+            candidates=[SimpleNamespace(symbol="BTCTMN")],
+            zscore_n=25,
+            zscore_min=18,
+            entries_allowed=False,
+            entries_blocked=True,
+            block_reason="entry_cutoff",
+            cutoff_reason="entry_cutoff",
+        )
+        self.assertEqual(blocked, "risk/cutoff blocking entry: entry cutoff")
+        self.assertEqual(names, ["BTCTMN"])
+        long = "x" * 400
+        decision = SimpleNamespace(
+            comment="ignored when a hold rationale exists",
+            decisions=[SimpleNamespace(action="HOLD", rationale=long)],
+        )
+        text, names = classify_hold(
+            features=[],
+            candidates=[SimpleNamespace(symbol="ETH TMN")],
+            zscore_n=25,
+            zscore_min=18,
+            entries_allowed=True,
+            entries_blocked=False,
+            block_reason="shadow",
+            cutoff_reason="shadow",
+            decision=decision,
+        )
+        self.assertEqual(len(text), 300)
+        self.assertEqual(text, long[:300])
+        self.assertEqual(names, ["ETH TMN"])
+
+    def test_identical_holds_wait_fifteen_minutes_and_a_new_reason_posts(self):
+        calls, post = self._capture()
+        kwargs = dict(
+            mode="live", ops_state="LIVE_ARMED", when=self.when,
+            reason="no candidates passed the filters (6 symbols, main filter ema 6)",
+            candidates=[], cash=1_000_000, positions=[("BTCTMN", 0.01)], post=post,
+        )
+        self.assertFalse(send_hold(**kwargs, now=1))
+        self._arm()
+        self.assertTrue(send_hold(**kwargs, now=1))
+        self.assertFalse(send_hold(**kwargs, now=2))
+        self.assertFalse(send_hold(**kwargs, now=1 + 899))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("HOLD", calls[0]["text"])
+        self.assertIn("main filter ema 6", calls[0]["text"])
+        self.assertIn("cash 1,000,000.00 TMN · BTCTMN 0.01", calls[0]["text"])
+        self.assertNotIn("[SHADOW]", calls[0]["text"])
+        self.assertEqual(calls[0]["chat_id"], "-1003898687684")
+        self.assertTrue(send_hold(**kwargs, now=1 + 900))
+        self.assertIn("still holding (4 cycles), same reason", calls[1]["text"])
+        self.assertNotIn("\nHOLD\n", calls[1]["text"])
+        changed = dict(kwargs, reason="EV below the fee hurdle (6 symbols, ev 6)")
+        self.assertTrue(send_hold(**changed, now=1 + 901))
+        self.assertIn("EV below the fee hurdle", calls[2]["text"])
+        self.assertIn("\nHOLD\n", calls[2]["text"])
+        other = dict(kwargs, candidates=["XRPTMN"])
+        self.assertTrue(send_hold(**other, now=1 + 902))
+        self.assertEqual(len(calls), 4)
+
+    def test_shadow_prefix_and_a_failed_hold_stay_quiet(self):
+        calls, post = self._capture()
+        self._arm()
+
+        def explode(url, body):
+            raise RuntimeError(url)
+
+        with self.assertLogs("trader.alerts", level="WARNING") as captured:
+            sent = send_hold(
+                mode="shadow", ops_state="SHADOW", when=self.when, reason="warm-up not complete (4/18)",
+                candidates=[], cash=500, positions=[], post=explode, now=5,
+            )
+        self.assertFalse(sent)
+        blob = "\n".join(captured.output)
+        self.assertNotIn("secret-token", blob)
+        self.assertIn("RuntimeError", blob)
+        self.assertTrue(send_hold(
+            mode="shadow", ops_state="SHADOW", when=self.when, reason="warm-up not complete (4/18)",
+            candidates=[], cash=500, positions=[], post=post, now=5 + 900,
+        ))
+        self.assertTrue(calls[0]["text"].startswith("[SHADOW] "))
+        self.assertIn("SHADOW", calls[0]["text"])
+        self.assertIn("still holding (2 cycles), same reason", calls[0]["text"])
+
+    def test_a_trade_cycle_does_not_also_post_hold(self):
+        calls, post = self._capture()
+        self._arm()
+        original = runtime.send_hold
+        runtime.send_hold = lambda **kwargs: original(**kwargs, post=post)
+        try:
+            runtime._relay_hold(
+                "live", self.when, {"state": "LIVE_ARMED"},
+                SimpleNamespace(entries_blocked=False, block_reason=""),
+                SimpleNamespace(zscore_n=25),
+                {"ops": {"zscore_min_n": 18}},
+                [], [], None,
+                SimpleNamespace(actions=[SimpleNamespace(side="SELL")], rejected=[]),
+                True, "", SimpleNamespace(cash=10, positions={}),
+            )
+            runtime._relay_hold(
+                "live", self.when, {"state": "LIVE_ARMED"},
+                SimpleNamespace(entries_blocked=False, block_reason=""),
+                SimpleNamespace(zscore_n=25),
+                {"ops": {"zscore_min_n": 18}},
+                self._features(), [], None,
+                SimpleNamespace(actions=[], rejected=[]),
+                True, "", SimpleNamespace(cash=10, positions={}),
+            )
+        finally:
+            runtime.send_hold = original
+        self.assertEqual(len(calls), 1)
+        self.assertIn("main filter return_24h 3", calls[0]["text"])
 
 
 if __name__ == "__main__":

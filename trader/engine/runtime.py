@@ -59,7 +59,7 @@ from trader.strategy.quotes import execution_cost, inventory_skew, maker_buy_lim
 from trader.strategy.signals import build_candidates, evaluate_symbol
 from trader.timeutil import iso, now_tehran
 from trader.types import Bar, MarketRule
-from trader.alerts import notify, report_cycle, send_decision, send_skips, send_update
+from trader.alerts import classify_hold, notify, report_cycle, send_decision, send_hold, send_skips, send_update
 from trader.order_guard import OrderIntent, assess
 from trader.scorecard import seal_signals
 from trader.wallex.client import (
@@ -1034,6 +1034,10 @@ def _cycle(
         entry_taker_fills=entry_taker_fills,
     )
     _relay_skips(mode, now, candidates, features, planned.rejected)
+    _relay_hold(
+        mode, now, ops, view, facts, cfg, features, candidates, decision,
+        planned, allowed, cutoff_reason, portfolio,
+    )
     ops["last_cycle_unix"] = now_unix
     _emit_contract(
         journal.directory, cfg, state, ops, facts, now, mode, send_orders, equity, portfolio,
@@ -1988,6 +1992,38 @@ def _relay_cancel(mode, when, row: dict) -> None:
             side=str(row.get("side") or ""), order_type=str(row.get("order_type") or ""),
             status="CANCEL", price=None, qty=None, qty_total=None, pnl=None,
             client_id=str(row.get("client_id") or ""),
+        )
+    except Exception as exc:
+        log.warning("telegram note failed: %s", type(exc).__name__)
+
+
+def _relay_hold(
+    mode, when, ops, view, facts, cfg, features, candidates, decision, planned, allowed, cutoff_reason, portfolio,
+) -> None:
+    """Tell the trades channel why this cycle held. Never affects the book."""
+    try:
+        if any(getattr(action, "side", "") in {"BUY", "SELL"} for action in planned.actions):
+            return
+        reason, names = classify_hold(
+            features=features,
+            candidates=candidates,
+            zscore_n=getattr(facts, "zscore_n", 0),
+            zscore_min=int((cfg.get("ops") or {}).get("zscore_min_n", 18)),
+            entries_allowed=bool(allowed),
+            entries_blocked=bool(getattr(view, "entries_blocked", False)),
+            block_reason=str(getattr(view, "block_reason", "") or ""),
+            cutoff_reason=str(cutoff_reason or ""),
+            decision=decision,
+            rejected=getattr(planned, "rejected", None),
+        )
+        send_hold(
+            mode=mode,
+            ops_state=str(ops.get("state") or ""),
+            when=when,
+            reason=reason,
+            candidates=names,
+            cash=portfolio.cash,
+            positions=[(item.symbol, item.qty) for item in portfolio.positions.values()],
         )
     except Exception as exc:
         log.warning("telegram note failed: %s", type(exc).__name__)
