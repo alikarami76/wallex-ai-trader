@@ -23,10 +23,29 @@ from trader.engine.journal import Journal
 from trader.engine.portfolio import Portfolio
 from trader.engine.state import load_state, save_state
 from trader.engine.universe import explain_universe, select_universe, symbol_block
-from trader.risk.manager import RiskManager, roll_day
+from trader.engine.ops import (
+    Facts,
+    apply_frozen_cost_gate,
+    attach_evidence,
+    cost_gate_view,
+    entries_allowed,
+    emit_cycle_logs,
+    first_block,
+    gate_trace,
+    gates_from_feature,
+    advance,
+    key_presence,
+    load_ops,
+    llm_override_warning,
+    next_client_id,
+    set_log_context,
+    stamp,
+    text_hash,
+)
+from trader.risk.manager import Action, RiskManager, roll_day
 from trader.sentiment import SentimentFeed
 from trader.strategy.agent import TradingAgent
-from trader.strategy.quotes import inventory_skew, maker_buy_limit, maker_sell_limit
+from trader.strategy.quotes import execution_cost, inventory_skew, maker_buy_limit, maker_sell_limit
 from trader.strategy.signals import build_candidates, evaluate_symbol
 from trader.timeutil import iso, now_tehran
 from trader.types import Bar, MarketRule
@@ -101,6 +120,10 @@ def run_runtime(
         positions=[row.symbol for row in state["portfolio"].positions.values()],
     )
     log.info("starting %s dry_run=%s data=%s", mode, not send_orders, out_dir)
+    warning = llm_override_warning()
+    if warning:
+        log.warning("%s", warning)
+    set_log_context(cfg, load_ops(state).get("go_live_sha"))
     signal.signal(signal.SIGTERM, _request_stop)
     try:
         _run_loop(
@@ -134,12 +157,19 @@ def _run_loop(
     rules = _load_rules(client)
     unavailable = _load_bans(client, int(cfg["exchange"]["package_id"]))
     account_fees: dict[str, tuple[float, float]] = {}
-    if send_orders:
+    if api_key:
         try:
             account_fees = client.get_fees()
+            ops = load_ops(state)
+            rates = list(account_fees.values())
+            if rates:
+                ops["fee_maker_bps"] = max(pair[0] for pair in rates) * 10_000
+                ops["fee_taker_bps"] = max(pair[1] for pair in rates) * 10_000
+            ops["fee_fetched_at"] = iso()
             log.info("loaded account fees for %s symbols", len(account_fees))
         except WallexError as exc:
             log.warning("account fee endpoint unavailable, using config fees: %s", exc)
+    if send_orders:
         _reconcile(client, state, rules)
 
     universe, spreads = _refresh_universe(client, cfg, rules, unavailable)
@@ -208,12 +238,239 @@ def _run_loop(
         time.sleep(loop_seconds)
 
 
+def _emit_contract(
+    directory, cfg, state, ops, facts, now, mode, send_orders, equity, portfolio,
+    view, universe, unavailable, features, decision, planned, requests, fills, residuals,
+    latency_ms, allowed, cutoff_reason, adjustment_rows, order_errors, order_rejects,
+    entry_taker_fills, cancel_errors, b9_skips, maker_rate, taker_rate, hurdle,
+) -> None:
+    """Append the contract logs. Rows are stamped and secrets are presence-only."""
+    ops["cycle_seq"] = int(ops.get("cycle_seq") or 0) + 1
+    cycle_id = f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}#{ops['cycle_seq']:05d}"
+    usage = decision.usage or {}
+    if decision.source == "llm_cache":
+        llm_source = "llm_cache"
+    elif decision.source == "llm":
+        llm_source = "llm"
+    else:
+        llm_source = "fallback"
+    minimum = int((cfg.get("ops") or {}).get("zscore_min_n", 18))
+    ban_hash = text_hash("\n".join(sorted(unavailable))) if unavailable else ""
+    dust = []
+    for position in portfolio.positions.values():
+        notional = position.qty * position.entry_price
+        if notional < float(cfg["risk"]["min_notional_tmn"]):
+            dust.append({"symbol": position.symbol, "notional_tmn": round(notional, 2)})
+    mode_label = "dry-run" if mode == "live" and not send_orders else mode
+    golive = ops.get("go_live_equity")
+    pnl_pct = None if not golive else (equity / float(golive) - 1)
+    symbol_rows = []
+    block_counts: dict[str, int] = {}
+    n_cost = 0
+    for row in features:
+        compact = row.compact()
+        extra_gates = {}
+        veto = any(item.symbol == row.symbol and item.veto for item in decision.decisions)
+        extra_gates["llm_veto"] = (not veto, decision.picked_id or decision.source, None)
+        low_conf = any(
+            item.symbol == row.symbol and item.action == "BUY" and item.confidence < float(cfg["risk"]["min_confidence"])
+            for item in decision.decisions
+        )
+        extra_gates["llm_confidence"] = (not low_conf, None, cfg["risk"]["min_confidence"])
+        shrunk = any(item.symbol == row.symbol and item.size_fraction not in (None, 1) for item in decision.decisions)
+        extra_gates["llm_shrink"] = (True, None, None)
+        if shrunk:
+            extra_gates["llm_shrink"] = (True, "shrunk", None)
+        reasons = " ".join(
+            str(item.get("reason") or "") for item in planned.rejected if item.get("symbol") == row.symbol
+        ).lower()
+        extra_gates["risk_cap"] = ("cap" not in reasons, None, cfg["risk"].get("max_fraction_per_trade"))
+        extra_gates["risk_gross"] = ("gross" not in reasons and "exposure" not in reasons, None, cfg["risk"].get("max_gross_exposure"))
+        extra_gates["risk_throttle"] = ("hour" not in reasons and "cooldown" not in reasons, None, None)
+        extra_gates["risk_kill"] = (not view.kill_switch, view.kill_reason, cfg["risk"].get("daily_max_drawdown"))
+        extra_gates["risk_cutoff"] = (allowed or cutoff_reason not in {"entry_cutoff", "flatten", "halt"}, cutoff_reason, None)
+        below_min = "b9" in reasons or "notional" in reasons
+        extra_gates["min_notional"] = (not below_min, None, cfg["risk"].get("min_notional_tmn"))
+        trace = gate_trace(gates_from_feature(compact, cfg, {"symbol": row.symbol, "gates": extra_gates}))
+        blocked = first_block(trace)
+        if blocked:
+            block_counts[blocked] = block_counts.get(blocked, 0) + 1
+        if compact.get("expected_gross") and compact.get("round_trip_cost"):
+            if float(compact["expected_gross"]) > float(compact["round_trip_cost"]) * float(cfg["strategy"]["edge_multiple"]):
+                n_cost += 1
+        position = portfolio.positions.get(row.symbol)
+        fill = next((item for item in fills if item.symbol == row.symbol), None)
+        reject = next((item for item in planned.rejected if item.get("symbol") == row.symbol), None)
+        replay = getattr(decision, "replay", None) or {}
+        symbol_rows.append({
+            "record": "symbol",
+            "cycle_id": cycle_id,
+            "symbol": row.symbol,
+            "gate_trace": trace,
+            "first_block": blocked,
+            "cost_gate": cost_gate_view(row, cfg, maker=maker_rate, taker=taker_rate),
+            "llm": {
+                "tier": usage.get("tier"),
+                "model": usage.get("model"),
+                "source": llm_source,
+                "confidence": next((item.confidence for item in decision.decisions if item.symbol == row.symbol), None),
+                "action": next((item.action for item in decision.decisions if item.symbol == row.symbol), None),
+                "size_mult": ops.get("size_multiplier"),
+                "veto": veto,
+                "prompt_hash": text_hash(replay.get("prompt") or "") if replay else None,
+                "response_hash": text_hash(replay.get("response") or "") if replay else None,
+                "tokens_in": usage.get("prompt_tokens"),
+                "tokens_out": usage.get("completion_tokens"),
+                "usage_cost_usd": usage.get("usd"),
+            },
+            "risk": {
+                "verdict": "reject" if reject else "pass",
+                "size_before": None,
+                "size_after": ops.get("size_multiplier"),
+                "reason_codes": [reject["reason"]] if reject else [],
+            },
+            "liquidity": {
+                "depth_1pct_tmn": compact.get("depth_100_tmn"),
+                "spread_bps": compact.get("spread_bps"),
+                "z_depth": compact.get("depth_z"),
+                "z_spread": compact.get("spread_z"),
+                "z_volume": compact.get("volume_z"),
+                "z_n": facts.zscore_n,
+                "size_scale": compact.get("liquidity_scale"),
+            },
+            "order": None if fill is None and reject is None else {
+                "client_id": None if fill is None else fill.client_id,
+                "side": None if fill is None else fill.side,
+                "type": None if fill is None else fill.order_type,
+                "limit_price": None if fill is None else fill.price,
+                "qty": None if fill is None else fill.qty,
+                "notional_tmn": None if fill is None else fill.notional_tmn,
+                "status": "rejected" if fill is None else "filled",
+                "reject_reason": None if reject is None else reject.get("reason"),
+                "filled_qty": None if fill is None else fill.qty,
+                "fee_tmn": None if fill is None else fill.fee_tmn,
+                "liquidity_flag": None if fill is None else ("taker" if fill.order_type == "MARKET" else "maker"),
+            },
+            "position_after": None if position is None else {
+                "qty": position.qty,
+                "avg_px": position.entry_price,
+                "unrealized_tmn": None,
+                "hold_minutes": round((time.time() - position.entry_time) / 60, 1),
+            },
+        })
+    if b9_skips:
+        adjustment_rows = list(adjustment_rows) + [{
+            "action": "A0_NO_CHANGE",
+            "state_before": ops["state"],
+            "state_after": ops["state"],
+            "param": "min_notional",
+            "old": b9_skips,
+            "new": 0,
+            "evidence_cycle_ids": [cycle_id],
+            "actor": "bot",
+            "playbook_rule": "B9",
+            "note": "notional below 50,000 TMN was skipped and not sent",
+            "corrects": None,
+            "rejected_action": None,
+            "applied": True,
+        }]
+    cycle = {
+        "record": "cycle",
+        "cycle_id": cycle_id,
+        "mode": mode_label,
+        "state": ops["state"],
+        "loop_latency_ms": round(latency_ms, 1),
+        "universe": list(universe),
+        "ban_list_hash": ban_hash,
+        "denylist_hits": list(facts.dropped),
+        "fee_maker_bps": round(maker_rate * 10_000, 4),
+        "fee_taker_bps": round(taker_rate * 10_000, 4),
+        "fee_fetched_at": ops.get("fee_fetched_at"),
+        "fee_hurdle": hurdle,
+        "equity_tmn": round(equity, 2),
+        "free_tmn": round(portfolio.cash, 2),
+        "coin_notional_tmn": round(max(0.0, equity - portfolio.cash), 2),
+        "dust": dust,
+        "pnl_from_golive_tmn": None if pnl_pct is None else round(equity - float(golive), 2),
+        "pnl_from_golive_pct": pnl_pct,
+        "daily_pnl_pct": (equity / view.day_start_equity - 1) if view.day_start_equity else None,
+        "drawdown_pct": view.drawdown,
+        "kill_switch": view.kill_switch,
+        "entries_allowed": allowed,
+        "cutoff_reason": cutoff_reason or None,
+        "size_multiplier": ops.get("size_multiplier"),
+        "ev_override": bool(ops.get("locked") and ops.get("ev_override")),
+        "open_positions": [position.symbol for position in portfolio.positions.values()],
+        "open_orders": list((state.get("pending") or {}).keys()),
+        "n_quant_pass": sum(1 for row in features if row.signal),
+        "n_cost_pass": n_cost,
+        "n_llm_veto": sum(1 for item in decision.decisions if item.veto),
+        "n_orders_submitted": len(requests),
+        "n_orders_rejected": order_rejects,
+        "n_fills": len(fills),
+        "n_entry_taker_fills": entry_taker_fills,
+        "n_cancel_errors": cancel_errors,
+        "block_counts": block_counts,
+        "llm_tier": usage.get("tier"),
+        "llm_model": usage.get("model"),
+        "llm_source": llm_source,
+        "llm_usd": usage.get("usd") or 0,
+        "llm_usd_today": usage.get("spent_today_usd") or usage.get("spent_usd") or 0,
+        "llm_usd_total": usage.get("spent_usd") or 0,
+        "veto_all": decision.veto_all,
+        "zscore_n": facts.zscore_n,
+        "zscore_ready": facts.zscore_n >= minimum,
+        "errors": order_errors,
+        "stop_fired": any(action.source == "stop" for action in planned.actions),
+        "unprotected_positions": len(facts.unprotected),
+        "residuals": residuals,
+        **key_presence(),
+    }
+    replay = getattr(decision, "replay", None) or {}
+    if replay:
+        replay = {**replay, "model": usage.get("model")}
+    emit_cycle_logs(directory, cycle, symbol_rows, attach_evidence(adjustment_rows, cycle_id), replay or None)
+
+
+def _zscore_n(state: dict, universe: list[str]) -> int:
+    counts = []
+    liquidity = state.get("liquidity") or {}
+    for symbol in universe:
+        depth = (liquidity.get(symbol) or {}).get("depth") or []
+        if depth:
+            counts.append(max(0, len(depth) - 1))
+    return min(counts) if counts else 0
+
+
+def _unprotected(state: dict, marks: dict, threshold: float) -> list[str]:
+    pending_stops = {
+        row.get("symbol")
+        for row in (state.get("pending") or {}).values()
+        if str(row.get("order_type") or "").upper().startswith("STOP")
+    }
+    found = []
+    for symbol, position in state["portfolio"].positions.items():
+        if symbol in pending_stops or position.entry_price <= 0:
+            continue
+        mark = marks.get(symbol, position.entry_price)
+        if mark / position.entry_price - 1 <= threshold:
+            found.append(symbol)
+    return found
+
+
 def _cycle(
     cfg, mode, client, agent, risk, journal, state, state_path,
     rules, unavailable, account_fees, universe, spreads, hourly, micro,
     send_orders: bool, sentiment: SentimentFeed | None = None,
 ) -> None:
     started = time.perf_counter()
+    ops = load_ops(state)
+    denied_now = [
+        symbol for symbol in universe
+        if symbol_block(symbol, cfg, unavailable, rules.get(symbol))
+    ]
+    dropped = set(ops.get("dropped_symbols") or [])
+    universe = [symbol for symbol in universe if symbol not in dropped and symbol not in denied_now]
     books = _books_for(client, universe)
     marks = {}
     for symbol in universe:
@@ -234,9 +491,9 @@ def _cycle(
     now = now_tehran()
     now_unix = time.time()
     equity_now = portfolio.equity(marks) if marks else portfolio.cash
-    state["day_key"], state["day_start_equity"] = roll_day(state["day_key"], now, equity_now)
-    if not state["day_key"]:
-        state["day_key"], state["day_start_equity"] = roll_day("", now, equity_now)
+    state["day_key"], state["day_start_equity"] = roll_day(
+        state["day_key"], now, equity_now, state.get("day_start_equity"),
+    )
 
     mood = sentiment.snapshot(universe) if sentiment is not None else None
     sentiment_calls: list[dict] = []
@@ -271,6 +528,9 @@ def _cycle(
             )
         )
         feature_by_symbol[symbol] = features[-1]
+    apply_frozen_cost_gate(
+        features, cfg, locked_override=bool(ops.get("locked") and ops.get("ev_override")),
+    )
     candidates = build_candidates(features, cfg)
     if mood is not None and not sentiment_calls and not candidates and not portfolio.positions:
         sentiment_calls = agent.apply_sentiment(mood, now_unix, allow_network=True)
@@ -288,6 +548,33 @@ def _cycle(
     state["peak_equity"] = view.peak_equity
     state["kill_switch"] = view.kill_switch
     state["kill_reason"] = view.kill_reason
+    kindest = min((value for value in spreads.values() if value is not None), default=0.0)
+    maker_rate = float(ops["fee_maker_bps"]) / 10_000 if ops.get("fee_maker_bps") is not None else float(cfg["fees"]["maker_rate"])
+    taker_rate = float(ops["fee_taker_bps"]) / 10_000 if ops.get("fee_taker_bps") is not None else float(cfg["fees"]["taker_rate"])
+    hurdle = float(cfg["strategy"]["edge_multiple"]) * execution_cost(cfg, maker_rate, taker_rate, kindest)
+    threshold = float((cfg.get("ops") or {}).get("unprotected_stop_pnl", -0.02))
+    facts = Facts(
+        now=now,
+        mode=mode,
+        send_orders=send_orders,
+        equity=equity_now,
+        daily_drawdown=view.daily_drawdown,
+        global_drawdown=view.drawdown,
+        kill_switch=view.kill_switch,
+        zscore_n=_zscore_n(state, universe),
+        fee_hurdle=hurdle,
+        fee_maker_bps=maker_rate * 10_000,
+        fee_taker_bps=taker_rate * 10_000,
+        phase=view.phase,
+        dropped=tuple(denied_now),
+        unprotected=tuple(_unprotected(state, marks, threshold)),
+    )
+    pre_rows = advance(ops, facts, cfg, stage="pre")
+    set_log_context(cfg, ops.get("go_live_sha"))
+    allowed, cutoff_reason = entries_allowed(ops, facts, cfg)
+    if not allowed:
+        view.entries_blocked = True
+        view.block_reason = view.block_reason or cutoff_reason
     liquidity = {row.symbol: row.liquidity for row in features if row.liquidity is not None}
     menu = risk.legal_menu(
         portfolio=portfolio,
@@ -325,9 +612,42 @@ def _cycle(
         liquidity=liquidity,
         features=features,
     )
+    min_notional = float(cfg["risk"]["min_notional_tmn"])
+    multiplier = float(ops.get("size_multiplier") or 1.0)
+    kept_actions = []
+    b9_skips = 0
+    for action in planned.actions:
+        if action.side == "BUY":
+            action.size_fraction = float(action.size_fraction) * multiplier
+            notional = float(action.size_fraction) * float(view.equity)
+            if notional < min_notional:
+                planned.rejected.append({"symbol": action.symbol, "reason": "B9 notional below 50000 TMN"})
+                b9_skips += 1
+                continue
+        kept_actions.append(action)
+    planned.actions = kept_actions
+    for symbol in facts.unprotected:
+        if any(item.symbol == symbol and item.side == "SELL" for item in planned.actions):
+            continue
+        if symbol not in portfolio.positions:
+            continue
+        planned.actions.append(Action(
+            symbol=symbol,
+            side="SELL",
+            order_type="MARKET",
+            size_fraction=1.0,
+            reason="B10 no working stop and position is at or below -2%",
+            source="b10",
+            price_direction="down",
+            aggressive=True,
+        ))
     fills = []
     requests = []
     residuals = []
+    order_errors = []
+    order_rejects = 0
+    entry_taker_fills = 0
+    cancel_errors = 0
     pending_symbols = {row.get("symbol") for row in state.get("pending", {}).values()}
     for action in planned.actions:
         if action.source == "cancel":
@@ -337,6 +657,7 @@ def _cycle(
             else:
                 requests.append(cancelled)
                 if cancelled.get("error"):
+                    cancel_errors += 1
                     planned.rejected.append({"symbol": action.symbol, "reason": cancelled["error"]})
             continue
         if action.symbol in pending_symbols:
@@ -366,6 +687,13 @@ def _cycle(
                 feature_by_symbol.get(action.symbol), unavailable,
             )
         except (WallexError, OrderRejected) as exc:
+            order_rejects += 1
+            order_errors.append({
+                "endpoint": "/v1/account/orders",
+                "http_status": getattr(exc, "status", None),
+                "client_id": action.client_order_id or None,
+                "message": str(exc),
+            })
             planned.rejected.append({"symbol": action.symbol, "reason": str(exc)})
             continue
         if request:
@@ -376,6 +704,8 @@ def _cycle(
             journal.trade(_trade_row(fill, now, mode))
             if fill.side == "SELL" and action.source == "stop":
                 state["cooldowns"][action.symbol] = now_unix + float(cfg["risk"]["cooldown_after_stop_seconds"])
+            if fill.side == "BUY" and (action.order_type == "MARKET" or action.aggressive):
+                entry_taker_fills += 1
     equity = portfolio.equity(marks) if marks else portfolio.cash
     state["peak_equity"] = max(state["peak_equity"], equity)
     journal.equity({
@@ -387,6 +717,19 @@ def _cycle(
         "peak_tmn": round(state["peak_equity"], 2),
     })
     latency_ms = (time.perf_counter() - started) * 1000
+    golive_equity = ops.get("go_live_equity")
+    facts.order_rejects = order_rejects
+    facts.entry_taker_fills = entry_taker_fills
+    facts.equity = equity
+    facts.pnl_from_golive_pct = None if not golive_equity else (equity / float(golive_equity) - 1)
+    post_rows = advance(ops, facts, cfg, stage="post")
+    allowed, cutoff_reason = entries_allowed(ops, facts, cfg)
+    _emit_contract(
+        journal.directory, cfg, state, ops, facts, now, mode, send_orders, equity, portfolio,
+        view, universe, unavailable, features, decision, planned, requests, fills, residuals,
+        latency_ms, allowed, cutoff_reason, pre_rows + post_rows, order_errors, order_rejects,
+        entry_taker_fills, cancel_errors, b9_skips, maker_rate, taker_rate, hurdle,
+    )
     journal.decision({
         "timestamp": iso(now),
         "mode": mode,
@@ -417,6 +760,8 @@ def _cycle(
         cash_tmn=round(portfolio.cash, 2),
         phase=view.phase,
         kill_switch=view.kill_switch,
+        ops_state=ops["state"],
+        entries_allowed=allowed,
         positions=[
             {"symbol": row.symbol, "qty": row.qty}
             for row in portfolio.positions.values()
@@ -425,8 +770,8 @@ def _cycle(
         last_error="",
     )
     log.info(
-        "%s equity=%.0f exposure=%.1f%% phase=%s candidates=%s actions=%s source=%s tier=%s pick=%s",
-        mode, equity, view.gross_exposure * 100, view.phase, len(candidates),
+        "%s state=%s equity=%.0f exposure=%.1f%% phase=%s candidates=%s actions=%s source=%s tier=%s pick=%s",
+        mode, ops["state"], equity, view.gross_exposure * 100, view.phase, len(candidates),
         len(planned.actions), decision.source, (decision.usage or {}).get("tier") or "-",
         decision.picked_id or "-",
     )
@@ -984,8 +1329,7 @@ def _fee_pair(cfg, rule, account) -> tuple[float, float]:
 
 
 def _next_id(state) -> str:
-    state["client_seq"] = int(state.get("client_seq") or 0) + 1
-    return f"SC{int(time.time())}{state['client_seq']}"
+    return next_client_id(state)
 
 
 def _public_response(response: dict) -> dict:

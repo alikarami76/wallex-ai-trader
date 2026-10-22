@@ -1,4 +1,4 @@
-"""Hourly backtest. The same signal, agent, and risk code as live mode."""
+"""Hourly backtest. Rules only: the quant and risk layers run, and the model is off."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from trader.engine.journal import Journal
+from trader.engine.ops import set_log_context
 from trader.engine.portfolio import Portfolio
 from trader.engine.validation import deflated_sharpe
 from trader.risk.manager import RiskManager, roll_day
@@ -49,6 +50,7 @@ def run_backtest(
     fear_greed: list[tuple[int, float, str]] | None = None,
 ) -> dict:
     spreads = spreads or {}
+    set_log_context(cfg, None)
     symbols = [symbol for symbol in candles if symbol not in unavailable and symbol in rules]
     portfolio = Portfolio(float(cfg["account"]["initial_equity_tmn"]))
     risk = RiskManager(cfg)
@@ -82,7 +84,7 @@ def run_backtest(
             continue
         now = datetime.fromtimestamp(stamp, tz=timezone.utc).astimezone(TEHRAN)
         state["day_key"], state["day_start_equity"] = roll_day(
-            state["day_key"], now, portfolio.equity(closes)
+            state["day_key"], now, portfolio.equity(closes), state.get("day_start_equity"),
         )
         _fill_resting(cfg, portfolio, indexed, stamp, rules, state, journal, spreads)
         _exits(cfg, portfolio, history, indexed, stamp, rules, state, journal, risk)
@@ -125,7 +127,7 @@ def run_backtest(
             [p.to_dict() for p in portfolio.positions.values()],
             view.compact(),
             stamp,
-            use_llm=False,
+            use_llm=False,  # rules only: the backtest does not call BoxAPI
         )
         planned = risk.plan(
             portfolio=portfolio,

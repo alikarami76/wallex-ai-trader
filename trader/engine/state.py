@@ -22,6 +22,7 @@ def load_state(path: Path, initial_cash: float) -> dict:
         payload.setdefault("pending", {})
         payload.setdefault("client_seq", 1)
         payload.setdefault("liquidity", {})
+        payload.setdefault("ops", {})
         return payload
     return fresh_state(initial_cash)
 
@@ -39,6 +40,7 @@ def fresh_state(initial_cash: float) -> dict:
         "pending": {},
         "client_seq": 1,
         "liquidity": {},
+        "ops": {},
     }
 
 
@@ -71,6 +73,7 @@ def save_state(path: Path, state: dict) -> None:
         "pending": state["pending"],
         "client_seq": state["client_seq"],
         "liquidity": _trim_liquidity(state.get("liquidity") or {}),
+        "ops": {key: value for key, value in (state.get("ops") or {}).items() if key != "_queued"},
     }
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

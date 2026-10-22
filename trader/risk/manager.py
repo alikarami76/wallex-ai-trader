@@ -634,11 +634,19 @@ def _entry_decisions(agent: AgentDecision, candidates: list[Candidate]) -> list[
     ]
 
 
-def roll_day(day: str, now: datetime, equity: float) -> tuple[str, float]:
+def roll_day(day: str, now: datetime, equity: float, day_start: float | None = None) -> tuple[str, float]:
+    """Reset the daily baseline at 00:00 Asia/Tehran (UTC+03:30).
+
+    The same Tehran date keeps `day_start`. A new date, including the instant
+    of midnight, adopts the equity passed in. A +03:00 clock would still be on
+    the previous date at 20:30 UTC; Tehran is already the next day then.
+    """
     current = day_key(now)
-    if current != day:
+    if not day or current != day:
         return current, equity
-    return day, equity
+    if day_start is None:
+        return day, equity
+    return day, day_start
 
 
 def _count_since(times: list[float], now: float, window: float) -> int:

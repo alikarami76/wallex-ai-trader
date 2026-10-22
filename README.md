@@ -1,6 +1,6 @@
 # Wallex AI trader
 
-Fee-aware spot bot for the Starcoach × Wallex credit account (package 183, 5,000,000 TMN). One process, one CLI, the same decision code in backtest, shadow, and live. Orders go only to spot `POST /v1/account/orders`. The config allowlist is intersected with the live package list, and TON, NEAR, FET, INJ, TAO, WIF, BONK, PENDLE, and RENDER are denied in every quote.
+Fee-aware spot bot for the Starcoach × Wallex credit account (package 183, 5,000,000 TMN). One process and one CLI. The backtest is **rules only**: it runs the quant and risk layers with the model off, and it keeps the researched 0.9% gross prior. Shadow and live add the menu and the BoxAPI call, and they block new entries on a frozen 0.45% prior unless `ev_override` was locked before go-live. Orders go only to spot `POST /v1/account/orders`. The config allowlist is intersected with the live package list, and TON, NEAR, FET, INJ, TAO, WIF, BONK, PENDLE, and RENDER are denied in every quote.
 
 A forced exit under 50,000 TMN tops up with a spot buy and sells the combined amount. Coin that cannot be flattened is reported. Shadow is the default mode in `scripts/run.sh`.
 
@@ -57,6 +57,12 @@ python3 -m trader --mode live --config config/default.yaml --dry-run --once
 python3 -m trader --mode live --config config/default.yaml
 
 python3 -m trader --mode report --log-dir results/backtest
+
+# Offline checkpoint draft from local jsonl. No key and no LLM call.
+python3 -m trader report --checkpoint C0 --log-dir results/shadow
+
+# Re-parse saved prompts and responses. Does not call BoxAPI.
+python3 -m trader replay --log-dir results/live
 ```
 
 `./scripts/run.sh shadow --duration 900 --fresh` loads `.env` and calls the same CLI.

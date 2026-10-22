@@ -6,11 +6,13 @@ import argparse
 import json
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 
 from trader.config import load_config, runtime_dirs
 from trader.engine.backtest import run_backtest, run_walk_forward, sentiment_ablation
+from trader.engine.ops import replay_offline, write_checkpoint
 from trader.sentiment import SentimentFeed
 from trader.engine.runtime import check_order, run_runtime
 from trader.engine.universe import select_universe
@@ -18,14 +20,23 @@ from trader.report import build_report
 from trader.wallex.client import WallexClient, aggregate_bars, median_spacing
 
 
+_MODES = {"backtest", "shadow", "live", "report", "check-order", "replay"}
+
+
 def main(argv: list[str] | None = None) -> None:
+    if argv is None:
+        argv = sys.argv[1:]
+    else:
+        argv = list(argv)
+    if argv and argv[0] in _MODES:
+        argv = ["--mode", *argv]
     parser = argparse.ArgumentParser(description="Wallex fee-aware AI trader")
     mode_from_env = os.getenv("TRADER_MODE", "").strip() or None
     parser.add_argument(
         "--mode",
         default=mode_from_env,
         required=mode_from_env is None,
-        choices=["backtest", "shadow", "live", "report", "check-order"],
+        choices=sorted(_MODES),
     )
     parser.add_argument("--config", default="config/default.yaml")
     parser.add_argument("--duration", type=float, default=None, help="seconds, shadow or live")
@@ -34,7 +45,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--interval", type=float, default=None, help="seconds between decision cycles")
     parser.add_argument("--fresh", action="store_true", help="ignore saved shadow/live state")
     parser.add_argument("--out", default=None, help="output directory")
-    parser.add_argument("--log-dir", default=None, help="journal directory for --mode report")
+    parser.add_argument("--log-dir", default=None, help="journal directory for report and replay")
+    parser.add_argument("--checkpoint", choices=["C0", "C1", "C2", "C3", "C4"], default=None)
+    parser.add_argument("--operator-action", default=None)
+    parser.add_argument("--operator-rule", default=None)
+    parser.add_argument("--note", default=None)
     parser.add_argument("--symbol", default="BTCTMN")
     parser.add_argument("--side", default="BUY")
     parser.add_argument("--notional", type=float, default=100_000)
@@ -48,6 +63,22 @@ def main(argv: list[str] | None = None) -> None:
     if args.mode == "backtest":
         out = Path(args.out or "results/backtest")
         _run_backtest(cfg, out)
+        return
+    if args.mode == "replay":
+        source = Path(args.log_dir or args.out or "results/live")
+        print(json.dumps(replay_offline(source), ensure_ascii=False, indent=2))
+        return
+    if args.mode == "report" and args.checkpoint:
+        source = Path(args.log_dir or args.out or ("results/shadow" if args.checkpoint == "C0" else "results/live"))
+        path = write_checkpoint(
+            source,
+            args.checkpoint,
+            out_dir=Path(args.out) if args.out else None,
+            operator_action=args.operator_action,
+            operator_rule=args.operator_rule,
+            note=args.note,
+        )
+        print(path)
         return
     if args.mode == "report":
         source = Path(args.log_dir or args.out or "results/backtest")

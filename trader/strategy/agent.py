@@ -565,6 +565,7 @@ class TradingAgent:
         if hit and hit.get("content"):
             decision = self._parse_or_fallback(hit["content"], candidates)
             decision.source = "llm_cache"
+            decision.replay = {"prompt": user, "response": hit.get("content") or ""}
             decision.usage = {
                 "cached": True,
                 "model": hit.get("model") or spec["model"],
@@ -603,6 +604,7 @@ class TradingAgent:
         self.budget.remember(key, raw, usage, now)
         decision = self._parse_or_fallback(raw, candidates)
         decision.usage = usage
+        decision.replay = {"prompt": user, "response": raw}
         return decision
 
     def _decide_menu(
@@ -632,6 +634,7 @@ class TradingAgent:
         if hit and hit.get("content"):
             decision = self._choice_or_hold(hit["content"], menu)
             decision.source = "llm_cache" if decision.menu_bound else decision.source
+            decision.replay = {"prompt": user, "response": hit.get("content") or ""}
             decision.usage = {
                 "cached": True,
                 "model": hit.get("model") or spec["model"],
@@ -674,6 +677,7 @@ class TradingAgent:
         decision = self._choice_or_hold(raw, menu)
         decision.usage = usage
         decision.menu = rows
+        decision.replay = {"prompt": user, "response": raw}
         return decision
 
     def _choice_or_hold(self, raw: str, menu: list[MenuAction]) -> AgentDecision:

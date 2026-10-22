@@ -85,6 +85,7 @@ strategy:
   atr_period: 14
   max_atr_pct: 0.03
   # Researched 24h drift of this setup, before fees. Not a per-trade forecast.
+  # The rules-only backtest keeps this 0.9% prior. Live and shadow use ops.frozen_gross_prior.
   expected_gross: 0.009
   edge_multiple: 1.2
   min_micro_return: -0.004
@@ -140,6 +141,17 @@ liquidation:
   aggressive_before_minutes: 30
   flat_by: "2026-10-23T23:30:00+03:30"
   min_hours_to_enter: 8
+
+ops:
+  # Measured gross per closed trade on the recorded backtest (~0.45%).
+  # Entries stay blocked unless ev_override was set before go-live and then locked.
+  frozen_gross_prior: 0.0045
+  entry_cutoff: "2026-10-22T23:30:00+03:30"
+  zscore_min_n: 18
+  size_cut_pnl: -0.005
+  unprotected_stop_pnl: -0.02
+  fee_maker_bps_max: 25
+  fee_taker_bps_max: 30
 
 llm:
   # BoxAPI is OpenRouter-like (https://ai.boxapi.ir/ai/v1). Prefer prefixed ids.

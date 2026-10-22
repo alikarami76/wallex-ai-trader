@@ -34,6 +34,7 @@ class AgentDecision:
     menu_bound: bool = False
     picked_id: str = ""
     menu: list = field(default_factory=list)
+    replay: dict = field(default_factory=dict)
 
     def as_log(self) -> dict:
         return {

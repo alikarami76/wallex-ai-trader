@@ -6,6 +6,8 @@ import csv
 import json
 from pathlib import Path
 
+from trader.engine.ops import stamp
+
 
 TRADE_FIELDS = [
     "timestamp",
@@ -45,7 +47,8 @@ class Journal:
         self._ensure_csv(self.equity_path, EQUITY_FIELDS)
 
     def decision(self, payload: dict) -> None:
-        self._decisions.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        row = stamp(payload)
+        self._decisions.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         self._decisions.flush()
 
     def trade(self, row: dict) -> None:
