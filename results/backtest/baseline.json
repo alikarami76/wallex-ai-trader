@@ -1,0 +1,39 @@
+{
+  "n_runs": 1000,
+  "seed": 20261022,
+  "target_entries": 17,
+  "symbols": [
+    "BTCTMN",
+    "DOGETMN",
+    "ETHTMN",
+    "USDTTMN",
+    "XAUTTMN",
+    "XRPTMN"
+  ],
+  "symbols_entered": [
+    "BTCTMN",
+    "DOGETMN",
+    "ETHTMN",
+    "USDTTMN",
+    "XAUTTMN",
+    "XRPTMN"
+  ],
+  "observed_return_pct": -0.14,
+  "observed_sharpe": -1.4650175717930198,
+  "return_percentile": 76.7,
+  "sharpe_percentile": 61.4,
+  "return_quantiles": {
+    "p05": -2.388714053040353,
+    "p25": -1.4179050940833382,
+    "p50": -0.7770825226433242,
+    "p75": -0.18389699441805352,
+    "p95": 0.59820587526902
+  },
+  "sharpe_quantiles": {
+    "p05": -6.485876512942955,
+    "p25": -4.040136120870105,
+    "p50": -2.3034055039780457,
+    "p75": -0.5525183094967059,
+    "p95": 1.9417657390357674
+  }
+}

@@ -22,6 +22,7 @@ def build_report(log_dir: Path, out_dir: Path | None = None, title: str = "Walle
     trades = _read_csv(log_dir / "trades.csv")
     decisions = _read_jsonl(log_dir / "decisions.jsonl")
     stats = _stats(equity, trades, decisions)
+    stats["baseline"] = _baseline_section(log_dir)
     _charts(equity, out_dir)
     path = out_dir / "report.md"
     path.write_text(_markdown(title, stats, out_dir), encoding="utf-8")
@@ -247,6 +248,14 @@ def _latency(stats: dict) -> str:
     )
 
 
+def _baseline_section(log_dir: Path) -> str:
+    candle_dir = log_dir / "candles"
+    if not candle_dir.is_dir() or not any(candle_dir.glob("*.csv")):
+        return ""
+    from trader.baseline import baseline_section
+    return baseline_section(log_dir)
+
+
 def _walk_forward(out_dir: Path) -> str:
     path = out_dir / "walk_forward.json"
     if not path.exists():
@@ -322,4 +331,5 @@ Equity samples: {stats['points']}.
 
 The return is mark-to-market in toman, including fees. Hit rate counts a closed trade as a win when its realized toman PnL is positive. Sharpe uses the median spacing of the equity samples, so an hourly backtest and a short shadow run are not on the same scale. Latency is the decision cycle, from the book fetch through the risk plan.
 {walk}
+{stats.get('baseline') or ''}
 """
