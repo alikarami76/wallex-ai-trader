@@ -43,6 +43,21 @@ Execution cost, in the sense of Almgren and Chriss (2000), is entry fee + exit f
 
 The quant score is `0.40 × trend + 0.30 × pullback depth + 0.20 × spread + 0.10 × book`. The quant layer is the only trade trigger. Size is quarter-Kelly from a prior win probability of 0.55 and a payoff of 1.0, which is 2.5% of equity, and it cannot exceed the 12% per-trade cap.
 
+## Liquidity
+
+Each cycle, for every symbol, the bot records four numbers and their z-scores against the recent window (24 points, at least 18 before a z-score is trusted):
+
+- Depth: quote notional sitting within 0.5% and within 1% of mid, from `GET /v2/depth/all`. The 1% figure is the one that gates and sizes.
+- Spread: the touch, in basis points.
+- Traded volume: the last closed hour's quote volume (base size times close). The z-score is on the log, so a typical quiet hour is not a shock.
+- The change in each series, also as a z-score. Depth and volume are scored in logs. The standard deviation has a floor (0.20 log points for the level, 0.15 for the change, 1 bp for the spread) so a smooth hour is not called a shock.
+
+An entry is skipped when depth inside 1% is under 1,000,000 TMN, when depth or log-volume is two standard deviations below its recent history, or when the spread is two standard deviations above it. A missing book does not block. The backtest has no historical depth, so only the volume score can veto a historical bar. The order, after quarter-Kelly, must also be at most 10% of the 1% depth. If the cut falls under the 50,000 TMN minimum, the entry is refused.
+
+Size uses the worst of those z-scores. A rising book and rising volume keep the full post-Kelly size. A deteriorating one scales it down, to half at the block threshold. The scale never increases size. It is applied after quarter-Kelly, because the 12% quant fraction sits above the 2.5% Kelly cap and a cut there would not change the order.
+
+Stops, the kill switch, and the aggressive liquidation window (from 23:20) still trade through a thin book. A time stop, and the passive flatten that starts at 22:50, wait while the book is thin or the spread has just blown out. The time stop gives that wait at most 6 extra hours. The passive flatten stops waiting when the aggressive window opens. The metrics are on every feature row in `decisions.jsonl` (`depth_100_tmn`, `depth_50_tmn`, the z-scores, `liquidity_scale`, `exit_ready`).
+
 ## What the model does
 
 BoxAPI `POST /chat/completions` goes through one router. The quant layer is still the only trigger. The router picks the model after that, and it makes at most one decision call per cycle:
@@ -152,6 +167,7 @@ On the 2026-10-22 hourly window the lagged index ranged from 53 to 78. It never 
 | --- | --- | --- |
 | Cost gate | Almgren and Chriss (2000), *Journal of Risk* 3(2) | Trade only when the prior edge exceeds fees + half-spread + slippage, with a fixed 1.2 buffer. |
 | Book imbalance | Cont, Kukanov and Stoikov (2014), *Journal of Financial Econometrics* 12(1) | Best-bid versus best-ask quantity from `/v2/depth/all`. A strongly offered book blocks the entry. |
+| Liquidity | Depth within a band of mid, plus the spread and log traded volume | Z-scores versus the recent window. A sudden thin book, a wide spread, or dried-up volume blocks the entry and cuts size. Passive liquidation waits for a book that can take the order. |
 | Inventory quotes | Avellaneda and Stoikov (2008), *Quantitative Finance* 8(3) | Reservation-price skew. The arrival-intensity spread is not fitted. |
 | Slow momentum | Moskowitz, Ooi and Pedersen (2012), *Journal of Financial Economics* 104(2) | 72-hour return must be non-negative before the faster pullback can arm. |
 | Regime filter | López de Prado (2018), *Advances in Financial Machine Learning*, meta-labeling | The LLM vetoes or downsizes. It does not create the trade. Fear & Greed and the headline score are inputs to that veto. |
@@ -204,4 +220,4 @@ Check these before sending real orders:
 
 ## خلاصه فارسی
 
-ربات فقط روی جفت‌های تومانی مجاز پلن ۱۸۳ معامله می‌کند و فهرست بازارهای ممنوع را در شروع می‌گیرد. سیگنال، پولبک در روند صعودی ساعتی است و فقط وقتی فعال می‌شود که هزینه رفت‌وبرگشت کارمزد را پوشش بدهد. شاخص ترس و طمع و امتیاز اخبار به‌عنوان ورودی به فیلتر رژیم داده می‌شوند؛ در آزمون تاریخی، بستن ورود در طمع شدید (۸۰ به بالا) هیچ معامله‌ای را عوض نکرد و در نتیجه خاموش ماند. مدل ارزان (`gpt-6-luna` با تلاش کم) امتیاز اخبار را می‌دهد و مدل قوی‌تر (`gpt-6-sol`) فقط وقتی صدا زده می‌شود که سیگنال کمی از دروازهٔ هزینه گذشته باشد. هزینه از `usage.cost` خوانده می‌شود و نزدیک سقف ۲٫۵۰ دلار مدل به ردهٔ ارزان‌تر برمی‌گردد. اگر سقف هزینه یا خطا پیش بیاید، لایه قطعی جایگزین می‌شود. حد ضرر، سقف حجم، و خروج اجباری قبل از ۲۳:۳۰ روز ۲۳ اکتبر ۲۰۲۶ به وقت تهران خارج از اختیار مدل هستند.
+ربات فقط روی جفت‌های تومانی مجاز پلن ۱۸۳ معامله می‌کند و فهرست بازارهای ممنوع را در شروع می‌گیرد. سیگنال، پولبک در روند صعودی ساعتی است و فقط وقتی فعال می‌شود که هزینه رفت‌وبرگشت کارمزد را پوشش بدهد. عمق دفتر سفارش، اسپرد، و حجم معاملات اگر ناگهان بد شوند ورود را می‌بندند و اندازه را بعد از کلی کوچک می‌کنند؛ خروج اجباریِ آرام منتظر نقدشوندگی می‌ماند و از ۲۳:۲۰ دیگر منتظر نمی‌ماند. شاخص ترس و طمع و امتیاز اخبار به‌عنوان ورودی به فیلتر رژیم داده می‌شوند؛ در آزمون تاریخی، بستن ورود در طمع شدید (۸۰ به بالا) هیچ معامله‌ای را عوض نکرد و در نتیجه خاموش ماند. مدل ارزان (`gpt-6-luna` با تلاش کم) امتیاز اخبار را می‌دهد و مدل قوی‌تر (`gpt-6-sol`) فقط وقتی صدا زده می‌شود که سیگنال کمی از دروازهٔ هزینه گذشته باشد. هزینه از `usage.cost` خوانده می‌شود و نزدیک سقف ۲٫۵۰ دلار مدل به ردهٔ ارزان‌تر برمی‌گردد. اگر سقف هزینه یا خطا پیش بیاید، لایه قطعی جایگزین می‌شود. حد ضرر، سقف حجم، و خروج اجباری قبل از ۲۳:۳۰ روز ۲۳ اکتبر ۲۰۲۶ به وقت تهران خارج از اختیار مدل هستند.

@@ -12,8 +12,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from trader.strategy.indicators import atr_percent, clip, ema, finite, roc, rsi
+from trader.strategy.liquidity import Liquidity, measure_liquidity
 from trader.strategy.quotes import execution_cost, half_spread
-from trader.types import Bar
+from trader.types import Bar, OrderBook
 
 
 @dataclass
@@ -38,6 +39,7 @@ class SymbolFeatures:
     news_score: float | None = None
     news_change: float | None = None
     news_headlines: list[str] = field(default_factory=list)
+    liquidity: Liquidity | None = None
     blockers: list[str] = field(default_factory=list)
     score: float = 0.0
 
@@ -71,6 +73,7 @@ class SymbolFeatures:
             "signal": self.signal,
             "score": round(self.score, 3),
             "blockers": self.blockers,
+            **(self.liquidity.as_log() if self.liquidity is not None else {}),
         }
 
 
@@ -103,6 +106,11 @@ class Candidate:
             "fear_greed_change": self.facts.get("fear_greed_change"),
             "news_score": self.facts.get("news_score"),
             "news_change": self.facts.get("news_change"),
+            "liquidity_scale": self.facts.get("liquidity_scale"),
+            "depth_100_tmn": self.facts.get("depth_100_tmn"),
+            "volume_z": self.facts.get("volume_z"),
+            "depth_change_z": self.facts.get("depth_change_z"),
+            "spread_change_z": self.facts.get("spread_change_z"),
         }
 
 
@@ -126,6 +134,8 @@ def evaluate_symbol(
     news_score: float | None = None,
     news_change: float | None = None,
     news_headlines: list[str] | None = None,
+    book: OrderBook | None = None,
+    liquidity_history: dict | None = None,
 ) -> SymbolFeatures:
     strategy = cfg["strategy"]
     closes = [bar.close for bar in bars]
@@ -152,6 +162,14 @@ def evaluate_symbol(
         news_change=news_change,
         news_headlines=list(news_headlines or []),
     )
+    features.liquidity = measure_liquidity(
+        bars,
+        cfg,
+        book=book,
+        spread_bps=spread_bps,
+        history=liquidity_history,
+        max_spread_bps=float(cfg["universe"]["max_spread_bps"]) if cfg.get("universe") else None,
+    )
     slow_bars = int(strategy.get("slow_bars") or 0)
     need = max(
         int(strategy["ema_slow"]),
@@ -161,6 +179,8 @@ def evaluate_symbol(
     ) + 2
     if len(bars) < need:
         features.blockers.append(f"warmup {len(bars)}/{need}")
+        if features.liquidity and features.liquidity.block_reason:
+            features.blockers.append(features.liquidity.block_reason)
         return features
 
     fast = ema(closes, int(strategy["ema_fast"]))[-1]
@@ -218,6 +238,8 @@ def evaluate_symbol(
     greed_cap = float(sentiment.get("extreme_greed", 80))
     if sentiment.get("block_extreme_greed") and fear_greed is not None and fear_greed >= greed_cap:
         blockers.append(f"fear and greed {fear_greed:.0f} is extreme greed")
+    if features.liquidity and features.liquidity.block_reason:
+        blockers.append(features.liquidity.block_reason)
 
     features.blockers = blockers
     features.signal = not blockers

@@ -44,7 +44,8 @@ Rules:
 - HOLD means abstain, not a veto. Use veto true on a symbol to reject that name only.
 - confidence is from 0 to 1. Below 0.55 a BUY confirmation is dropped.
 - You may CLOSE an existing position only when close is below ema_slow and roc_24h has turned negative.
-- Cite the numbers you used (slow return, 24h return, 4h pullback, half-spread, imbalance, cost, fear_greed, news_score) in rationale.
+- Cite the numbers you used (slow return, 24h return, 4h pullback, half-spread, imbalance, cost, fear_greed, news_score, depth_100_tmn, liquidity_scale) in rationale.
+- liquidity_scale below 1 means the book or the volume is deteriorating. That is a reason to veto or leave size alone. Do not raise size to offset it.
 - fear_greed is 0-100. A missing sentiment field is not a reason to veto. Extreme greed (80 or above) or a sharply negative news_score is a reason to veto or cut size.
 - Never tell the engine to ignore a stop, the daily max-loss, or the liquidation window.
 

@@ -63,6 +63,20 @@ strategy:
   entry_size_fraction: 0.12
   imbalance_block: -0.55
 
+liquidity:
+  # Depth is quote notional within this fraction of mid, from /v2/depth/all.
+  # Z-scores use a 24-point window and need 18 prior points. |z| >= 2 blocks.
+  # The scale multiplies size after quarter-Kelly. It does not raise size.
+  depth_band: 0.01
+  depth_band_tight: 0.005
+  history: 24
+  min_history: 18
+  z_block: 2.0
+  max_order_fraction_of_depth: 0.10
+  min_depth_tmn: 1000000
+  min_scale: 0.50
+  exit_defer_hours: 6
+
 execution:
   # Join the bid (maker). A marketable limit is the old taker entry and is off.
   # Stops still cross the spread. quote_gamma is the Avellaneda-Stoikov inventory weight.

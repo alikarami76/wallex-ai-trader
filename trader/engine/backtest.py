@@ -139,6 +139,7 @@ def run_backtest(
             order_times=state["order_times"],
             cooldowns=state["cooldowns"],
             now_unix=stamp,
+            liquidity={row.symbol: row.liquidity for row in features if row.liquidity is not None},
         )
         if trade_after is not None and stamp < trade_after:
             planned.actions = [item for item in planned.actions if item.side != "BUY"]

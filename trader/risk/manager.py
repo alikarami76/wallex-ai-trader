@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from trader.engine.portfolio import Portfolio
+from trader.strategy.liquidity import Liquidity, liquidity_settings
 from trader.strategy.parser import AgentDecision, ParsedDecision
 from trader.strategy.quotes import fractional_kelly
 from trader.strategy.signals import Candidate
@@ -161,6 +162,7 @@ class RiskManager:
         order_times: list[float],
         cooldowns: dict[str, float],
         now_unix: float,
+        liquidity: dict[str, Liquidity] | None = None,
     ) -> RiskResult:
         actions: list[Action] = []
         rejected: list[dict] = []
@@ -170,15 +172,24 @@ class RiskManager:
         for symbol, position in list(portfolio.positions.items()):
             price = marks.get(symbol, position.entry_price)
             forced = self._forced_exit(symbol, position, price, now_unix, view)
-            if forced:
-                actions.append(forced)
+            if not forced:
+                continue
+            if self._defer_exit(forced, position, view, liquidity, now_unix):
+                rejected.append({"symbol": symbol, "reason": "exit deferred until the book is liquid"})
+                continue
+            actions.append(forced)
 
         forced_symbols = {action.symbol for action in actions}
         if view.phase != "normal" or view.kill_switch:
             for symbol in held:
                 if symbol in forced_symbols:
                     continue
-                actions.append(self._flatten_action(symbol, view))
+                flatten = self._flatten_action(symbol, view)
+                position = portfolio.positions.get(symbol)
+                if position is not None and self._defer_exit(flatten, position, view, liquidity, now_unix):
+                    rejected.append({"symbol": symbol, "reason": "liquidation deferred until the book is liquid"})
+                    continue
+                actions.append(flatten)
 
         candidate_by_symbol = {item.symbol: item for item in candidates}
         entries_this_hour = _count_since(order_times, now_unix, 3600)
@@ -232,8 +243,15 @@ class RiskManager:
                         size = min(size, kelly)
                     room = float(risk["max_gross_exposure"]) - view.gross_exposure
                     size = min(size, room)
+                    size = self._liquidity_size(size, decision.symbol, view.equity, liquidity)
                     if size <= 0:
                         rejected.append({"symbol": decision.symbol, "reason": "no exposure room"})
+                        continue
+                    if size * view.equity < float(risk["min_notional_tmn"]):
+                        rejected.append({
+                            "symbol": decision.symbol,
+                            "reason": "size after the liquidity cap is below the minimum order",
+                        })
                         continue
                     actions.append(
                         Action(
@@ -348,6 +366,39 @@ class RiskManager:
         if entries_this_hour >= entry_cap or entries_this_hour >= order_cap:
             return {"symbol": symbol, "reason": "hourly order cap reached"}
         return None
+
+    def _liquidity_size(self, size: float, symbol: str, equity: float, liquidity: dict | None) -> float:
+        """Cut the post-Kelly size when the book is thin. Never raise it."""
+        liq = (liquidity or {}).get(symbol)
+        if liq is None or equity <= 0:
+            return size
+        settings = liquidity_settings(self.cfg)
+        scaled = size * float(liq.scale)
+        depth = liq.depth_100_tmn
+        if depth is not None and depth > 0:
+            cap = float(settings["max_order_fraction_of_depth"]) * depth / equity
+            scaled = min(scaled, cap)
+        return max(0.0, scaled)
+
+    def _defer_exit(self, action: Action, position, view: RiskView, liquidity: dict | None, now_unix: float) -> bool:
+        """Wait for a usable book on time stops and the passive flatten.
+
+        Stops, trails, the kill switch, and the aggressive liquidation window
+        still trade through a thin book.
+        """
+        if action.aggressive or view.phase == "aggressive" or view.kill_switch:
+            return False
+        if action.source not in {"time", "liquidation"} and view.phase == "normal":
+            return False
+        liq = (liquidity or {}).get(action.symbol)
+        if liq is None or liq.exit_ready:
+            return False
+        if action.source == "time":
+            settings = liquidity_settings(self.cfg)
+            limit = float(self.cfg["risk"]["time_stop_hours"]) + float(settings["exit_defer_hours"])
+            if (now_unix - position.entry_time) / 3600 >= limit:
+                return False
+        return True
 
 
 def _entry_decisions(agent: AgentDecision, candidates: list[Candidate]) -> list[ParsedDecision]:

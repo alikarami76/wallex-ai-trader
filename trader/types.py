@@ -92,6 +92,30 @@ class OrderBook:
             return None
         return (bid_qty - ask_qty) / total
 
+    def depth_notional(self, band: float) -> tuple[float, float] | None:
+        """Quote notional on each side within `band` (a fraction) of mid.
+
+        Bids are below mid and asks above it. Levels outside the band are
+        ignored. The book is sorted, so the scan stops at the first price
+        past the band.
+        """
+        mid = self.mid
+        if mid is None or mid <= 0 or band <= 0:
+            return None
+        lo = mid * (1 - band)
+        hi = mid * (1 + band)
+        bid = 0.0
+        ask = 0.0
+        for level in self.bids:
+            if level.price < lo:
+                break
+            bid += level.price * level.quantity
+        for level in self.asks:
+            if level.price > hi:
+                break
+            ask += level.price * level.quantity
+        return bid, ask
+
 
 @dataclass
 class Balance:

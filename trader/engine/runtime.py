@@ -201,6 +201,7 @@ def _cycle(
             continue
         book = books.get(symbol)
         maker, taker = _fee_pair(cfg, rules.get(symbol), account_fees.get(symbol))
+        history = state.setdefault("liquidity", {}).setdefault(symbol, {})
         features.append(
             evaluate_symbol(
                 symbol,
@@ -216,6 +217,8 @@ def _cycle(
                 news_score=None if mood is None else mood.news_score.get(symbol),
                 news_change=None if mood is None else mood.news_change.get(symbol),
                 news_headlines=None if mood is None else mood.headlines.get(symbol),
+                book=book,
+                liquidity_history=history,
             )
         )
         feature_by_symbol[symbol] = features[-1]
@@ -253,6 +256,7 @@ def _cycle(
         order_times=state["order_times"],
         cooldowns={k: float(v) for k, v in state["cooldowns"].items()},
         now_unix=now_unix,
+        liquidity={row.symbol: row.liquidity for row in features if row.liquidity is not None},
     )
     fills = []
     requests = []

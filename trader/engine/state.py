@@ -21,6 +21,7 @@ def load_state(path: Path, initial_cash: float) -> dict:
         payload.setdefault("order_times", [])
         payload.setdefault("pending", {})
         payload.setdefault("client_seq", 1)
+        payload.setdefault("liquidity", {})
         return payload
     return fresh_state(initial_cash)
 
@@ -37,7 +38,22 @@ def fresh_state(initial_cash: float) -> dict:
         "order_times": [],
         "pending": {},
         "client_seq": 1,
+        "liquidity": {},
     }
+
+
+def _trim_liquidity(history: dict) -> dict:
+    trimmed: dict = {}
+    if not isinstance(history, dict):
+        return trimmed
+    for symbol, row in history.items():
+        if not isinstance(row, dict):
+            continue
+        trimmed[str(symbol)] = {
+            "depth": [float(item) for item in (row.get("depth") or [])][-48:],
+            "spread": [float(item) for item in (row.get("spread") or [])][-48:],
+        }
+    return trimmed
 
 
 def save_state(path: Path, state: dict) -> None:
@@ -54,6 +70,7 @@ def save_state(path: Path, state: dict) -> None:
         "order_times": state["order_times"][-500:],
         "pending": state["pending"],
         "client_seq": state["client_seq"],
+        "liquidity": _trim_liquidity(state.get("liquidity") or {}),
     }
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
