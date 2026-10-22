@@ -61,6 +61,8 @@ python3 -m trader --mode report --log-dir results/backtest
 
 `./scripts/run.sh shadow --duration 900 --fresh` loads `.env` and calls the same CLI.
 
+Liara deployment is in [deploy/LIARA.md](deploy/LIARA.md). The image listens on port 8080 for `/health` and `/status` and runs the shadow loop beside it. State goes to `TRADER_DATA_DIR` so a Liara disk keeps the decision log across restarts. Secrets stay in `liara env set`.
+
 ## Unattended run
 
 ```bash

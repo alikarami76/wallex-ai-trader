@@ -8,12 +8,15 @@ Both modes call the same signal, agent, and risk code as the backtest.
 from __future__ import annotations
 
 import logging
+import os
+import signal
 import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
 from trader.config import wallex_credentials
+from trader.health import configure_status, serve_in_background, update_status
 from trader.engine.backtest import _trade_row
 from trader.engine.dust import FORCED_FLATTEN, apply_paper, plan_dust_flatten
 from trader.engine.journal import Journal
@@ -34,6 +37,26 @@ from trader.wallex.precision import OrderRejected, round_price, round_qty
 log = logging.getLogger("trader.runtime")
 
 
+def _request_stop(signum, frame) -> None:
+    """Liara stop and restart send SIGTERM. Treat it as a clean shutdown."""
+    raise KeyboardInterrupt
+
+
+def _start_health(directory: Path) -> None:
+    """Bind the platform port when TRADER_HEALTH_PORT is set. Liara curls /health."""
+    configure_status(directory / "status.json")
+    raw = os.getenv("TRADER_HEALTH_PORT", "").strip()
+    if not raw:
+        return
+    host = os.getenv("TRADER_HEALTH_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    try:
+        port = int(raw)
+    except ValueError as exc:
+        raise SystemExit(f"TRADER_HEALTH_PORT must be an integer, got {raw!r}") from exc
+    serve_in_background(host, port)
+    log.info("health listening on http://%s:%s/health", host, port)
+
+
 def run_runtime(
     cfg: dict,
     *,
@@ -44,6 +67,7 @@ def run_runtime(
     dry_run: bool,
     interval: float | None,
     fresh: bool,
+    state_path: Path | None = None,
 ) -> None:
     if mode not in {"shadow", "live"}:
         raise ValueError(mode)
@@ -61,11 +85,23 @@ def run_runtime(
         dry_run=not send_orders,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
-    state_path = out_dir / "state.json"
+    state_path = state_path or (out_dir / "state.json")
+    state_path.parent.mkdir(parents=True, exist_ok=True)
     if fresh and state_path.exists():
         state_path.unlink()
     state = load_state(state_path, float(cfg["account"]["initial_equity_tmn"]))
     journal = Journal(out_dir)
+    _start_health(out_dir)
+    update_status(
+        mode=mode,
+        dry_run=not send_orders,
+        data_dir=str(out_dir),
+        state_path=str(state_path),
+        started_at=iso(),
+        positions=[row.symbol for row in state["portfolio"].positions.values()],
+    )
+    log.info("starting %s dry_run=%s data=%s", mode, not send_orders, out_dir)
+    signal.signal(signal.SIGTERM, _request_stop)
     risk = RiskManager(cfg)
     mcp = None
     if cfg.get("mcp", {}).get("enabled", False):
@@ -120,43 +156,44 @@ def run_runtime(
     candles_at = time.time()
     backoff = 1.0
 
-    while True:
-        try:
-            if time.time() - markets_at > 300:
-                rules = _load_rules(client)
-                unavailable = _load_bans(client, int(cfg["exchange"]["package_id"]))
-                universe, spreads = _refresh_universe(client, cfg, rules, unavailable)
-                markets_at = time.time()
-            if time.time() - candles_at > float(cfg["runtime"]["candle_refresh_seconds"]):
-                hourly, micro = _load_history(client, universe, cfg, previous=hourly)
-                candles_at = time.time()
-            _cycle(
-                cfg, mode, client, agent, risk, journal, state, state_path,
-                rules, unavailable, account_fees, universe, spreads, hourly, micro,
-                send_orders=send_orders, sentiment=sentiment,
-            )
-            backoff = 1.0
-        except KeyboardInterrupt:
-            log.info("stopped by user")
-            save_state(state_path, state)
-            break
-        except Exception as exc:
-            log.exception("cycle failed")
-            journal.decision({
-                "timestamp": iso(),
-                "mode": mode,
-                "event": "error",
-                "error": str(exc),
-                "traceback": traceback.format_exc()[-2000:],
-            })
-            save_state(state_path, state)
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-        if once:
-            break
-        if deadline is not None and time.time() >= deadline:
-            break
-        time.sleep(loop_seconds)
+    try:
+        while True:
+            try:
+                if time.time() - markets_at > 300:
+                    rules = _load_rules(client)
+                    unavailable = _load_bans(client, int(cfg["exchange"]["package_id"]))
+                    universe, spreads = _refresh_universe(client, cfg, rules, unavailable)
+                    markets_at = time.time()
+                if time.time() - candles_at > float(cfg["runtime"]["candle_refresh_seconds"]):
+                    hourly, micro = _load_history(client, universe, cfg, previous=hourly)
+                    candles_at = time.time()
+                _cycle(
+                    cfg, mode, client, agent, risk, journal, state, state_path,
+                    rules, unavailable, account_fees, universe, spreads, hourly, micro,
+                    send_orders=send_orders, sentiment=sentiment,
+                )
+                backoff = 1.0
+            except Exception as exc:
+                log.exception("cycle failed")
+                journal.decision({
+                    "timestamp": iso(),
+                    "mode": mode,
+                    "event": "error",
+                    "error": str(exc),
+                    "traceback": traceback.format_exc()[-2000:],
+                })
+                update_status(last_error=str(exc), last_cycle_at=iso())
+                save_state(state_path, state)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+            if once:
+                break
+            if deadline is not None and time.time() >= deadline:
+                break
+            time.sleep(loop_seconds)
+    except KeyboardInterrupt:
+        log.info("stopped by user")
+        save_state(state_path, state)
     journal.close()
 
 
@@ -361,6 +398,21 @@ def _cycle(
         "residuals": residuals,
     })
     save_state(state_path, state)
+    update_status(
+        mode=mode,
+        dry_run=not send_orders,
+        last_cycle_at=iso(now),
+        equity_tmn=round(equity, 2),
+        cash_tmn=round(portfolio.cash, 2),
+        phase=view.phase,
+        kill_switch=view.kill_switch,
+        positions=[
+            {"symbol": row.symbol, "qty": row.qty}
+            for row in portfolio.positions.values()
+        ],
+        residuals=residuals,
+        last_error="",
+    )
     log.info(
         "%s equity=%.0f exposure=%.1f%% phase=%s candidates=%s actions=%s source=%s tier=%s pick=%s",
         mode, equity, view.gross_exposure * 100, view.phase, len(candidates),

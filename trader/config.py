@@ -51,7 +51,49 @@ def load_config(path: str | Path) -> dict:
     llm.setdefault("usage_path", "data/llm_usage.json")
     payload.setdefault("mcp", {"enabled": True, "url": "https://api.wallex.ir/mcp", "timeout_seconds": 8, "refresh_seconds": 600})
     payload.setdefault("account", {"initial_equity_tmn": 5_000_000})
+    _apply_data_dir(payload)
     return payload
+
+
+def _apply_data_dir(payload: dict) -> None:
+    """Point journals and caches at TRADER_DATA_DIR when that env var is set.
+
+    A Liara disk is mounted on that path. Restarts keep the decision log,
+    positions, the LLM ledger, and the sentiment cache.
+    """
+    data = os.getenv("TRADER_DATA_DIR", "").strip()
+    usage = os.getenv("TRADER_LLM_USAGE_PATH", "").strip()
+    cache = os.getenv("TRADER_SENTIMENT_CACHE", "").strip()
+    llm = payload.setdefault("llm", {})
+    sentiment = payload.setdefault("sentiment", {})
+    if usage:
+        llm["usage_path"] = usage
+    elif data:
+        llm["usage_path"] = str(Path(data) / "llm_usage.json")
+    if cache:
+        sentiment["cache_path"] = cache
+    elif data:
+        sentiment["cache_path"] = str(Path(data) / "sentiment_cache.json")
+
+
+def runtime_dirs(explicit_out: str | None, mode: str, dry_run: bool) -> tuple[Path, Path, Path]:
+    """Return `(out_dir, state_path, log_dir)`.
+
+    `TRADER_DATA_DIR` is the disk root. `TRADER_STATE_PATH` is the positions
+    file. `TRADER_LOG_DIR` is the decision log directory. An explicit `--out`
+    still wins over the data-dir default.
+    """
+    data = os.getenv("TRADER_DATA_DIR", "").strip()
+    if explicit_out:
+        out = Path(explicit_out)
+    elif data:
+        out = Path(data)
+    else:
+        name = "dry-run" if dry_run and mode == "live" else mode
+        out = Path("data") / name
+    state = Path(os.getenv("TRADER_STATE_PATH", "").strip() or (out / "state.json"))
+    logs = Path(os.getenv("TRADER_LOG_DIR", "").strip() or out)
+    return out, state, logs
 
 
 def wallex_credentials() -> tuple[str, str]:

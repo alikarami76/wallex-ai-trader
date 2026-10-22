@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
-from trader.config import load_config
+from trader.config import load_config, runtime_dirs
 from trader.engine.backtest import run_backtest, run_walk_forward, sentiment_ablation
 from trader.sentiment import SentimentFeed
 from trader.engine.runtime import check_order, run_runtime
@@ -19,7 +20,13 @@ from trader.wallex.client import WallexClient, aggregate_bars, median_spacing
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Wallex fee-aware AI trader")
-    parser.add_argument("--mode", required=True, choices=["backtest", "shadow", "live", "report", "check-order"])
+    mode_from_env = os.getenv("TRADER_MODE", "").strip() or None
+    parser.add_argument(
+        "--mode",
+        default=mode_from_env,
+        required=mode_from_env is None,
+        choices=["backtest", "shadow", "live", "report", "check-order"],
+    )
     parser.add_argument("--config", default="config/default.yaml")
     parser.add_argument("--duration", type=float, default=None, help="seconds, shadow or live")
     parser.add_argument("--once", action="store_true")
@@ -51,19 +58,25 @@ def main(argv: list[str] | None = None) -> None:
         payload = check_order(cfg, args.symbol, args.side, args.notional)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
-    out = Path(args.out or f"data/{'dry-run' if args.dry_run and args.mode == 'live' else args.mode}")
+    dry_run = args.dry_run or _env_flag("TRADER_DRY_RUN") or args.mode == "shadow"
+    _out, state_path, log_dir = runtime_dirs(args.out, args.mode, dry_run)
     run_runtime(
         cfg,
         mode=args.mode,
-        out_dir=out,
+        out_dir=log_dir,
+        state_path=state_path,
         duration=args.duration,
         once=args.once,
-        dry_run=args.dry_run or args.mode == "shadow",
+        dry_run=dry_run,
         interval=args.interval,
         fresh=args.fresh,
     )
-    if args.mode == "shadow" or (args.mode == "live" and args.dry_run):
-        build_report(out, out, title=f"Wallex {args.mode} report")
+    if args.mode == "shadow" or (args.mode == "live" and dry_run):
+        build_report(log_dir, log_dir, title=f"Wallex {args.mode} report")
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _run_backtest(cfg: dict, out: Path) -> None:
