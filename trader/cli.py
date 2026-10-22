@@ -16,6 +16,7 @@ from trader.engine.ops import replay_offline, write_checkpoint
 from trader.sentiment import SentimentFeed
 from trader.engine.runtime import check_order, run_runtime
 from trader.engine.universe import select_universe
+from trader.compare import compare_backtest
 from trader.report import build_report
 from trader.scorecard import write_scorecard
 from trader.wallex.client import WallexClient, aggregate_bars, median_spacing
@@ -48,6 +49,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--out", default=None, help="output directory")
     parser.add_argument("--log-dir", default=None, help="journal directory for report, replay, and scorecard")
     parser.add_argument("--candles", default=None, help="stored candle directory for the offline scorecard")
+    parser.add_argument(
+        "--compare",
+        nargs=2,
+        metavar=("BASE", "HEAD"),
+        default=None,
+        help="diff a stored backtest at BASE against a HEAD replay of those candles",
+    )
     parser.add_argument("--checkpoint", choices=["C0", "C1", "C2", "C3", "C4"], default=None)
     parser.add_argument("--operator-action", default=None)
     parser.add_argument("--operator-rule", default=None)
@@ -69,6 +77,22 @@ def main(argv: list[str] | None = None) -> None:
         report = write_scorecard(log_dir, candles, cfg, dest)
         print(dest / "scorecard.md")
         print(json.dumps({key: report[key] for key in ("rows", "shadow_rows", "signals", "rules_pnl_tmn", "taken_pnl_tmn", "gap_tmn")}, indent=2))
+        return
+    if args.mode == "backtest" and args.compare:
+        base, head = args.compare
+        if head != "HEAD":
+            raise SystemExit("the second compare ref must be HEAD")
+        dest = Path(args.out or "results/compare")
+        report = compare_backtest(cfg, base, Path("results/backtest"), dest)
+        print(dest / "compare.md")
+        print(json.dumps({
+            "identical": report["identical"],
+            "base_sha": report["base_sha"],
+            "head_sha": report["head_sha"],
+            "config_hash": report["config_hash"],
+            "return_pct": report["head"]["return_pct"],
+            "closed_trades": report["head"]["closed_trades"],
+        }, indent=2))
         return
     if args.mode == "backtest":
         out = Path(args.out or "results/backtest")
