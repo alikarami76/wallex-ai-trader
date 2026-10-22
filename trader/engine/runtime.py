@@ -220,6 +220,7 @@ def _run_loop(
         })
     log.info("%s", candle_data_path(mcp))
     hourly, micro = _load_history(client, universe, cfg)
+    _seed_warmup(state, hourly, cfg)
     markets_at = time.time()
     candles_at = time.time()
     backoff = 1.0
@@ -239,6 +240,7 @@ def _run_loop(
                     client, universe, cfg, previous=hourly, previous_micro=micro,
                 )
                 _restore_warmup(state, warm)
+                _seed_warmup(state, hourly, cfg)
                 candles_at = time.time()
             _cycle(
                 cfg, mode, client, agent, risk, journal, state, state_path,
@@ -544,6 +546,7 @@ def _cycle_llm_usd(rows) -> tuple[float, float, float]:
 def _zscore_n(state: dict, universe: list[str]) -> int:
     """Samples behind the current point, for names that have been warming together.
 
+    The count is the longer of the live depth tape and the hourly-bar seed.
     A symbol that joins on a universe refresh has one sample and would otherwise
     pull the minimum back to 0. Names more than one sample behind the leader are
     still recorded; they do not reset the cohort that is already counting.
@@ -555,8 +558,14 @@ def _zscore_n(state: dict, universe: list[str]) -> int:
         if not isinstance(row, dict):
             continue
         depth = row.get("depth") or []
-        if depth:
-            counts.append(max(0, len(depth) - 1))
+        live = max(0, len(depth) - 1) if depth else 0
+        try:
+            seed = max(0, int(row.get("seed_n") or 0))
+        except (TypeError, ValueError):
+            seed = 0
+        observed = max(live, seed)
+        if observed or depth:
+            counts.append(observed)
     if not counts:
         return 0
     leader = max(counts)
@@ -564,16 +573,51 @@ def _zscore_n(state: dict, universe: list[str]) -> int:
     return min(core)
 
 
+def _seed_warmup(state: dict, hourly: dict, cfg: dict) -> None:
+    """Fill the warm-up count from closed hourly bars when that history exists.
+
+    The threshold stays `zscore_min_n`. A series shorter than the window does
+    not pretend to be ready. A later short refetch cannot shrink the seed.
+    """
+    from trader.strategy.liquidity import _quote_points, liquidity_settings
+
+    keep = int(liquidity_settings(cfg)["history"]) + 2
+    liquidity = state.setdefault("liquidity", {})
+    ready = 0
+    for symbol, bars in (hourly or {}).items():
+        points = _quote_points(_closed(list(bars or []), 3600), keep)
+        seeded = max(0, len(points) - 1)
+        row = liquidity.get(symbol)
+        if not isinstance(row, dict):
+            row = {}
+            liquidity[symbol] = row
+        row["seed_n"] = max(int(row.get("seed_n") or 0), seeded)
+        if bars:
+            ready += 1
+    if ready:
+        counts = [
+            int((liquidity.get(symbol) or {}).get("seed_n") or 0)
+            for symbol in hourly
+            if isinstance(liquidity.get(symbol), dict)
+        ]
+        log.info("z-score warm-up seeded from %s hourly series, min seed %s", ready, min(counts) if counts else 0)
+
+
 def _warmup_snapshot(state: dict) -> dict:
     out = {}
     for symbol, row in (state.get("liquidity") or {}).items():
         if not isinstance(row, dict):
             continue
+        try:
+            seed_n = max(0, int(row.get("seed_n") or 0))
+        except (TypeError, ValueError):
+            seed_n = 0
         out[symbol] = {
             "depth": list(row.get("depth") or []),
             "spread": list(row.get("spread") or []),
             "volume": list(row.get("volume") or []),
             "volume_ts": list(row.get("volume_ts") or []),
+            "seed_n": seed_n,
         }
     return out
 
@@ -587,6 +631,17 @@ def _restore_warmup(state: dict, snap: dict) -> None:
             current = {}
             liquidity[symbol] = current
         for key, values in row.items():
+            if key == "seed_n":
+                try:
+                    seeded = max(0, int(values or 0))
+                except (TypeError, ValueError):
+                    seeded = 0
+                try:
+                    have_seed = max(0, int(current.get("seed_n") or 0))
+                except (TypeError, ValueError):
+                    have_seed = 0
+                current["seed_n"] = max(have_seed, seeded)
+                continue
             have = current.get(key) or []
             if len(values) > len(have):
                 current[key] = list(values)

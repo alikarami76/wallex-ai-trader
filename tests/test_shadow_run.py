@@ -11,6 +11,7 @@ from trader.engine.runtime import (
     _cycle_llm_usd,
     _load_history,
     _restore_warmup,
+    _seed_warmup,
     _warmup_snapshot,
     _zscore_n,
     merge_bars,
@@ -59,6 +60,38 @@ class WarmupTests(unittest.TestCase):
         self.assertEqual(len(state["liquidity"]["BTCTMN"]["depth"]), 10)
         self.assertEqual(_zscore_n(state, ["BTCTMN"]), 9)
         self.assertEqual(hourly["BTCTMN"][-1].time, 39 * 3600)
+
+    def test_hourly_history_seeds_the_warm_up_immediately(self):
+        state = {"liquidity": {}}
+        hourly = {
+            "BTCTMN": _bars(40),
+            "ETHTMN": _bars(40),
+            "SOLTMN": _bars(4),
+        }
+        cfg = {"runtime": {"history_days": 29}, "liquidity": {"history": 24}, "ops": {"zscore_min_n": 18}}
+        _seed_warmup(state, hourly, cfg)
+        self.assertGreaterEqual(_zscore_n(state, ["BTCTMN", "ETHTMN"]), 18)
+        self.assertLess(_zscore_n(state, ["SOLTMN"]), 18)
+        # A name that just joined does not pull the seeded cohort under the gate.
+        state["liquidity"]["ADATMN"] = {"depth": [1.0]}
+        self.assertGreaterEqual(_zscore_n(state, ["BTCTMN", "ETHTMN", "ADATMN"]), 18)
+        saved = _trim_liquidity(state["liquidity"])
+        self.assertGreaterEqual(saved["BTCTMN"]["seed_n"], 18)
+
+        class Client:
+            def get_ohlcv(self, symbol, timeframe, start, end):
+                state["liquidity"].clear()
+                return _bars(3, start=37 * 3600)
+
+        snap = _warmup_snapshot(state)
+        merged, _micro = _load_history(
+            Client(), ["BTCTMN"], cfg, previous={"BTCTMN": hourly["BTCTMN"]},
+            previous_micro={"BTCTMN": hourly["BTCTMN"]},
+        )
+        _restore_warmup(state, snap)
+        _seed_warmup(state, merged, cfg)
+        self.assertGreaterEqual(len(merged["BTCTMN"]), 40)
+        self.assertGreaterEqual(_zscore_n(state, ["BTCTMN"]), 18)
 
     def test_a_new_symbol_does_not_zero_the_warmed_cohort(self):
         state = {

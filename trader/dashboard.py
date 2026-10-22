@@ -369,6 +369,21 @@ def _rationale(legacy: list[dict]) -> dict:
     return found
 
 
+def _exchange_errors(cycles: list[dict]) -> list[dict]:
+    """Wallex HTTP errors from the loaded cycle tail, not only the latest few."""
+    rows = []
+    for cycle in cycles:
+        for item in cycle.get("errors") or []:
+            if isinstance(item, dict):
+                rows.append({
+                    "ts": cycle.get("ts_tehran") or cycle.get("ts_utc") or "",
+                    "where": item.get("endpoint") or "wallex",
+                    "status": item.get("http_status"),
+                    "message": item.get("message") or "",
+                })
+    return rows
+
+
 def _errors(cycles: list[dict], legacy: list[dict]) -> list[dict]:
     rows = []
     for cycle in cycles:
@@ -692,8 +707,10 @@ def _wallex_panel(latest: dict, desk: dict) -> str:
     if samples:
         ordered = sorted(samples)
         median = f"{ordered[len(ordered) // 2]:,.0f} ms"
-    errors = desk["errors"]
-    wallex = [row for row in errors if row.get("where") not in {"decision", "cycle"}]
+    errors = _exchange_errors(desk.get("cycles") or []) or [
+        row for row in desk["errors"] if row.get("where") not in {"decision", "cycle"}
+    ]
+    wallex = errors
     lines = "".join(
         f"<tr><td class='mono'>{_esc(row.get('status'))}</td><td>{_esc(row.get('where'))}</td><td>{_esc(row.get('message'))}</td></tr>"
         for row in wallex[-8:]

@@ -46,6 +46,13 @@ def fresh_state(initial_cash: float) -> dict:
     }
 
 
+def _seed_n(value) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _trim_liquidity(history: dict) -> dict:
     trimmed: dict = {}
     if not isinstance(history, dict):
@@ -58,6 +65,7 @@ def _trim_liquidity(history: dict) -> dict:
             "spread": [float(item) for item in (row.get("spread") or [])][-48:],
             "volume": [float(item) for item in (row.get("volume") or [])][-48:],
             "volume_ts": [int(item) for item in (row.get("volume_ts") or [])][-48:],
+            "seed_n": _seed_n(row.get("seed_n")),
         }
     return trimmed
 
