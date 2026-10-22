@@ -547,7 +547,7 @@ def run_all(root: Path | None = None) -> int:
 
     def dashboard() -> str:
         desk = root / "desk"
-        sources = [journals[name] for name in ("faults", "dip", "kill") if name in journals]
+        sources = [journals[name] for name in ("faults", "dip") if name in journals]
         need(sources, "desk journals missing")
         desk.mkdir(parents=True, exist_ok=True)
         for name in ("cycles.jsonl", "decisions.jsonl", "adjustments.jsonl"):
@@ -620,7 +620,7 @@ def _audit(directory: Path | None, label: str) -> str:
     need(completed.returncode == 0, completed.stderr[-400:])
     need(payload.get("ok") is True, f"{label} audit failed: {payload.get('failures')}")
     need(payload.get("secret_hits") == 0, "secret hit")
-    return f"PASS drift {payload.get('max_drift_tmn')} TMN, secrets 0"
+    return f"drift {payload.get('max_drift_tmn')} TMN, secrets 0"
 
 
 def _command(argv: list[str], env: dict | None = None) -> subprocess.CompletedProcess:
