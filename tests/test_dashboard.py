@@ -7,6 +7,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from trader.dashboard import create_app
+from trader.report import decision_cards
 
 
 class DashboardTests(unittest.TestCase):
@@ -118,9 +119,21 @@ class DashboardTests(unittest.TestCase):
                     {"gate": "trend", "pass": True},
                     {"gate": "cost", "pass": False, "value": 0.003, "threshold": 0.0045},
                 ],
-                "llm": {"tier": "routine", "model": "openai/gpt-6-luna", "confidence": 0.62, "veto": False},
-                "risk": {"verdict": "pass"},
-                "cost_gate": {"prior": 0.0045, "hurdle": 0.0072, "pass": False},
+                "llm": {
+                    "tier": "routine", "model": "openai/gpt-6-luna", "source": "fallback",
+                    "confidence": 0.62, "veto": False, "rationale": "4h pullback is inside the band",
+                },
+                "risk": {
+                    "verdict": "pass",
+                    "size_before": 0.12,
+                    "size_after": 0.06,
+                    "reason_codes": ["liquidity scale"],
+                },
+                "signal": {"close": 100, "roc_24h": 0.02, "roc_4h": -0.008, "spread_bps": 10, "signal": True},
+                "cost_gate": {
+                    "prior": 0.0045, "hurdle": 0.0072, "pass": False,
+                    "fee_in_bps": 25, "fee_out_bps": 30, "half_spread_bps": 5, "buffer_bps": 3,
+                },
                 "order": {"status": "filled", "side": "BUY", "qty": 0.001, "notional_tmn": 100000},
             },
             {
@@ -172,6 +185,33 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("do not render this prompt", html)
         self.assertIn("present", html)
         self.assertIn("Equity", html)
+        self.assertIn("Decision card", html)
+        self.assertIn("First block", html)
+        self.assertIn("half-spread", html)
+        self.assertIn("buffer", html)
+        self.assertIn("fallback", html)
+        self.assertIn("0.1200 → 0.0600", html)
+        self.assertIn("liquidity scale", html)
+        self.assertIn("roc_24h", html)
+        card = decision_cards([{
+            "record": "symbol",
+            "cycle_id": "c1",
+            "symbol": "BTCTMN",
+            "first_block": "cost",
+            "signal": {"close": 100, "roc_24h": 0.02, "signal": True},
+            "cost_gate": {
+                "prior": 0.0045, "fee_in_bps": 25, "fee_out_bps": 30,
+                "half_spread_bps": 5, "buffer_bps": 3, "hurdle": 0.0072,
+            },
+            "llm": {"source": "fallback", "confidence": 0.62, "rationale": "4h pullback is inside the band"},
+            "risk": {"size_before": 0.12, "size_after": 0.06, "reason_codes": ["liquidity scale"]},
+            "prompt": secret,
+        }])
+        self.assertIn("First block: cost", card)
+        self.assertIn("prior 0.0045", card)
+        self.assertIn("half-spread 5", card)
+        self.assertIn("0.12 → 0.06", card)
+        self.assertNotIn(secret, card)
 
     def _write(self, name: str, rows: list[dict]) -> None:
         text = "".join(json.dumps(row) + "\n" for row in rows)

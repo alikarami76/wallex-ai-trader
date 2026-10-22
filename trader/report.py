@@ -117,6 +117,7 @@ def _stats(equity: list[dict], trades: list[dict], decisions: list[dict]) -> dic
         "latency_p95_ms": latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))] if latencies else None,
         "latency_samples": len(latencies),
         "residuals": _latest_residuals(decisions),
+        "decision_cards": decision_cards(decisions),
     }
 
 
@@ -126,6 +127,50 @@ def _latest_residuals(decisions: list[dict]) -> list[dict]:
         if "residuals" in row:
             latest = list(row.get("residuals") or [])
     return latest
+
+
+def decision_cards(decisions: list[dict]) -> str:
+    """Latest-cycle decision cards. Feature numbers, the cost gate, and the size change."""
+    symbols = [row for row in decisions if row.get("record") == "symbol"]
+    if not symbols:
+        return ""
+    cycle = symbols[-1].get("cycle_id")
+    rows = [row for row in symbols if row.get("cycle_id") == cycle] if cycle else symbols[-6:]
+    lines = ["## Decision card", ""]
+    for row in rows:
+        llm = row.get("llm") if isinstance(row.get("llm"), dict) else {}
+        risk = row.get("risk") if isinstance(row.get("risk"), dict) else {}
+        gate = row.get("cost_gate") if isinstance(row.get("cost_gate"), dict) else {}
+        signal = row.get("signal") if isinstance(row.get("signal"), dict) else {}
+        features = ", ".join(
+            f"{key}={signal.get(key)}"
+            for key in ("close", "roc_24h", "roc_4h", "atr_pct", "spread_bps", "signal")
+            if key in signal
+        ) or "n/a"
+        reasons = ", ".join(str(item) for item in (risk.get("reason_codes") or [])) or "none"
+        lines.append(f"### {row.get('symbol')}")
+        lines.append("")
+        lines.append(f"First block: {row.get('first_block') or 'none'}.")
+        lines.append(f"Features: {features}.")
+        lines.append(
+            "Cost gate: "
+            f"prior {gate.get('prior')}, "
+            f"fee in {gate.get('fee_in_bps')} bps, "
+            f"fee out {gate.get('fee_out_bps')} bps, "
+            f"half-spread {gate.get('half_spread_bps')} bps, "
+            f"buffer {gate.get('buffer_bps')} bps, "
+            f"hurdle {gate.get('hurdle')}."
+        )
+        lines.append(
+            f"LLM source {llm.get('source') or 'n/a'}, "
+            f"confidence {llm.get('confidence')}, "
+            f"rationale: {llm.get('rationale') or 'n/a'}."
+        )
+        lines.append(
+            f"Size {risk.get('size_before')} → {risk.get('size_after')}. Reasons: {reasons}."
+        )
+        lines.append("")
+    return "\n".join(lines)
 
 
 def _residual_lines(rows: list[dict]) -> str:
@@ -268,6 +313,8 @@ def _markdown(title: str, stats: dict, out_dir: Path) -> str:
 Equity samples: {stats['points']}.
 
 {_residual_lines(stats.get('residuals') or [])}
+
+{stats.get('decision_cards') or ''}
 
 ![Equity](equity.png)
 

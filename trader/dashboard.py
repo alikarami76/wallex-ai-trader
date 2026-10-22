@@ -145,6 +145,7 @@ def render_page(desk: dict) -> str:
         _book_panel(latest, desk, pnl),
         _curve_panel(desk["cycles"]),
         _feed_panel(desk),
+        _decision_card(desk),
         _gates_panel(desk["block_counts"]),
         _fee_panel(latest, desk["symbols"]),
         _wallex_panel(latest, desk),
@@ -347,6 +348,9 @@ header { border-bottom: 1px solid var(--rule); padding-bottom: 18px; margin-bott
 main { display: grid; gap: 14px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
 .panel { background: var(--panel); border: 1px solid var(--rule); padding: 16px 18px; overflow-x: auto; }
+.card { border-top: 1px solid var(--rule); padding-top: 12px; margin-top: 12px; }
+.card h3 { margin: 0 0 6px; font-size: 16px; font-weight: 500; }
+.card p { margin: 4px 0; }
 .stat { font-size: 28px; margin-top: 6px; }
 .label { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; }
 .profit { color: var(--profit); }
@@ -503,6 +507,48 @@ def _feed_panel(desk: dict) -> str:
         "<table><thead><tr><th>Symbol</th><th>Gates</th><th>LLM</th><th>Conf</th>"
         f"<th>Veto</th><th>Rationale</th><th>Risk</th></tr></thead><tbody>{body}</tbody></table></section>"
     )
+
+
+def _decision_card(desk: dict) -> str:
+    """One card per symbol on the latest cycle. Numbers only, no prompts or keys."""
+    cards = []
+    fallback_source = (desk.get("latest") or {}).get("llm_source")
+    for row in desk.get("symbols") or []:
+        llm = row.get("llm") if isinstance(row.get("llm"), dict) else {}
+        risk = row.get("risk") if isinstance(row.get("risk"), dict) else {}
+        gate = row.get("cost_gate") if isinstance(row.get("cost_gate"), dict) else {}
+        signal = row.get("signal") if isinstance(row.get("signal"), dict) else {}
+        symbol = str(row.get("symbol") or "")
+        rationale = llm.get("rationale") or (desk.get("rationale") or {}).get(symbol) or (desk.get("rationale") or {}).get("") or ""
+        features = " · ".join(
+            f"{key} {_esc(signal.get(key))}"
+            for key in ("close", "roc_24h", "roc_4h", "atr_pct", "spread_bps", "signal")
+            if key in signal
+        ) or "—"
+        reasons = ", ".join(str(item) for item in (risk.get("reason_codes") or [])) or "—"
+        before = risk.get("size_before")
+        after = risk.get("size_after")
+        cards.append(
+            "<article class='card'>"
+            f"<h3>{_esc(symbol)}</h3>"
+            f"<p><span class='label'>First block</span> {_esc(row.get('first_block') or 'none')}</p>"
+            f"<p><span class='label'>Features</span> <span class='mono'>{features}</span></p>"
+            "<p><span class='label'>Cost gate</span> "
+            f"prior {_pct(gate.get('prior'))} · "
+            f"fee in {_bps(gate.get('fee_in_bps'))} · fee out {_bps(gate.get('fee_out_bps'))} · "
+            f"half-spread {_bps(gate.get('half_spread_bps'))} · "
+            f"buffer {_bps(gate.get('buffer_bps'))} · "
+            f"hurdle {_pct(gate.get('hurdle'))}</p>"
+            "<p><span class='label'>LLM</span> "
+            f"source {_esc(llm.get('source') or fallback_source or '—')} · "
+            f"confidence {_num_text(llm.get('confidence'), 2)} · "
+            f"{_esc(rationale or '—')}</p>"
+            f"<p><span class='label'>Size</span> <span class='mono'>{_num_text(before, 4)} → {_num_text(after, 4)}</span>"
+            f" · {_esc(reasons)}</p>"
+            "</article>"
+        )
+    inner = "".join(cards) or "<p class='empty'>No symbol decision yet.</p>"
+    return f"<section class='panel'><h2>Decision card</h2>{inner}</section>"
 
 
 def _gates_panel(counts: list[tuple[str, int]]) -> str:
