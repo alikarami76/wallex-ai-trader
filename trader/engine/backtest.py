@@ -232,6 +232,8 @@ def _exits(cfg, portfolio, history, indexed, stamp, rules, state, journal, risk)
         fill = None
         reason = ""
         order_type = "LIMIT"
+        take = float(cfg["risk"].get("take_profit_pct") or 0)
+        target = position.entry_price * (1 + take) if take > 0 else None
         if bar.low <= position.stop_price:
             price = position.stop_price * (1 - stop_slip)
             fill = portfolio.sell(
@@ -241,6 +243,14 @@ def _exits(cfg, portfolio, history, indexed, stamp, rules, state, journal, risk)
             reason = "stop"
             order_type = "MARKET"
             state["cooldowns"][symbol] = stamp + float(cfg["risk"]["cooldown_after_stop_seconds"])
+        elif target is not None and bar.high >= target:
+            maker, _taker = _fees(cfg, rules[symbol])
+            fill = portfolio.sell(
+                symbol=symbol, price=target, fee_rate=maker, reason="take profit",
+                client_id=_cid(state), order_type="LIMIT",
+            )
+            reason = "take_profit"
+            order_type = "LIMIT"
         else:
             if bar.high > position.peak_price:
                 position.peak_price = bar.high

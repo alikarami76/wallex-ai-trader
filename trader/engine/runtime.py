@@ -602,7 +602,13 @@ def _seed_warmup(state: dict, hourly: dict, cfg: dict) -> None:
             for symbol in hourly
             if isinstance(liquidity.get(symbol), dict)
         ]
-        log.info("z-score warm-up seeded from %s hourly series, min seed %s", ready, min(counts) if counts else 0)
+        lowest = min(counts) if counts else 0
+        # Candle refresh re-runs this every few minutes. The seed only grows.
+        marker = state.setdefault("_warmup_log", {})
+        if marker.get("ready") != ready or marker.get("min") != lowest:
+            log.info("z-score warm-up seeded from %s hourly series, min seed %s", ready, lowest)
+            marker["ready"] = ready
+            marker["min"] = lowest
 
 
 def _warmup_snapshot(state: dict) -> dict:

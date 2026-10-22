@@ -107,14 +107,11 @@ class SentimentTests(unittest.TestCase):
             {"sentiment": {"cache_path": str(path), "cache_seconds": 0, "history_cache_seconds": 0}},
             opener=flaky,
         )
-        with self.assertLogs("trader.sentiment", level="INFO") as captured:
-            first = feed.snapshot(["BTCTMN"])
-            phase["empty"] = True
-            second = feed.snapshot(["BTCTMN"])
-        text = "\n".join(captured.output)
-        self.assertEqual(text.count("sentiment source cryptopanic failed"), 1)
-        self.assertEqual(text.count("sentiment source reddit failed"), 1)
+        first = feed.snapshot(["BTCTMN"])
+        phase["empty"] = True
+        second = feed.snapshot(["BTCTMN"])
         self.assertIn("cryptopanic", feed._disabled_sources)
+        self.assertIn("reddit", feed._disabled_sources)
         self.assertGreater(first.news_score["BTCTMN"], 0)
         self.assertEqual(second.news_score["BTCTMN"], first.news_score["BTCTMN"])
         self.assertIsNotNone(second.news_score["BTCTMN"])

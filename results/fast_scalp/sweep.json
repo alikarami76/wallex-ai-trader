@@ -1,0 +1,90 @@
+{
+  "primary": {
+    "closed_trades": 14,
+    "trades_per_day": 1.0,
+    "win_rate": 0.286,
+    "net_tmn": -9749.61,
+    "net_pct": -0.195,
+    "max_drawdown_pct": 0.195,
+    "fees_paid": 7619.66,
+    "realized_pnl": -9749.61
+  },
+  "sweep": [
+    {
+      "closed_trades": 14,
+      "trades_per_day": 1.0,
+      "win_rate": 0.286,
+      "net_tmn": -9749.61,
+      "net_pct": -0.195,
+      "max_drawdown_pct": 0.195,
+      "fees_paid": 7619.66,
+      "realized_pnl": -9749.61,
+      "tp": 0.012,
+      "sl": 0.008,
+      "hold_h": 2
+    },
+    {
+      "closed_trades": 14,
+      "trades_per_day": 1.0,
+      "win_rate": 0.286,
+      "net_tmn": -9827.02,
+      "net_pct": -0.197,
+      "max_drawdown_pct": 0.197,
+      "fees_paid": 7619.46,
+      "realized_pnl": -9827.02,
+      "tp": 0.01,
+      "sl": 0.008,
+      "hold_h": 2
+    },
+    {
+      "closed_trades": 14,
+      "trades_per_day": 1.0,
+      "win_rate": 0.286,
+      "net_tmn": -7271.41,
+      "net_pct": -0.145,
+      "max_drawdown_pct": 0.145,
+      "fees_paid": 7455.42,
+      "realized_pnl": -7271.41,
+      "tp": 0.012,
+      "sl": 0.006,
+      "hold_h": 1
+    },
+    {
+      "closed_trades": 14,
+      "trades_per_day": 1.0,
+      "win_rate": 0.214,
+      "net_tmn": -9705.06,
+      "net_pct": -0.194,
+      "max_drawdown_pct": 0.194,
+      "fees_paid": 7569.1,
+      "realized_pnl": -9705.06,
+      "tp": 0.015,
+      "sl": 0.01,
+      "hold_h": 3
+    },
+    {
+      "closed_trades": 14,
+      "trades_per_day": 1.0,
+      "win_rate": 0.214,
+      "net_tmn": -11169.41,
+      "net_pct": -0.223,
+      "max_drawdown_pct": 0.223,
+      "fees_paid": 7615.2,
+      "realized_pnl": -11169.41,
+      "tp": 0.012,
+      "sl": 0.008,
+      "hold_h": 3
+    }
+  ],
+  "days": 14.0,
+  "symbols": [
+    "BTCTMN",
+    "ETHTMN",
+    "XAUTTMN",
+    "XRPTMN",
+    "DOGETMN",
+    "SOLTMN",
+    "BNBTMN",
+    "ADATMN"
+  ]
+}

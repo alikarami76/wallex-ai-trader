@@ -70,6 +70,8 @@ universe:
     ADATMN: 22.2
 
 strategy:
+  # uptrend_pullback (default) or fast_scalp. TRADER_STRATEGY overrides this.
+  name: uptrend_pullback
   ema_fast: 8
   ema_slow: 24
   pullback_bars: 4
@@ -124,6 +126,8 @@ risk:
   max_gross_exposure: 0.30
   max_positions: 2
   stop_loss_pct: 0.045
+  # Optional hard take-profit. Null or 0 means the trail and time stop handle exits.
+  take_profit_pct: 0
   # Six hours, and never past liquidation.flat_by.
   time_stop_hours: 6
   trail_arm_pct: 0.025

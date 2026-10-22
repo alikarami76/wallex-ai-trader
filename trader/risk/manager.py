@@ -522,6 +522,19 @@ class RiskManager:
                 price_direction="down",
                 aggressive=True,
             )
+        take = float(risk.get("take_profit_pct") or 0)
+        if take > 0 and price >= position.entry_price * (1 + take):
+            target = position.entry_price * (1 + take)
+            return Action(
+                symbol=symbol,
+                side="SELL",
+                order_type="LIMIT",
+                size_fraction=1.0,
+                reason=f"take profit {target:.8g} at {price:.8g}",
+                source="take_profit",
+                price_direction="up",
+                aggressive=False,
+            )
         if position.peak_price >= position.entry_price * (1 + float(risk["trail_arm_pct"])):
             trail = position.peak_price * (1 - float(risk["trail_distance_pct"]))
             if price <= trail:
