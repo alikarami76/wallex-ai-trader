@@ -6,3 +6,4 @@ data/
 *.tmp
 .pytest_cache/
 results/compare/head/
+results/e2e/

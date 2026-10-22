@@ -162,9 +162,10 @@ A systemd unit is in `deploy/wallex-trader.service`. Point `WorkingDirectory` an
 
 1. `python3 -m pip install -r requirements.txt`
 2. `python3 -m unittest discover -s tests -v`
-3. `python3 -m trader --mode backtest --config config/default.yaml`
-4. `python3 -m trader --mode shadow --config config/default.yaml --duration 900 --fresh --out results/shadow`
+3. `make e2e` runs the mock-exchange scenarios (`python3 -m trader e2e`). No Wallex key.
+4. `python3 -m trader --mode backtest --config config/default.yaml`
+5. `python3 -m trader --mode shadow --config config/default.yaml --duration 900 --fresh --out results/shadow`
 
-No API key is required for 1–4. Shadow uses public REST only. Backtest forces the deterministic agent so a stray `LLM_API_KEY` cannot spend the budget. Charts land next to the journal: `report.md`, `equity.png`, `drawdown.png`, `trades.csv`, `equity.csv`, `decisions.jsonl`.
+No API key is required for 1–5. Shadow uses public REST only. Backtest forces the deterministic agent so a stray `LLM_API_KEY` cannot spend the budget. Charts land next to the journal: `report.md`, `equity.png`, `drawdown.png`, `trades.csv`, `equity.csv`, `decisions.jsonl`.
 
 The sample already in the repo is `results/backtest/` (about 29 days of hourly candles, deterministic agent, volume liquidity score, Fear & Greed ablation, walk-forward and deflated Sharpe) and `results/shadow/` (a short live-book run, no orders). On 2026-10-22 the backtest finished at −0.140% mark-to-market with a 0.415% max drawdown, and the deflated Sharpe probability was 0.043. Lagged Fear & Greed stayed between 53 and 78, so the extreme-greed gate (80) never fired and was left off. Depth and spread shocks are live-only. Numbers and citations are in [STRATEGY.md](STRATEGY.md).

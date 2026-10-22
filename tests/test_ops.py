@@ -13,6 +13,7 @@ from trader.engine.ops import (
     apply_frozen_cost_gate,
     fresh_ops,
     llm_override_warning,
+    load_ops,
     next_client_id,
     propose,
     replay_offline,
@@ -304,6 +305,14 @@ class ReportTests(unittest.TestCase):
         restarted = {"client_seq": 1}
         other = next_client_id(restarted)
         self.assertNotEqual(other[:10], left[:10])
+        held = {"client_seq": 1, "ops": {}}
+        ops = load_ops(held)
+        ops["state"] = "HALT"
+        next_client_id(held)
+        ops["cycle_seq"] = 7
+        self.assertIs(held["ops"], ops)
+        self.assertEqual(held["ops"]["state"], "HALT")
+        self.assertEqual(held["ops"]["cycle_seq"], 7)
 
     def test_llm_model_is_warned_and_does_not_pin_the_tier_table(self):
         os.environ["LLM_MODEL"] = "openai/gpt-6-luna"

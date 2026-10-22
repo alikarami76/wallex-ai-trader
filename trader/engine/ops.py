@@ -111,15 +111,25 @@ def fresh_ops() -> dict:
 
 
 def load_ops(state: dict) -> dict:
+    """Return the one ops dict for this process.
+
+    A second call used to copy the dict and store the copy. The cycle keeps the
+    first object, so a HALT or a cycle_seq bump after next_client_id() was
+    written to the copy that save_state no longer saw. The next cycle then
+    reopened LIVE_ARMED.
+    """
     raw = state.get("ops")
+    if isinstance(raw, dict) and raw.get("_ops_ready"):
+        return raw
     merged = fresh_ops()
     if isinstance(raw, dict):
-        merged.update(raw)
+        merged.update({key: value for key, value in raw.items() if key != "_ops_ready"})
     merged["state"] = str(merged.get("state") or "SHADOW")
     if merged["state"] not in STATES:
         merged["state"] = "SHADOW"
     merged["dropped_symbols"] = [str(item) for item in (merged.get("dropped_symbols") or [])]
     merged["size_multiplier"] = float(merged.get("size_multiplier") if merged.get("size_multiplier") is not None else 1.0)
+    merged["_ops_ready"] = True
     state["ops"] = merged
     return merged
 

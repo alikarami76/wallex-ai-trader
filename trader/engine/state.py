@@ -73,7 +73,11 @@ def save_state(path: Path, state: dict) -> None:
         "pending": state["pending"],
         "client_seq": state["client_seq"],
         "liquidity": _trim_liquidity(state.get("liquidity") or {}),
-        "ops": {key: value for key, value in (state.get("ops") or {}).items() if key != "_queued"},
+        "ops": {
+            key: value
+            for key, value in (state.get("ops") or {}).items()
+            if key not in {"_queued", "_ops_ready"}
+        },
     }
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

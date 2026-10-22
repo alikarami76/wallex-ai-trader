@@ -23,7 +23,7 @@ from trader.scorecard import write_scorecard
 from trader.wallex.client import WallexClient, aggregate_bars, median_spacing
 
 
-_MODES = {"backtest", "shadow", "live", "report", "check-order", "replay", "scorecard", "audit", "watchdog"}
+_MODES = {"backtest", "shadow", "live", "report", "check-order", "replay", "scorecard", "audit", "watchdog", "e2e"}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -71,6 +71,9 @@ def main(argv: list[str] | None = None) -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    if args.mode == "e2e":
+        from trader.e2e.run import main as e2e_main
+        raise SystemExit(e2e_main())
     cfg = load_config(args.config)
     if args.mode == "scorecard":
         log_dir = Path(args.log_dir or "results/shadow")
