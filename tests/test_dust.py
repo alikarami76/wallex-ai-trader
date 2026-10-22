@@ -128,7 +128,9 @@ class DustFlattenTests(unittest.TestCase):
             fills, requests, residual = result
             self.assertEqual(fills, [])
             self.assertEqual(requests, [])
-            self.assertIn("BTCTMN", portfolio.positions)
+            self.assertNotIn("BTCTMN", portfolio.positions)
+            self.assertIn("BTCTMN", portfolio.dust)
+            self.assertAlmostEqual(portfolio.equity({"BTCTMN": 100}), portfolio.cash + 10_000)
             self.assertNotIn("order_guard", residual["reason"])
             self.assertAlmostEqual(residual["dust_tmn"], 10_000)
             self.assertEqual(state["client_seq"], 4)
@@ -200,6 +202,54 @@ class DustFlattenTests(unittest.TestCase):
         self.assertEqual(residual["symbol"], "BTCTMN")
         self.assertIn("residual", residual["reason"])
         self.assertIn("BTCTMN", portfolio.positions)
+
+    def test_global_kill_counts_dust_and_dust_does_not_block_it(self):
+        from datetime import datetime
+
+        from trader.config import load_config
+        from trader.engine.ops import Facts, advance, fresh_ops
+        from trader.risk.manager import RiskManager
+        from trader.timeutil import TEHRAN
+
+        cfg = load_config("config/default.yaml")
+        portfolio = Portfolio(4_700_000)
+        portfolio.dust["BTCTMN"] = {
+            "qty": 1.0,
+            "entry_price": 300_000,
+            "mark_price": 150_000,
+            "cost_tmn": 300_000,
+        }
+        marks = {"BTCTMN": 150_000}
+        self.assertAlmostEqual(portfolio.equity(marks), 4_850_000)
+        restored = Portfolio.from_dict(portfolio.to_dict())
+        self.assertAlmostEqual(restored.equity(marks), 4_850_000)
+        now = datetime(2026, 10, 22, 12, 0, tzinfo=TEHRAN)
+        view = RiskManager(cfg).view(
+            portfolio, marks, now,
+            peak_equity=5_000_000,
+            day_start_equity=4_850_000,
+            kill_switch=False,
+            kill_reason="",
+        )
+        self.assertAlmostEqual(view.daily_drawdown, 0.0)
+        self.assertAlmostEqual(view.drawdown, 0.03)
+        self.assertTrue(view.kill_switch)
+        self.assertIn("global", view.kill_reason)
+        ops = fresh_ops()
+        ops["state"] = "FLATTEN"
+        ops["locked"] = True
+        facts = Facts(
+            now=now,
+            mode="live",
+            send_orders=True,
+            equity=view.equity,
+            daily_drawdown=view.daily_drawdown,
+            global_drawdown=view.drawdown,
+            kill_switch=view.kill_switch,
+            phase=view.phase,
+        )
+        advance(ops, facts, cfg, stage="pre")
+        self.assertEqual(ops["state"], "KILLED")
 
 
 if __name__ == "__main__":

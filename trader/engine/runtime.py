@@ -533,6 +533,10 @@ def _cycle(
     for symbol, position in state["portfolio"].positions.items():
         marks.setdefault(symbol, position.entry_price)
     portfolio: Portfolio = state["portfolio"]
+    for symbol, lot in portfolio.dust.items():
+        marks.setdefault(symbol, float(lot.get("mark_price") or lot.get("entry_price") or 0))
+    portfolio.remark_dust(marks)
+    _refresh_dust_book(state, portfolio, marks)
     if state.get("pending"):
         if send_orders:
             _sync_pending(client, portfolio, state)
@@ -947,6 +951,14 @@ def _position_notionals(portfolio, marks: dict, symbol: str) -> tuple[float, flo
         gross += notional
         if held == symbol:
             named = notional
+    for held, lot in getattr(portfolio, "dust", {}).items():
+        if held in portfolio.positions:
+            continue
+        price = marks.get(held, lot.get("mark_price") or lot.get("entry_price") or 0)
+        notional = float(lot.get("qty") or 0) * float(price or 0)
+        gross += notional
+        if held == symbol:
+            named += notional
     return named, gross
 
 
@@ -1012,7 +1024,7 @@ def _dust_report(state, portfolio, min_notional: float) -> tuple[list[dict], flo
     return dust, total
 
 
-def _touch_dust(state, symbol: str, qty: float, notional: float) -> dict:
+def _touch_dust(state, symbol: str, qty: float, notional: float, portfolio=None) -> dict:
     """Remember an unsellable remainder. A later cycle reports it and does not send an order."""
     book = state.setdefault("dust_book", {})
     fresh = symbol not in book
@@ -1026,7 +1038,31 @@ def _touch_dust(state, symbol: str, qty: float, notional: float) -> dict:
         "repeat": not fresh,
     }
     book[symbol] = row
+    if portfolio is not None and symbol in getattr(portfolio, "positions", {}):
+        mark = (float(notional) / float(qty)) if qty else 0.0
+        portfolio.park_dust(symbol, mark)
     return row
+
+
+def _refresh_dust_book(state, portfolio, marks: dict) -> None:
+    """Keep the logged dust_tmn on the live mark so a later drawdown still sees it."""
+    if not getattr(portfolio, "dust", None):
+        return
+    book = state.setdefault("dust_book", {})
+    for symbol, lot in portfolio.dust.items():
+        price = marks.get(symbol, lot.get("mark_price") or lot.get("entry_price") or 0)
+        value = float(lot.get("qty") or 0) * float(price or 0)
+        prior = dict(book.get(symbol) or {})
+        prior.update({
+            "symbol": symbol,
+            "qty": lot.get("qty"),
+            "dust_tmn": round(value, 2),
+            "mark_tmn": round(value, 2),
+            "notional_tmn": round(value, 2),
+            "reason": prior.get("reason") or "unsellable dust; a top-up buy is not used",
+            "repeat": True,
+        })
+        book[symbol] = prior
 
 
 def _note_unsellable_remainder(state, portfolio, marks, symbol: str, min_notional: float) -> None:
@@ -1038,7 +1074,7 @@ def _note_unsellable_remainder(state, portfolio, marks, symbol: str, min_notiona
     mark = marks.get(symbol) or left.entry_price or 0
     if left.qty * float(mark) + 1e-6 >= min_notional:
         return
-    _touch_dust(state, symbol, left.qty, left.qty * float(mark))
+    _touch_dust(state, symbol, left.qty, left.qty * float(mark), portfolio)
 
 
 def _try_dust_flatten(
@@ -1055,6 +1091,9 @@ def _try_dust_flatten(
     position = portfolio.positions.get(action.symbol)
     rule = rules.get(action.symbol)
     if position is None or rule is None:
+        logged = (state.get("dust_book") or {}).get(action.symbol)
+        if position is None and logged and str(ops_state) in {"FLATTEN", "KILLED"}:
+            return [], [], {**logged, "repeat": True}
         return None
     book = books.get(action.symbol)
     mark = marks.get(action.symbol) or rule.last_price or 0
@@ -1083,12 +1122,12 @@ def _try_dust_flatten(
         if no_topup:
             rounded = float(round_qty(position.qty, int(rule.qty_decimals)))
             if rounded <= 0 or rounded * float(sell_price) + 1e-6 < floor:
-                return [], [], _touch_dust(state, action.symbol, position.qty, plan.mark_tmn)
+                return [], [], _touch_dust(state, action.symbol, position.qty, plan.mark_tmn, portfolio)
             book = state.get("dust_book") or {}
             book.pop(action.symbol, None)
         return None
     if plan.kind == "dust":
-        return [], [], _touch_dust(state, action.symbol, position.qty, plan.mark_tmn)
+        return [], [], _touch_dust(state, action.symbol, position.qty, plan.mark_tmn, portfolio)
     if plan.kind == "residual":
         return [], [], plan.residual(action.symbol, position.qty)
     slip = float(cfg["execution"].get("stop_slippage_bps", 5)) / 10_000

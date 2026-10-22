@@ -364,7 +364,9 @@ def run_all(root: Path | None = None) -> int:
         last = cycles_of(directory)[-1]
         dust_tmn = float(last.get("dust_tmn") or 0)
         need(dust_tmn > 0, f"dust_tmn was not logged ({last.get('dust')})")
-        need("BTCTMN" in positions(directory), "the unsellable coin was dropped")
+        dust_lots = (saved(directory).get("portfolio") or {}).get("dust") or {}
+        need("BTCTMN" in dust_lots, "the unsellable coin was not kept as dust")
+        need("BTCTMN" not in positions(directory), "dust stayed on the tradable book")
         need(abs(float(last.get("coin_notional_tmn") or 0) - dust_tmn) < 500, "dust is missing from equity")
         killed_buy = assess(OrderIntent(
             symbol="BTCTMN", side="BUY", order_type="LIMIT", qty=0.2, price=1_000_000.0,

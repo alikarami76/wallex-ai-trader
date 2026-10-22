@@ -44,6 +44,7 @@ class Portfolio:
     def __init__(self, cash: float):
         self.cash = float(cash)
         self.positions: dict[str, Position] = {}
+        self.dust: dict[str, dict] = {}
         self.realized_pnl = 0.0
         self.fees_paid = 0.0
         self.closed_trades = 0
@@ -52,6 +53,10 @@ class Portfolio:
         total = self.cash
         for symbol, position in self.positions.items():
             total += position.qty * marks.get(symbol, position.entry_price)
+        for symbol, lot in self.dust.items():
+            if symbol in self.positions:
+                continue
+            total += self._dust_notional(symbol, lot, marks)
         return total
 
     def exposure(self, marks: dict[str, float]) -> float:
@@ -59,7 +64,40 @@ class Portfolio:
         if equity <= 0:
             return 1.0
         gross = sum(position.qty * marks.get(symbol, position.entry_price) for symbol, position in self.positions.items())
+        for symbol, lot in self.dust.items():
+            if symbol in self.positions:
+                continue
+            gross += self._dust_notional(symbol, lot, marks)
         return gross / equity
+
+    def remark_dust(self, marks: dict[str, float]) -> None:
+        for symbol, lot in self.dust.items():
+            price = marks.get(symbol)
+            if price:
+                lot["mark_price"] = float(price)
+
+    def park_dust(self, symbol: str, mark: float) -> dict | None:
+        """Move an unsellable remainder off the tradable book. The mark stays in equity."""
+        position = self.positions.get(symbol)
+        if position is None:
+            return self.dust.get(symbol)
+        price = float(mark or position.entry_price or 0)
+        lot = {
+            "qty": position.qty,
+            "entry_price": position.entry_price,
+            "mark_price": price,
+            "cost_tmn": position.cost_tmn,
+        }
+        self.dust[symbol] = lot
+        del self.positions[symbol]
+        return lot
+
+    @staticmethod
+    def _dust_notional(symbol: str, lot: dict, marks: dict[str, float]) -> float:
+        price = marks.get(symbol)
+        if not price:
+            price = lot.get("mark_price", lot.get("entry_price", 0))
+        return float(lot.get("qty") or 0) * float(price or 0)
 
     def buy(
         self,
@@ -205,6 +243,7 @@ class Portfolio:
             "realized_pnl": self.realized_pnl,
             "fees_paid": self.fees_paid,
             "positions": {symbol: position.to_dict() for symbol, position in self.positions.items()},
+            "dust": self.dust,
         }
 
     @classmethod
@@ -214,4 +253,5 @@ class Portfolio:
         portfolio.fees_paid = float(payload.get("fees_paid") or 0)
         for symbol, row in (payload.get("positions") or {}).items():
             portfolio.positions[symbol] = Position.from_dict(row)
+        portfolio.dust = dict(payload.get("dust") or {})
         return portfolio
