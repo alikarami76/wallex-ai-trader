@@ -301,6 +301,89 @@ class DashboardTests(unittest.TestCase):
         empty = TestClient(create_app(self.root))
         self.assertEqual(empty.get("/", auth=("desk-operator", "desk-password-not-for-html")).status_code, 401)
 
+    def test_desk_matches_state_and_keeps_flat_books(self):
+        """Empty positions must win over an older held row; PnL follows the cycle."""
+        password = "desk-password-not-for-html"
+        self._write("cycles.jsonl", [{
+            "record": "cycle",
+            "cycle_id": "c2",
+            "ts_utc": "2026-10-22T19:00:00Z",
+            "ts_tehran": "2026-10-22T22:30:00+03:30",
+            "state": "LIVE_ARMED",
+            "mode": "live",
+            "equity_tmn": 5_010_000,
+            "free_tmn": 4_000_000,
+            "go_live_equity": 4_900_000,
+            "pnl_from_golive_pct": 5_010_000 / 4_900_000 - 1,
+            "pnl_from_golive_tmn": 110_000,
+            "open_positions": [],
+        }])
+        self._write("decisions.jsonl", [
+            {
+                "timestamp": "t1",
+                "equity_tmn": 5_100_000,
+                "positions": [{"symbol": "BTCTMN", "qty": 0.001, "entry_price": 100_000_000}],
+                "fills": [],
+            },
+            {
+                "timestamp": "t2",
+                "equity_tmn": 5_010_000,
+                "positions": [],
+                "fills": [{
+                    "symbol": "BTCTMN", "side": "SELL", "qty": 0.001,
+                    "notional_tmn": 100_000, "fee_tmn": 300,
+                }],
+            },
+            {
+                "record": "symbol",
+                "cycle_id": "c1",
+                "symbol": "BTCTMN",
+                "order": {"status": "filled", "side": "BUY", "qty": 0.001, "notional_tmn": 99_000},
+            },
+        ])
+        (self.root / "state.json").write_text(json.dumps({
+            "portfolio": {
+                "cash": 5_010_000,
+                "realized_pnl": 700,
+                "fees_paid": 300,
+                "positions": {},
+            },
+            "ops": {"go_live_equity": 4_900_000},
+        }), encoding="utf-8")
+        page = self.client.get("/", auth=("desk-operator", password))
+        self.assertEqual(page.status_code, 200)
+        html = page.text
+        self.assertIn("+2.245%", html)
+        self.assertIn("110,000.00 TMN", html)
+        self.assertNotIn("+0.200%", html)
+        self.assertIn(">Fills</h2>", html)
+        self.assertIn("300.00", html)
+        self.assertIn("SELL", html)
+        self.assertNotIn("0.001000", html.split("Positions")[1].split("Fills")[0])
+        self.assertIn(">none</td>", html.split("Positions")[1].split("Fills")[0])
+        self.assertIn("5,010,000", html)
+        held = self.root / "state.json"
+        held.write_text(json.dumps({
+            "portfolio": {
+                "cash": 4_800_000,
+                "realized_pnl": 0,
+                "fees_paid": 0,
+                "positions": {
+                    "ETHTMN": {
+                        "symbol": "ETHTMN", "qty": 1.5, "entry_price": 200_000,
+                        "entry_time": 1, "cost_tmn": 300_000, "stop_price": 190_000,
+                        "peak_price": 200_000, "setup": "uptrend_pullback", "reason": "x",
+                    },
+                },
+            },
+            "ops": {"go_live_equity": 4_900_000},
+        }), encoding="utf-8")
+        again = self.client.get("/", auth=("desk-operator", password))
+        self.assertIn("ETHTMN", again.text)
+        self.assertIn("1.500000", again.text)
+        self.assertIn("200,000.00", again.text)
+        self.assertIn("4,800,000", again.text)
+
     def _write(self, name: str, rows: list[dict]) -> None:
         text = "".join(json.dumps(row) + "\n" for row in rows)
         (self.root / name).write_text(text, encoding="utf-8")
