@@ -9,7 +9,7 @@
 | Sharpe (annualized from the equity spacing) | 0.00 |
 | Max drawdown | 0.000% |
 | Hit rate | 0.0% (0 closed trades) |
-| Decision latency | median 4274 ms, p95 5366 ms (15 cycles) |
+| Decision latency | median 4063 ms, p95 4399 ms (5 cycles) |
 
 | Other | Value |
 | --- | --- |
@@ -18,11 +18,11 @@
 | Average closed-trade PnL | 0 TMN |
 | Fees paid | 0 TMN |
 | Fills | 0 |
-| Decision cycles | 17 |
-| Agent sources | fallback=15 |
+| Decision cycles | 7 |
+| Agent sources | fallback=5 |
 | Logged errors | 0 |
 
-Equity samples: 15.
+Equity samples: 5.
 
 ![Equity](equity.png)
 
