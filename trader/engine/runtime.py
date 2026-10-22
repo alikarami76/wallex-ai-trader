@@ -190,6 +190,9 @@ def _cycle(
         state["day_key"], state["day_start_equity"] = roll_day("", now, equity_now)
 
     mood = sentiment.snapshot(universe) if sentiment is not None else None
+    sentiment_calls: list[dict] = []
+    if mood is not None:
+        sentiment_calls = agent.apply_sentiment(mood, now_unix, allow_network=False)
     feature_by_symbol = {}
     features = []
     for symbol in universe:
@@ -217,6 +220,12 @@ def _cycle(
         )
         feature_by_symbol[symbol] = features[-1]
     candidates = build_candidates(features, cfg)
+    if mood is not None and not sentiment_calls and not candidates and not portfolio.positions:
+        sentiment_calls = agent.apply_sentiment(mood, now_unix, allow_network=True)
+        for row in features:
+            row.news_score = mood.news_score.get(row.symbol)
+            row.news_change = mood.news_change.get(row.symbol)
+            row.news_headlines = list(mood.headlines.get(row.symbol) or [])
     view = risk.view(
         portfolio, marks, now,
         peak_equity=state["peak_equity"],
@@ -290,6 +299,7 @@ def _cycle(
         "features": [row.compact() for row in features],
         "candidates": [row.compact() for row in candidates],
         "agent": decision.as_log(),
+        "llm_calls": [*sentiment_calls, decision.usage] if decision.usage else list(sentiment_calls),
         "risk": {
             "rejected": planned.rejected,
             "actions": [a.__dict__ for a in planned.actions],
@@ -300,9 +310,9 @@ def _cycle(
     })
     save_state(state_path, state)
     log.info(
-        "%s equity=%.0f exposure=%.1f%% phase=%s candidates=%s actions=%s source=%s",
+        "%s equity=%.0f exposure=%.1f%% phase=%s candidates=%s actions=%s source=%s tier=%s",
         mode, equity, view.gross_exposure * 100, view.phase, len(candidates),
-        len(planned.actions), decision.source,
+        len(planned.actions), decision.source, (decision.usage or {}).get("tier") or "-",
     )
     log.info("cycle latency %.0f ms", latency_ms)
 

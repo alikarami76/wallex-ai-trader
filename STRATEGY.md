@@ -9,7 +9,7 @@ flowchart TD
   public["Wallex public REST<br/>markets, package bans, depth, UDF candles"]
   private["Wallex private REST<br/>balances, orders, fees"]
   quant["Quant layer<br/>72h momentum, 24h trend, 4h pullback, book imbalance"]
-  agent["BoxAPI regime filter<br/>veto or downsize, one call per cycle"]
+  agent["BoxAPI router<br/>tier0 sentiment, tier2 only after the cost gate"]
   risk["Risk manager<br/>quarter-Kelly, stops, daily max-loss, liquidation"]
   exec["Execution<br/>maker bid with inventory skew, market stop"]
   journal["JSONL decisions, trades CSV, equity CSV, state.json"]
@@ -45,18 +45,27 @@ The quant score is `0.40 × trend + 0.30 × pullback depth + 0.20 × spread + 0.
 
 ## What the model does
 
-One BoxAPI `POST /chat/completions` per decision cycle. Every candidate and open position goes in one compact JSON prompt. The reply is one JSON object: regime, optional `veto_all`, and decisions with action, symbol, size fraction, confidence, and rationale.
+BoxAPI `POST /chat/completions` goes through one router. The quant layer is still the only trigger. The router picks the model after that, and it makes at most one decision call per cycle:
+
+| Tier | When | Model | Effort |
+| --- | --- | --- | --- |
+| routine (tier0) | Flat cycle, headline scoring | `gpt-6-luna` (or `gpt-5.4-mini`) | low |
+| signal (tier1) | A position is open and no new candidate cleared the cost gate | `gpt-6-luna` | medium |
+| trade (tier2) | A quant candidate exists, so the cost gate already passed | `gpt-6-sol` | high |
+
+Trade decisions are open, close, or size. Every candidate and open position goes in one compact JSON prompt. The reply is one JSON object: regime, optional `veto_all`, and decisions with action, symbol, size fraction, confidence, and rationale. Headline scoring is a separate short call, cached for 15 minutes, and it runs on a flat cycle so it does not sit in front of a trade. A failed score leaves the lexicon number in place.
 
 This is a meta-label, not a signal (López de Prado, 2018): the primary model proposes the bet, and the secondary model only accepts, rejects, or shrinks it. If the model abstains, the top quant candidate is still eligible. `regime: hostile` or `veto_all: true` blocks every new entry. An explicit BUY confirms that symbol only and does not fall through to a different name. A per-symbol `veto: true` drops that name.
 
-The model may also close a held name when close is below the slow EMA and the 24-hour return has turned negative. It may not invent a symbol, raise size, loosen a stop, or override the kill switch. A BUY confirmation with confidence below 0.55 is dropped. `temperature` and `response_format` are omitted. `gpt-5-mini` rejects temperature; both flags default to false in `config/default.yaml`.
+The model may also close a held name when close is below the slow EMA and the 24-hour return has turned negative. It may not invent a symbol, raise size, loosen a stop, or override the kill switch. A BUY confirmation with confidence below 0.55 is dropped. `temperature` and `response_format` are omitted. `reasoning_effort` is sent. If the model answers HTTP 400, the same request is retried once without that field. `LLM_MODEL`, when set, pins every tier to that one model.
 
 Budget, because the whole competition is $3:
 
-- at most one network call per cycle, then a cache keyed by the hour and the setup,
-- `max_llm_calls_per_hour: 2`, `max_llm_calls_total: 24`, `max_spend_usd: 2.50`,
+- hard stop at `max_spend_usd: 2.50` and `max_spend_usd_per_day: 1.25` (Tehran day), using `usage.cost` when BoxAPI sends it,
+- at $2.00 total or $1.00 today the router steps down one tier; inside $0.20 of either cap it uses the routine tier,
+- `max_llm_calls_per_hour: 8`, `max_llm_calls_total: 160`, at least 1 second between calls, and exponential backoff on HTTP 429 and 5xx,
 - assumed prices $0.50 / million input tokens and $2.00 / million output tokens, or $0.08 if the response has no usage,
-- token counts and estimated USD are logged on the call and stored on the decision (`agent.usage`) and in `data/llm_usage.json`,
+- model, tier, token counts, and USD are stored on the decision (`agent.usage` and `llm_calls`) and in `data/llm_usage.json`,
 - timeout, HTTP error, bad JSON, a missing key, or a cap all fall back to the deterministic ranking. The source field is `llm`, `llm_cache`, or `fallback`.
 
 Backtest sets `use_llm=False`. A key in the environment cannot spend money during a historical run.
@@ -129,7 +138,7 @@ python3 -m trader --mode shadow --config config/default.yaml --duration 900 --in
 Two inputs, both optional. A failed source is logged and skipped. The decision cycle still runs.
 
 - **Fear & Greed** (alternative.me). Level 0–100 and the one-day change. In the backtest the value is the latest point whose timestamp is at least one day before the bar, so the bot does not read an index that was not published yet. Live uses the newest published point.
-- **Headlines.** CoinDesk and Cointelegraph RSS, plus CryptoPanic and Reddit when those public endpoints answer. Titles are matched to the coin (`bitcoin` for BTCTMN, and the same for the other TMN names) and scored with a fixed positive/negative word list. The score is in [−1, 1]. The change is versus the previous cached score. Headlines are not in the backtest, because the feeds are not a point-in-time archive. The lexicon does not call BoxAPI, so it does not spend the $3 budget.
+- **Headlines.** CoinDesk and Cointelegraph RSS, plus CryptoPanic and Reddit when those public endpoints answer. Titles are matched to the coin (`bitcoin` for BTCTMN, and the same for the other TMN names) and scored with a fixed positive/negative word list. The score is in [−1, 1]. The change is versus the previous cached score. Headlines are not in the backtest, because the feeds are not a point-in-time archive. On a flat live or shadow cycle the router may rescore the same titles with tier0 (`gpt-6-luna`, low effort), cached for 15 minutes. If that call fails or the budget is tight, the lexicon score stays.
 
 Both the level and the change are fields on each symbol's feature payload, so the regime filter can see them. A missing field is not itself a veto.
 
@@ -195,4 +204,4 @@ Check these before sending real orders:
 
 ## خلاصه فارسی
 
-ربات فقط روی جفت‌های تومانی مجاز پلن ۱۸۳ معامله می‌کند و فهرست بازارهای ممنوع را در شروع می‌گیرد. سیگنال، پولبک در روند صعودی ساعتی است و فقط وقتی فعال می‌شود که هزینه رفت‌وبرگشت کارمزد را پوشش بدهد. شاخص ترس و طمع و امتیاز اخبار به‌عنوان ورودی به فیلتر رژیم داده می‌شوند؛ در آزمون تاریخی، بستن ورود در طمع شدید (۸۰ به بالا) هیچ معامله‌ای را عوض نکرد و در نتیجه خاموش ماند. مدل پیش‌فرض `gpt-6-luna` است و هزینهٔ دقیق از فیلد `usage.cost` خوانده می‌شود. مدل زبانی حداکثر یک بار در هر چرخه همه نمادها را با هم رتبه‌بندی یا رد می‌کند و اگر سقف هزینه یا خطا پیش بیاید، لایه قطعی جایگزین می‌شود. حد ضرر، سقف حجم، و خروج اجباری قبل از ۲۳:۳۰ روز ۲۳ اکتبر ۲۰۲۶ به وقت تهران خارج از اختیار مدل هستند.
+ربات فقط روی جفت‌های تومانی مجاز پلن ۱۸۳ معامله می‌کند و فهرست بازارهای ممنوع را در شروع می‌گیرد. سیگنال، پولبک در روند صعودی ساعتی است و فقط وقتی فعال می‌شود که هزینه رفت‌وبرگشت کارمزد را پوشش بدهد. شاخص ترس و طمع و امتیاز اخبار به‌عنوان ورودی به فیلتر رژیم داده می‌شوند؛ در آزمون تاریخی، بستن ورود در طمع شدید (۸۰ به بالا) هیچ معامله‌ای را عوض نکرد و در نتیجه خاموش ماند. مدل ارزان (`gpt-6-luna` با تلاش کم) امتیاز اخبار را می‌دهد و مدل قوی‌تر (`gpt-6-sol`) فقط وقتی صدا زده می‌شود که سیگنال کمی از دروازهٔ هزینه گذشته باشد. هزینه از `usage.cost` خوانده می‌شود و نزدیک سقف ۲٫۵۰ دلار مدل به ردهٔ ارزان‌تر برمی‌گردد. اگر سقف هزینه یا خطا پیش بیاید، لایه قطعی جایگزین می‌شود. حد ضرر، سقف حجم، و خروج اجباری قبل از ۲۳:۳۰ روز ۲۳ اکتبر ۲۰۲۶ به وقت تهران خارج از اختیار مدل هستند.
