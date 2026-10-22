@@ -23,7 +23,7 @@ from trader.scorecard import write_scorecard
 from trader.wallex.client import WallexClient, aggregate_bars, median_spacing
 
 
-_MODES = {"backtest", "shadow", "live", "report", "check-order", "replay", "scorecard", "audit"}
+_MODES = {"backtest", "shadow", "live", "report", "check-order", "replay", "scorecard", "audit", "watchdog"}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -100,6 +100,12 @@ def main(argv: list[str] | None = None) -> None:
             "secret_hits": len(report["secret_hits"]),
         }, indent=2))
         return
+    if args.mode == "watchdog":
+        from trader.watchdog import main as watchdog_main
+        raise SystemExit(watchdog_main([
+            "--log-dir", str(args.log_dir or "results/live"),
+            *(["--once"] if args.once else []),
+        ]))
     if args.mode == "backtest" and args.compare:
         base, head = args.compare
         if head != "HEAD":
