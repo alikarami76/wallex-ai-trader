@@ -124,6 +124,25 @@ Shadow:
 python3 -m trader --mode shadow --config config/default.yaml --duration 900 --interval 45 --fresh --out results/shadow
 ```
 
+## Result recorded on 2026-10-22
+
+`python3 -m trader --mode backtest --config config/default.yaml` on the live hourly history (695 bars, about 29 days) selected USDTTMN, BTCTMN, ETHTMN, XAUTTMN, XRPTMN, and DOGETMN. SOL and BNB were outside the 22 bp snapshot. The deterministic agent ran on every bar.
+
+| Metric | Value |
+| --- | --- |
+| Ending equity | 4,942,865 TMN |
+| Net return | −1.143% |
+| Max drawdown | 2.153% |
+| Sharpe | −2.19 |
+| Closed round trips | 26 |
+| Win rate | 53.8% |
+| Fees | 91,840 TMN |
+| Realized PnL | −21,986 TMN |
+
+Nine trailing stops were all winners. Fifteen time stops and two disaster stops (both DOGE) more than offset them. Two positions were still open at the last bar, so the equity figure is mark-to-market, not a fully realized flatten. Parameters were not changed after seeing this. A negative sample is preferred to a curve-fit that would not survive the next month. Candle aggregation for BTCTMN matched native hourly closes (median absolute error 0).
+
+The same day, a 15-minute shadow (`--duration 900 --interval 45`) on the live book kept 5,000,000 TMN, took no trades, logged 19 fallback decisions and zero errors, and confirmed the Wallex MCP candle tool. Live spreads that hour dropped XRPTMN, SOLTMN, and BNBTMN for being wider than 22 bps.
+
 ## Research, and what was not tuned
 
 On roughly 29 days of hourly candles, non-overlapping holds of this setup on the liquid majors were slightly positive after 0.50–0.58% costs: on the order of +0.1% average net trade, equity well under +1% at a 15% weight, max drawdown about 2–3%. Breakouts, continuation, cross-sectional momentum, and tight stops were negative after fees. The shipped parameters are that setup. They were not grid-searched against the backtest equity curve. If the engine backtest is flat, that is the result; names are not dropped after seeing them lose.

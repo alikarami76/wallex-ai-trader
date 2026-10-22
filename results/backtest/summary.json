@@ -1,0 +1,14 @@
+{
+  "ending_equity": 4942865.067607116,
+  "fees_paid": 91840.42085318467,
+  "realized_pnl": -21985.55138604343,
+  "bars": 695,
+  "symbols": [
+    "USDTTMN",
+    "BTCTMN",
+    "ETHTMN",
+    "XAUTTMN",
+    "XRPTMN",
+    "DOGETMN"
+  ]
+}
