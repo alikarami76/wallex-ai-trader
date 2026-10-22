@@ -57,6 +57,7 @@ from trader.strategy.quotes import execution_cost, inventory_skew, maker_buy_lim
 from trader.strategy.signals import build_candidates, evaluate_symbol
 from trader.timeutil import iso, now_tehran
 from trader.types import Bar, MarketRule
+from trader.alerts import report_cycle
 from trader.order_guard import OrderIntent, assess
 from trader.wallex.client import SPOT_ORDER_PATH, WallexClient, WallexError
 from trader.wallex.mcp import WallexMcp
@@ -533,6 +534,8 @@ def _cycle(
     portfolio.mark_peaks(marks)
     now = now_tehran()
     now_unix = time.time()
+    previous_cycle = float(ops.get("last_cycle_unix") or 0)
+    gap_seconds = (now_unix - previous_cycle) if previous_cycle else None
     equity_now = portfolio.equity(marks) if marks else portfolio.cash
     state["day_key"], state["day_start_equity"] = roll_day(
         state["day_key"], now, equity_now, state.get("day_start_equity"),
@@ -810,6 +813,13 @@ def _cycle(
     facts.pnl_from_golive_pct = None if not golive_equity else (equity / float(golive_equity) - 1)
     post_rows = advance(ops, facts, cfg, stage="post")
     allowed, cutoff_reason = entries_allowed(ops, facts, cfg)
+    report_cycle(
+        gap_seconds=gap_seconds,
+        ops_state=ops["state"],
+        order_rejects=order_rejects,
+        entry_taker_fills=entry_taker_fills,
+    )
+    ops["last_cycle_unix"] = now_unix
     _emit_contract(
         journal.directory, cfg, state, ops, facts, now, mode, send_orders, equity, portfolio,
         view, universe, unavailable, features, decision, planned, requests, fills, residuals,
