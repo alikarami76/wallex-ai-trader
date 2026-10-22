@@ -1,0 +1,70 @@
+{
+  "base_sha": "3880ac429f56f652cffd871d11dc5b05a1bd70ce",
+  "head_sha": "8d2948e5e1258a8fd570943c8291b0138dffed7c",
+  "config_hash": "ca79f960827676f3177a2b1940ee06c2b16bf77c5d75c3c9e39fedccc540fd0d",
+  "identical": true,
+  "base": {
+    "return_pct": -0.14,
+    "closed_trades": 17,
+    "ending_equity": 4993023.91105763,
+    "realized_pnl": -1037.642442369688,
+    "fees_paid": 10242.265218794308,
+    "max_drawdown_pct": 0.415
+  },
+  "head": {
+    "return_pct": -0.14,
+    "closed_trades": 17,
+    "ending_equity": 4993023.91105763,
+    "realized_pnl": -1037.642442369688,
+    "fees_paid": 10242.265218794308,
+    "max_drawdown_pct": 0.415
+  },
+  "trades": {
+    "identical": true,
+    "base_trades": 36,
+    "head_trades": 36,
+    "deltas": []
+  },
+  "sensitivity": [
+    {
+      "return_pct": -0.14,
+      "closed_trades": 17,
+      "ending_equity": 4993023.91105763,
+      "realized_pnl": -1037.642442369688,
+      "fees_paid": 10242.265218794308,
+      "max_drawdown_pct": 0.415,
+      "fee_multiple": 1.0,
+      "extra_slippage_bps": 0.0
+    },
+    {
+      "return_pct": 0.0,
+      "closed_trades": 0,
+      "ending_equity": 5000000.0,
+      "realized_pnl": 0.0,
+      "fees_paid": 0.0,
+      "max_drawdown_pct": 0.0,
+      "fee_multiple": 1.5,
+      "extra_slippage_bps": 0.0
+    },
+    {
+      "return_pct": -0.142,
+      "closed_trades": 17,
+      "ending_equity": 4992902.611738043,
+      "realized_pnl": -1158.9417619557353,
+      "fees_paid": 10241.900225926773,
+      "max_drawdown_pct": 0.417,
+      "fee_multiple": 1.0,
+      "extra_slippage_bps": 5.0
+    },
+    {
+      "return_pct": 0.0,
+      "closed_trades": 0,
+      "ending_equity": 5000000.0,
+      "realized_pnl": 0.0,
+      "fees_paid": 0.0,
+      "max_drawdown_pct": 0.0,
+      "fee_multiple": 1.5,
+      "extra_slippage_bps": 5.0
+    }
+  ]
+}

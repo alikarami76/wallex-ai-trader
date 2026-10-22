@@ -70,6 +70,8 @@ liara env set --app wallex-ai-trader --force \
 | `LLM_MODEL_STRONG` | Optional. Unset keeps `openai/gpt-6-sol` for the stakes tier. |
 | `DASHBOARD_USER` | Basic-auth user for `/` and `/status`. If unset, those routes stay closed. |
 | `DASHBOARD_PASSWORD` | Basic-auth password. Set it with the keys above, not in the image. |
+| `TELEGRAM_ALERT_BOT_TOKEN` | Optional. Alerts stay off unless this and the chat id are both set. |
+| `TELEGRAM_ALERT_CHAT_ID` | Optional chat for a cycle gap, HALT or KILLED, an order reject, or a taker entry fill. |
 
 `LLM_MODEL` is ignored. It does not pin every tier.
 

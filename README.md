@@ -26,6 +26,8 @@ cp .env.example .env
 | `LLM_MODEL_STRONG` | optional | Overrides the rare high-stakes tier. Default `openai/gpt-6-sol`. |
 | `DASHBOARD_USER` | desk only | HTTP basic user for the read-only page on the health port. |
 | `DASHBOARD_PASSWORD` | desk only | HTTP basic password. If either value is unset, the page stays closed. |
+| `TELEGRAM_ALERT_BOT_TOKEN` | optional | Alert bot token. Alerts stay off unless this and the chat id are both set. |
+| `TELEGRAM_ALERT_CHAT_ID` | optional | Chat that receives alerts. The token is not written to the journal. |
 
 The client omits `temperature` unless `llm.send_temperature: true`. A completion cap is sent as `max_completion_tokens` (`gpt-6-luna` rejects `max_tokens`). `reasoning_effort` is retried once without the field on HTTP 400. Each call logs `usage.cost` and the running total against the $3 budget. The hard cap defaults to $2.50: the router steps down a tier near it, then stops and uses the deterministic fallback. `/key` and `/credits` report a shared upstream account, so the bot does not use them as its balance.
 
@@ -65,11 +67,62 @@ python3 -m trader report --checkpoint C0 --log-dir results/shadow
 
 # Re-parse saved prompts and responses. Does not call BoxAPI.
 python3 -m trader replay --log-dir results/live
+
+# Offline veto scorecard. No keys. Reads the journal and the stored candles.
+python3 -m trader scorecard
+
+# Replay the stored candles and diff the trade list against a recorded commit.
+# Does not rewrite results/backtest/.
+python3 -m trader backtest --compare 3880ac429f56f652cffd871d11dc5b05a1bd70ce HEAD
 ```
 
 `./scripts/run.sh shadow --duration 900 --fresh` loads `.env` and calls the same CLI.
 
 Liara deployment is in [deploy/LIARA.md](deploy/LIARA.md). The image listens on port 8080. `/health` is open for the platform check. `/` is a read-only desk and `/status` is the latest cycle snapshot; both require `DASHBOARD_USER` and `DASHBOARD_PASSWORD`. The desk tails `cycles.jsonl`, `decisions.jsonl`, `adjustments.jsonl`, and `reviews.jsonl` on `TRADER_DATA_DIR`. It has no route that places or cancels orders, changes config, or starts or stops the loop. Secrets stay in `liara env set`.
+
+## Safety architecture
+
+These checks can only refuse an order, shrink a size, or write a log. They do not raise a size, add a symbol, or change a strategy number: EMA windows, return and pullback bands, ATR cap, spread cap, 24-hour hold, −4.5% stop, trail arm +2.5% with 1.2% distance, confidence floor 0.55, 12% size cap, 30% gross cap, frozen prior 0.45%, `ev_override` default off, kill levels −1.5% and −3%, and the Thu 2026-10-22 23:30 Asia/Tehran entry cutoff. The C0 report, the state machine, B1–B10, and the A0–A8 adjustment enum are unchanged. There are no new model calls. The $2.50 BoxAPI cap is unchanged.
+
+### Pre-send order guard
+
+`assess()` in `trader/order_guard.py` is a pure function. The live loop calls it after the price and quantity are known and before every order request. The request is sent only when all of these hold:
+
+- the market is spot TMN
+- the symbol is on the package-183 allowlist and is not on the denylist
+- a BUY is allowed only in `LIVE_ARMED`, and a SELL quantity is at most the held quantity
+- an entry is a post-only maker LIMIT
+- notional is at least 50,000 TMN
+- after the fill, that symbol is within the size cap and gross exposure is within the gross cap
+- the endpoint path is `/v1/account/orders`
+
+A refusal is not sent, does not advance the client-id sequence, and does not change the ops state. The symbol row records gate `order_guard` on `gate_trace` and `first_block`. No module under `trader/` names a withdraw endpoint.
+
+### Model off the exit path
+
+Stop, trail, and flatten actions run before `agent.decide`. That prefix does not wait on BoxAPI, so a hung completion cannot delay a protective exit. A buy that was not already on the menu from before those exits is dropped, so a stop that frees a slot cannot open a new entry in the same cycle.
+
+A hard timeout returns the deterministic fallback and stores `llm_source=fallback`. Output that fails the JSON schema is a veto: no decisions and no quant buy. Once `llm_usd_total` reaches $2.25 the client skips the call, logs the fallback, and uses that same deterministic path. The $2.00 tier step-down and the $2.50 hard cap still apply underneath. A menu that is only HOLD still skips the model. Invalid menu JSON stays HOLD.
+
+### Sealed scorecard
+
+At decision time each symbol row stores `prompt_hash`, `response_hash`, `action`, `size_mult`, and the signal snapshot. `python -m trader scorecard` is offline and needs no keys. It reads the journal and `results/backtest/candles`, then writes `results/scorecard.md` and `results/scorecard.json`. For each vetoed, shrunk, and accepted signal it computes after-fee PnL against a rules-only baseline, exiting at +24 hours or at the stop or trail, whichever comes first. Shadow-mode rows are counted.
+
+### Decision card
+
+The read-only desk and `python -m trader report` show one card per symbol on the latest cycle: features, `first_block`, the cost-gate inputs (prior, fee in, fee out, half-spread, buffer, hurdle), the model source, confidence, and rationale, and `size_before` → `size_after` with the reason codes. Prompts and keys are not rendered.
+
+### Alerts
+
+When both `TELEGRAM_ALERT_BOT_TOKEN` and `TELEGRAM_ALERT_CHAT_ID` are set, the process can alert on a cycle gap over 5 minutes, a `HALT` or `KILLED` state, an exchange order reject, or a taker entry fill. The same alert key stays quiet for 5 minutes after a send. If either variable is unset, nothing is sent. A failed send logs the exception type and not the request URL.
+
+### Compare
+
+`python -m trader backtest --compare <sha> HEAD` replays the stored candles with the 2026-10-22 market precision, diffs the trade list against that commit's `results/backtest/trades.csv`, and writes `results/compare/compare.md` plus `compare.json`. The report stamps the base SHA, the HEAD SHA, and the config hash. A sensitivity table reruns the same candles at 1.0× and 1.5× fees, each with 0 and +5 bps extra slippage. Those multiples are copies; `config/default.yaml` is not edited, and `results/backtest/` is not rewritten.
+
+HEAD versus `3880ac429f56f652cffd871d11dc5b05a1bd70ce` is identical: −0.140% mark-to-market, 17 closed trades, ending equity 4,993,023.91105763 TMN. At 1.5× fees the existing cost gate takes no trades. At 1.0× fees and +5 bps extra slippage the same 17 trades finish at −0.142%.
+
+Random model text cannot raise a size or turn a veto into a buy. The order-guard property tests and the schema veto cover that. Nothing in this section sets `TRADER_LIVE_AUTHORIZED`.
 
 ## Unattended run
 
