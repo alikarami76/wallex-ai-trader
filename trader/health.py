@@ -1,16 +1,16 @@
-"""Tiny HTTP server so a long-running trader can satisfy a platform port check.
+"""HTTP port for Liara and the read-only desk.
 
-Liara's Docker platform publishes one HTTP port and can curl it before it
-sends traffic to a new release. The trading loop is not a web app, so this
-server runs beside it. `/health` is only "the process is up". `/status` is
-the latest cycle, with no API keys.
+Liara's Docker platform publishes one HTTP port and curls `/health` before it
+sends traffic to a new release. `/health` stays open. `/` is the desk and
+`/status` is the in-memory snapshot; both require `DASHBOARD_USER` and
+`DASHBOARD_PASSWORD`. Nothing on this port can place or cancel an order.
 """
 
 from __future__ import annotations
 
 import json
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time
 from pathlib import Path
 
 _lock = threading.Lock()
@@ -41,37 +41,46 @@ def snapshot() -> dict:
         return dict(_status)
 
 
-class _Handler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:  # noqa: N802
-        path = self.path.split("?", 1)[0]
-        if path in {"/health", "/"}:
-            self._json({"ok": True})
-            return
-        if path == "/status":
-            self._json(snapshot())
-            return
-        body = b"not found"
-        self.send_response(404)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+class _Bound:
+    """The slice of a server the trader and the tests need."""
 
-    def log_message(self, fmt: str, *args) -> None:
-        return
+    def __init__(self, server, thread: threading.Thread, address: tuple[str, int]):
+        self._server = server
+        self._thread = thread
+        self.server_address = address
 
-    def _json(self, payload: dict) -> None:
-        body = json.dumps(payload, ensure_ascii=False, default=str).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    def shutdown(self) -> None:
+        self._server.should_exit = True
+        self._thread.join(timeout=5)
+
+    def server_close(self) -> None:
+        self.shutdown()
 
 
-def serve_in_background(host: str, port: int) -> ThreadingHTTPServer:
-    ThreadingHTTPServer.allow_reuse_address = True
-    server = ThreadingHTTPServer((host, port), _Handler)
-    thread = threading.Thread(target=server.serve_forever, name="health", daemon=True)
+def serve_in_background(host: str, port: int, directory: Path | None = None) -> _Bound:
+    """Serve `/health` and the desk. Uvicorn does not install signal handlers."""
+    import uvicorn
+
+    from trader.dashboard import create_app
+
+    app = create_app(directory)
+    config = uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False)
+    server = uvicorn.Server(config)
+    server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+    thread = threading.Thread(target=server.run, name="health", daemon=True)
     thread.start()
-    return server
+    address = _wait_until_bound(server, thread)
+    return _Bound(server, thread, address)
+
+
+def _wait_until_bound(server, thread: threading.Thread) -> tuple[str, int]:
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        for item in getattr(server, "servers", None) or []:
+            for sock in getattr(item, "sockets", None) or []:
+                host, port = sock.getsockname()[:2]
+                return str(host), int(port)
+        if not thread.is_alive():
+            break
+        time.sleep(0.02)
+    raise RuntimeError("health server failed to bind")

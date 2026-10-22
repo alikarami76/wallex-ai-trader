@@ -1,5 +1,5 @@
 # Long-running Wallex trader for Liara's Docker platform.
-# The process listens on 8080 for /health and runs the trading loop beside it.
+# The process listens on 8080 for /health and a read-only desk, and runs the loop beside it.
 # Secrets are not baked in. Set them with `liara env set`.
 FROM python:3.12-slim-bookworm
 

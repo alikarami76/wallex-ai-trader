@@ -15,13 +15,24 @@ class HealthTests(unittest.TestCase):
         root.mkdir(parents=True, exist_ok=True)
         configure_status(root / "status.json")
         update_status(mode="shadow", dry_run=True, equity_tmn=5_000_000)
-        server = serve_in_background("127.0.0.1", 0)
+        saved = {key: os.environ.get(key) for key in ("DASHBOARD_USER", "DASHBOARD_PASSWORD")}
+        os.environ["DASHBOARD_USER"] = "desk"
+        os.environ["DASHBOARD_PASSWORD"] = "desk-secret"
+        server = serve_in_background("127.0.0.1", 0, root)
         port = server.server_address[1]
+        token = self._basic("desk", "desk-secret")
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
                 self.assertEqual(response.status, 200)
                 self.assertEqual(json.load(response), {"ok": True})
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=2) as response:
+            with self.assertRaises(urllib.error.HTTPError) as closed:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=2)
+            self.assertEqual(closed.exception.code, 401)
+            status_request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/status",
+                headers={"Authorization": token},
+            )
+            with urllib.request.urlopen(status_request, timeout=2) as response:
                 body = json.load(response)
             self.assertEqual(body["mode"], "shadow")
             self.assertTrue(body["dry_run"])
@@ -29,12 +40,24 @@ class HealthTests(unittest.TestCase):
             encoded = json.dumps(body)
             self.assertNotIn("WALLEX_API_KEY", encoded)
             self.assertNotIn("LLM_API_KEY", encoded)
+            self.assertNotIn("desk-secret", encoded)
             with self.assertRaises(urllib.error.HTTPError) as caught:
                 urllib.request.urlopen(f"http://127.0.0.1:{port}/orders", timeout=2)
             self.assertEqual(caught.exception.code, 404)
         finally:
             server.shutdown()
             server.server_close()
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    @staticmethod
+    def _basic(user: str, password: str) -> str:
+        import base64
+        token = base64.b64encode(f"{user}:{password}".encode()).decode()
+        return f"Basic {token}"
 
     def test_data_dir_is_the_disk_root(self):
         keys = (

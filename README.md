@@ -24,6 +24,8 @@ cp .env.example .env
 | `LLM_MODEL` | unused | Ignored. It does not pin every tier. |
 | `LLM_MODEL_CHEAP` | optional | Overrides routine, signal, and trade. Default `openai/gpt-6-luna`. |
 | `LLM_MODEL_STRONG` | optional | Overrides the rare high-stakes tier. Default `openai/gpt-6-sol`. |
+| `DASHBOARD_USER` | desk only | HTTP basic user for the read-only page on the health port. |
+| `DASHBOARD_PASSWORD` | desk only | HTTP basic password. If either value is unset, the page stays closed. |
 
 The client omits `temperature` unless `llm.send_temperature: true`. A completion cap is sent as `max_completion_tokens` (`gpt-6-luna` rejects `max_tokens`). `reasoning_effort` is retried once without the field on HTTP 400. Each call logs `usage.cost` and the running total against the $3 budget. The hard cap defaults to $2.50: the router steps down a tier near it, then stops and uses the deterministic fallback. `/key` and `/credits` report a shared upstream account, so the bot does not use them as its balance.
 
@@ -67,7 +69,7 @@ python3 -m trader replay --log-dir results/live
 
 `./scripts/run.sh shadow --duration 900 --fresh` loads `.env` and calls the same CLI.
 
-Liara deployment is in [deploy/LIARA.md](deploy/LIARA.md). The image listens on port 8080 for `/health` and `/status` and runs the shadow loop beside it. State goes to `TRADER_DATA_DIR` so a Liara disk keeps the decision log across restarts. Secrets stay in `liara env set`.
+Liara deployment is in [deploy/LIARA.md](deploy/LIARA.md). The image listens on port 8080. `/health` is open for the platform check. `/` is a read-only desk and `/status` is the latest cycle snapshot; both require `DASHBOARD_USER` and `DASHBOARD_PASSWORD`. The desk tails `cycles.jsonl`, `decisions.jsonl`, `adjustments.jsonl`, and `reviews.jsonl` on `TRADER_DATA_DIR`. It has no route that places or cancels orders, changes config, or starts or stops the loop. Secrets stay in `liara env set`.
 
 ## Unattended run
 

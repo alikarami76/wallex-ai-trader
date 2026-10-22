@@ -72,7 +72,7 @@ def _start_health(directory: Path) -> None:
         port = int(raw)
     except ValueError as exc:
         raise SystemExit(f"TRADER_HEALTH_PORT must be an integer, got {raw!r}") from exc
-    serve_in_background(host, port)
+    serve_in_background(host, port, directory)
     log.info("health listening on http://%s:%s/health", host, port)
 
 
