@@ -12,7 +12,7 @@ from pathlib import Path
 
 from trader.config import load_config, runtime_dirs
 from trader.engine.backtest import run_backtest, run_walk_forward, sentiment_ablation
-from trader.engine.ops import config_hash, replay_offline, write_checkpoint
+from trader.engine.ops import config_file_hash, config_hash, replay_offline, write_checkpoint
 from trader.sentiment import SentimentFeed
 from trader.engine.runtime import check_order, run_runtime
 from trader.engine.universe import select_universe
@@ -51,6 +51,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--log-dir", default=None, help="journal directory for report, replay, and scorecard")
     parser.add_argument("--candles", default=None, help="stored candle directory for the offline scorecard")
     parser.add_argument("--wallex-snapshot", default=None, help="optional balances file for the offline audit")
+    parser.add_argument("--e2e", action="store_true", help="flag virtual time jumps instead of failing the audit")
     parser.add_argument(
         "--compare",
         nargs=2,
@@ -91,8 +92,9 @@ def main(argv: list[str] | None = None) -> None:
             log_dir,
             dest,
             starting_cash=float(cfg["account"]["initial_equity_tmn"]),
-            config_hash=config_hash(cfg),
+            config_hash=config_file_hash(args.config) if Path(args.config).is_file() else config_hash(cfg),
             wallex_snapshot=Path(args.wallex_snapshot) if args.wallex_snapshot else None,
+            e2e=bool(args.e2e),
         )
         print(dest / "audit.md")
         print(json.dumps({

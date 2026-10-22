@@ -164,12 +164,22 @@ def git_sha() -> str:
 
 
 def config_hash(cfg: dict) -> str:
-    blob = json.dumps(cfg, sort_keys=True, default=str, ensure_ascii=False)
+    visible = {key: value for key, value in cfg.items() if not str(key).startswith("_")}
+    blob = json.dumps(visible, sort_keys=True, default=str, ensure_ascii=False)
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
+def config_file_hash(path: str | Path) -> str:
+    """Hash of the config file on disk. Overlays in memory do not change it."""
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
 def set_log_context(cfg: dict, go_live_sha: str | None) -> None:
-    _LOG_CONTEXT["config_hash"] = config_hash(cfg)
+    path = cfg.get("_config_path") if isinstance(cfg, dict) else None
+    if path and Path(str(path)).is_file():
+        _LOG_CONTEXT["config_hash"] = config_file_hash(path)
+    else:
+        _LOG_CONTEXT["config_hash"] = config_hash(cfg)
     _LOG_CONTEXT["go_live_sha"] = go_live_sha
 
 

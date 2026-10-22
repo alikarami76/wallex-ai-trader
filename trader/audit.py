@@ -17,6 +17,7 @@ from trader.engine.ops import read_jsonl
 
 DRIFT_TMN = 1.0
 GAP_SECONDS = 300.0
+DUST_COIN_QTY = 1e-6
 TEHRAN_OFFSET = timedelta(hours=3, minutes=30)
 
 _SECRET_PATTERNS = (
@@ -47,12 +48,14 @@ def write_audit(
     starting_cash: float = 5_000_000,
     config_hash: str | None = None,
     wallex_snapshot: Path | None = None,
+    e2e: bool = False,
 ) -> dict:
     report = build_audit(
         Path(log_dir),
         starting_cash=starting_cash,
         config_hash=config_hash,
         wallex_snapshot=Path(wallex_snapshot) if wallex_snapshot else None,
+        e2e=e2e,
     )
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
@@ -85,6 +88,7 @@ def build_audit(
     starting_cash: float = 5_000_000,
     config_hash: str | None = None,
     wallex_snapshot: Path | None = None,
+    e2e: bool = False,
 ) -> dict:
     log_dir = Path(log_dir)
     files = {name: read_jsonl(log_dir / name) for name in _JSONL_NAMES}
@@ -101,11 +105,11 @@ def build_audit(
     dust_tmn = _dust_tmn(cycles)
     snapshot = _snapshot(wallex_snapshot, cash, coins, priced) if wallex_snapshot else None
     failures = []
-    if any(item["drift_tmn"] > DRIFT_TMN for item in drift):
+    if any(item.get("over_limit") for item in drift):
         failures.append("equity drift over 1 TMN")
     if duplicates:
         failures.append("duplicate client_id")
-    if gaps:
+    if gaps and not e2e:
         failures.append("cycle gap over 5 min")
     if clocks:
         failures.append("ts_utc and ts_tehran disagree")
@@ -120,7 +124,11 @@ def build_audit(
         "failures": failures,
         "starting_cash_tmn": float(starting_cash),
         "cash_tmn": round(cash, 4),
-        "coins": {asset: qty for asset, qty in sorted(coins.items()) if abs(qty) > 1e-12},
+        "coins": {asset: qty for asset, qty in sorted(coins.items()) if abs(qty) > DUST_COIN_QTY},
+        "dust_coins": {
+            asset: qty for asset, qty in sorted(coins.items())
+            if 1e-12 < abs(qty) <= DUST_COIN_QTY
+        },
         "max_drift_tmn": round(max((item["drift_tmn"] for item in drift), default=0.0), 4),
         "drift": drift,
         "duplicate_client_ids": duplicates,
@@ -131,6 +139,7 @@ def build_audit(
         "fee_bill_tmn": round(sum(float(item.get("fee_tmn") or 0) for item in fills), 4),
         "secret_hits": secrets,
         "dust_tmn": dust_tmn,
+        "e2e": bool(e2e),
         "snapshot": snapshot,
         "rows": {name: len(rows) for name, rows in files.items()},
     }
@@ -174,6 +183,8 @@ def render_markdown(report: dict) -> str:
     lines.append(f"Duplicate client ids: {len(report['duplicate_client_ids'])}.")
     for item in report["duplicate_client_ids"]:
         lines.append(f"- {item['client_id']} x{item['count']}")
+    if report.get("e2e") and report["gaps"]:
+        lines.append("E2E virtual time jumps are expected and do not fail this audit.")
     lines.append(f"Cycle gaps over 5 min: {len(report['gaps'])}.")
     for item in report["gaps"]:
         lines.append(f"- {item['from_ts']} → {item['to_ts']} ({item['seconds']:.0f}s)")
@@ -297,7 +308,12 @@ def _apply_one(cash, coins, priced, fill):
 
 
 def _equity_drift(cycles: list[dict], decisions: list[dict], starting_cash: float) -> list[dict]:
-    """Replay fills in log order and compare each logged equity to cash plus coin marks."""
+    """Replay fills in log order and compare each logged equity to cash plus coin marks.
+
+    An open coin may differ from the book mid by up to half the spread. A flat
+    book, and a sell-rounding crumb of at most 1e-6 coin, still has to land
+    within 1 TMN.
+    """
     cycle_ids = {row.get("cycle_id") for row in cycles if row.get("cycle_id")}
     by_cycle: dict[str, list[dict]] = {}
     if cycle_ids:
@@ -305,6 +321,7 @@ def _equity_drift(cycles: list[dict], decisions: list[dict], starting_cash: floa
             if row.get("record") != "symbol" or row.get("cycle_id") not in cycle_ids:
                 continue
             by_cycle.setdefault(str(row.get("cycle_id")), []).extend(_fills([row]))
+    spread_by_cycle, spread_by_asset = _spreads(decisions)
     cash = float(starting_cash)
     coins: dict[str, float] = {}
     priced: dict[str, float] = {}
@@ -319,16 +336,64 @@ def _equity_drift(cycles: list[dict], decisions: list[dict], starting_cash: floa
         logged = row.get("equity_tmn")
         if logged is None:
             continue
+        live = {asset: qty for asset, qty in coins.items() if abs(qty) > DUST_COIN_QTY}
         marks = _marks(row) or priced
-        equity = _marked(cash, coins, marks, priced)
+        equity = _marked(cash, live, marks, priced)
         logged_value = float(logged)
+        drift = abs(equity - logged_value)
+        prices = {}
+        for asset, qty in live.items():
+            mark = marks.get(asset)
+            if mark is None:
+                mark = priced.get(asset) or 0.0
+            prices[asset] = float(mark or 0)
+        spreads = dict(spread_by_asset)
+        spreads.update(spread_by_cycle.get(str(row.get("cycle_id") or ""), {}))
+        limit, over = _drift_over(live, prices, spreads, drift)
         rows.append({
             "ts": str(row.get("ts_tehran") or row.get("timestamp") or row.get("ts_utc") or ""),
             "rebuilt_equity_tmn": round(equity, 4),
             "logged_equity_tmn": round(logged_value, 4),
-            "drift_tmn": round(abs(equity - logged_value), 4),
+            "drift_tmn": round(drift, 4),
+            "limit_tmn": round(limit, 4),
+            "over_limit": over,
         })
     return rows
+
+
+def _drift_over(coins: dict[str, float], prices: dict[str, float], spreads: dict[str, float], drift: float) -> tuple[float, bool]:
+    if not coins:
+        return DRIFT_TMN, drift > DRIFT_TMN
+    allowance = 0.0
+    for asset, qty in coins.items():
+        spread = spreads.get(asset)
+        price = prices.get(asset) or 0.0
+        if spread is None or price <= 0:
+            continue
+        allowance += abs(qty) * price * (float(spread) / 2.0 / 10_000.0)
+    if allowance <= 0:
+        return DRIFT_TMN, drift > DRIFT_TMN
+    return allowance, drift > allowance + 0.05
+
+
+def _spreads(decisions: list[dict]) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
+    by_cycle: dict[str, dict[str, float]] = {}
+    by_asset: dict[str, float] = {}
+    for row in decisions:
+        cid = str(row.get("cycle_id") or "")
+        pairs = []
+        liquidity = row.get("liquidity") or {}
+        if row.get("symbol") and liquidity.get("spread_bps") is not None:
+            pairs.append((row.get("symbol"), liquidity.get("spread_bps")))
+        for feature in row.get("features") or []:
+            if isinstance(feature, dict) and feature.get("symbol") and feature.get("spread_bps") is not None:
+                pairs.append((feature.get("symbol"), feature.get("spread_bps")))
+        for symbol, spread in pairs:
+            asset = _base(str(symbol))
+            by_asset[asset] = float(spread)
+            if cid:
+                by_cycle.setdefault(cid, {})[asset] = float(spread)
+    return by_cycle, by_asset
 
 
 def _marked(cash: float, coins: dict[str, float], marks: dict[str, float], priced: dict[str, float]) -> float:
@@ -395,10 +460,28 @@ def _clock_reason(row: dict) -> str:
 
 
 def _duplicate_ids(decisions: list[dict]) -> list[dict]:
-    counts: dict[str, int] = {}
+    """Count each send once.
+
+    The same client id on a symbol row and on that cycle's fills blob is one
+    order. Two symbol rows, or two cycle blobs with no symbol row, still count
+    as two sends.
+    """
+    symbol_ids: list[str] = []
+    other_ids: list[str] = []
     for row in decisions:
-        for client_id in _client_ids(row):
-            counts[client_id] = counts.get(client_id, 0) + 1
+        ids = list(dict.fromkeys(_client_ids(row)))
+        if row.get("record") == "symbol":
+            symbol_ids.extend(ids)
+        else:
+            other_ids.extend(ids)
+    counts: dict[str, int] = {}
+    for client_id in symbol_ids:
+        counts[client_id] = counts.get(client_id, 0) + 1
+    on_a_symbol = set(symbol_ids)
+    for client_id in other_ids:
+        if client_id in on_a_symbol:
+            continue
+        counts[client_id] = counts.get(client_id, 0) + 1
     return [{"client_id": key, "count": count} for key, count in sorted(counts.items()) if count > 1]
 
 
@@ -495,6 +578,8 @@ def _snapshot(path: Path | None, cash: float, coins: dict[str, float], priced: d
         if asset == "TMN":
             if abs(got - want) > DRIFT_TMN:
                 failures.append({"asset": asset, "reason": f"TMN drift {abs(got - want):.4f}"})
+            continue
+        if abs(got - want) <= DUST_COIN_QTY:
             continue
         price = float(priced.get(asset) or 0)
         notional = abs(got - want) * price

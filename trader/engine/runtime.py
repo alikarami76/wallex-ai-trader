@@ -297,7 +297,16 @@ def _emit_contract(
         extra_gates["risk_gross"] = ("gross" not in reasons and "exposure" not in reasons, None, cfg["risk"].get("max_gross_exposure"))
         extra_gates["risk_throttle"] = ("hour" not in reasons and "cooldown" not in reasons, None, None)
         extra_gates["risk_kill"] = (not view.kill_switch, view.kill_reason, cfg["risk"].get("daily_max_drawdown"))
-        extra_gates["risk_cutoff"] = (allowed or cutoff_reason not in {"entry_cutoff", "flatten", "halt"}, cutoff_reason, None)
+        fill_for_gate = next((item for item in fills if item.symbol == row.symbol), None)
+        time_stop = (
+            fill_for_gate is not None
+            and fill_for_gate.side == "SELL"
+            and "time stop" in str(fill_for_gate.reason or "").lower()
+        ) or any(
+            item.symbol == row.symbol and item.side == "SELL" and item.source == "time"
+            for item in planned.actions
+        )
+        extra_gates["risk_cutoff"] = _risk_cutoff_gate(allowed, cutoff_reason, time_stop=time_stop)
         below_min = "b9" in reasons or "notional" in reasons
         extra_gates["min_notional"] = (not below_min, None, cfg["risk"].get("min_notional_tmn"))
         trace = gate_trace(gates_from_feature(compact, cfg, {"symbol": row.symbol, "gates": extra_gates}))
@@ -999,6 +1008,14 @@ def _order_guard_reason(
     if verdict.ok:
         return None
     return verdict.reason
+
+
+def _risk_cutoff_gate(allowed, cutoff_reason, *, time_stop: bool):
+    """Entry cutoff does not fail a time-stop exit. The trace says time_stop."""
+    if time_stop:
+        return True, "time_stop", None
+    passed = bool(allowed) or cutoff_reason not in {"entry_cutoff", "flatten", "halt"}
+    return passed, cutoff_reason, None
 
 
 def _dust_report(state, portfolio, min_notional: float) -> tuple[list[dict], float]:

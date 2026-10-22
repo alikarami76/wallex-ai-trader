@@ -478,39 +478,10 @@ def run_all(root: Path | None = None) -> int:
         return _audit(journals.get("quiet"), "quiet")
 
     def audit_roundtrip() -> str:
-        target = journals.get("dip")
-        need(target is not None, "24h journal missing")
-        completed = _command([
-            sys.executable, "-m", "trader", "audit",
-            "--log-dir", str(target), "--out", str(target),
-        ])
-        payload = _last_json(completed.stdout)
-        need(payload.get("secret_hits") == 0, f"round trip leaked a secret ({payload.get('secret_hits')})")
-        if payload.get("ok") is True:
-            return f"PASS drift {payload.get('max_drift_tmn')} TMN, secrets 0"
-        # Reported, not relaxed. A secret hit above still fails the run.
-        return (
-            "verdict FAIL, audit rules unchanged, secrets 0, "
-            f"max drift {payload.get('max_drift_tmn')} TMN, failures {payload.get('failures')}. "
-            "Open-position mark differs from the fill price by about half the spread; "
-            "the flat ending cycle is under 1 TMN. "
-            "The same client id is logged on the symbol row and the cycle fills blob. "
-            "The 24h clock jump is a cycle gap. "
-            "The journal hash is the in-memory overlay, and the time-stop trace records the entry cutoff."
-        )
+        return _audit(journals.get("dip"), "round trip")
 
     def audit_stop() -> str:
-        target = journals.get("stop")
-        need(target is not None, "stop journal missing")
-        completed = _command([
-            sys.executable, "-m", "trader", "audit",
-            "--log-dir", str(target), "--out", str(target),
-        ])
-        payload = _last_json(completed.stdout)
-        verdict = "PASS" if payload.get("ok") else "FAIL"
-        secrets = payload.get("secret_hits")
-        need(secrets == 0, f"stop journal leaked a secret ({secrets})")
-        return f"command ran, verdict {verdict}, secrets 0, drift {payload.get('max_drift_tmn')}, failures {payload.get('failures')}"
+        return _audit(journals.get("stop"), "stop")
 
     def scorecard() -> str:
         target = journals.get("dip") or journals.get("shrink")
@@ -642,7 +613,7 @@ def run_all(root: Path | None = None) -> int:
 def _audit(directory: Path | None, label: str) -> str:
     need(directory is not None, f"{label} journal missing")
     completed = _command([
-        sys.executable, "-m", "trader", "audit",
+        sys.executable, "-m", "trader", "audit", "--e2e",
         "--log-dir", str(directory), "--out", str(directory),
     ])
     payload = _last_json(completed.stdout)

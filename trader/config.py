@@ -52,6 +52,7 @@ def load_config(path: str | Path) -> dict:
     payload.setdefault("mcp", {"enabled": True, "url": "https://api.wallex.ir/mcp", "timeout_seconds": 8, "refresh_seconds": 600})
     payload.setdefault("account", {"initial_equity_tmn": 5_000_000})
     _apply_data_dir(payload)
+    payload["_config_path"] = str(Path(path))
     return payload
 
 
