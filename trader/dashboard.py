@@ -712,9 +712,9 @@ def _llm_panel(latest: dict, spent: float | None) -> str:
     klass = "loss" if amount > _LLM_CAP_USD else "accent"
     return (
         "<section class='panel'><h2>LLM spend</h2>"
-        f"<p class='stat num {klass}'>${amount:,.4f} <span class='meta'>of ${_LLM_CAP_USD:.2f}</span></p>"
+        f"<p class='stat num {klass}'>${amount:,.6f} <span class='meta'>of ${_LLM_CAP_USD:.2f}</span></p>"
         f"<div class='bar'><span style='width:{width:.1f}%'></span></div>"
-        f"<p class='meta'>Today ${(_num(latest.get('llm_usd_today')) or 0):,.4f}"
+        f"<p class='meta'>Today ${(_num(latest.get('llm_usd_today')) or 0):,.6f}"
         f" · tier {_esc(latest.get('llm_tier') or '—')} · {_esc(latest.get('llm_model') or '—')}"
         f" · {_esc(latest.get('llm_source') or '—')}</p></section>"
     )

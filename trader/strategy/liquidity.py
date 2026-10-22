@@ -113,11 +113,48 @@ def _remember(history: dict | None, key: str, value: float | None, limit: int) -
 
 
 def _quote_volume(bars: list[Bar], limit: int) -> list[float]:
-    out: list[float] = []
+    return [volume for _stamp, volume in _quote_points(bars, limit)]
+
+
+def _quote_points(bars: list[Bar], limit: int) -> list[tuple[int, float]]:
+    out: list[tuple[int, float]] = []
     for bar in bars[-limit:]:
         if bar.close > 0 and bar.volume >= 0 and math.isfinite(bar.volume):
-            out.append(bar.volume * bar.close)
+            out.append((int(bar.time), bar.volume * bar.close))
     return out
+
+
+def _volume_window(history: dict | None, bars: list[Bar], limit: int) -> list[float]:
+    """Quote-volume window for the z-score.
+
+    A full bar fetch returns the same series `_quote_volume` would. A short
+    refetch updates that window by bar time and does not shrink it.
+    """
+    fresh = _quote_points(bars, limit)
+    if not isinstance(history, dict):
+        return [volume for _stamp, volume in fresh]
+    if len(bars) >= limit:
+        history["volume_ts"] = [stamp for stamp, _volume in fresh]
+        history["volume"] = [volume for _stamp, volume in fresh]
+        return list(history["volume"])
+    by_time: dict[int, float] = {}
+    stored_ts = list(history.get("volume_ts") or [])
+    stored_vol = list(history.get("volume") or [])
+    for stamp, volume in zip(stored_ts, stored_vol):
+        try:
+            by_time[int(stamp)] = float(volume)
+        except (TypeError, ValueError):
+            continue
+    for stamp, volume in fresh:
+        by_time[int(stamp)] = float(volume)
+    ordered = sorted(by_time)
+    if len(ordered) > limit:
+        ordered = ordered[-limit:]
+    history["volume_ts"] = ordered
+    history["volume"] = [by_time[stamp] for stamp in ordered]
+    if len(history["volume"]) >= len(fresh):
+        return list(history["volume"])
+    return [volume for _stamp, volume in fresh]
 
 
 def _health(z: float | None, z_block: float, *, invert: bool = False) -> float | None:
@@ -159,7 +196,7 @@ def measure_liquidity(
 
     depth_series = _remember(history, "depth", liq.depth_100_tmn, keep)
     spread_series = _remember(history, "spread", spread_bps, keep)
-    volumes = _quote_volume(bars, keep)
+    volumes = _volume_window(history, bars, keep)
     if volumes:
         liq.quote_volume = volumes[-1]
     logs = [math.log(max(item, 1.0)) for item in volumes]

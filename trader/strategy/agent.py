@@ -458,7 +458,7 @@ def _price(usage: dict, settings: dict, model: str) -> dict:
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "reasoning_tokens": reasoning,
-        "usd": round(usd, 8),
+        "usd": float(usd),
         "cost_source": source,
     }
 

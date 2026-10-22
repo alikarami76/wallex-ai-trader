@@ -23,6 +23,7 @@ class WallexMcp:
         self.timeout = timeout
         self._ready = False
         self._failures = 0
+        self.disabled_reason = ""
 
     @property
     def disabled(self) -> bool:
@@ -46,9 +47,18 @@ class WallexMcp:
                 return text
             return json.dumps(result)[:2000]
         except Exception as exc:
-            self._failures += 1
-            log.warning("MCP tool %s failed (%s). failures=%s", name, exc, self._failures)
+            self._note_failure(name, exc)
             return None
+
+    def _note_failure(self, name: str, exc: BaseException) -> None:
+        code = _error_code(exc)
+        if code == 1203:
+            self._failures = 2
+            self.disabled_reason = "MCP refused the key (HTTP 403 code 1203); candles stay on REST"
+            log.warning("%s", self.disabled_reason)
+            return
+        self._failures += 1
+        log.warning("MCP tool %s failed (%s). failures=%s", name, exc, self._failures)
 
     def _rpc(self, method: str, params: dict) -> dict:
         payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
@@ -72,6 +82,35 @@ class WallexMcp:
         if "error" in parsed:
             raise RuntimeError(str(parsed["error"]))
         return parsed.get("result") or {}
+
+
+def candle_data_path(mcp: WallexMcp | None = None) -> str:
+    """Candles are always read from REST. MCP is a prompt note, never the source."""
+    reason = ""
+    if mcp is not None and mcp.disabled_reason:
+        reason = f" ({mcp.disabled_reason})"
+    return f"candle data path: REST /v1/udf/history{reason}"
+
+
+def _error_code(exc: BaseException) -> int | None:
+    text = str(exc)
+    start = text.find("{")
+    payload = None
+    if start >= 0:
+        try:
+            payload = json.loads(text[start:])
+        except json.JSONDecodeError:
+            payload = None
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("code")
+    result = payload.get("result")
+    if code is None and isinstance(result, dict):
+        code = result.get("error_code")
+    try:
+        return int(code) if code is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _sse_data(raw: str) -> str:

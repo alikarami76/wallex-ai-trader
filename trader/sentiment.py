@@ -127,6 +127,8 @@ class SentimentFeed:
         self._opener = opener or urllib.request.urlopen
         self.series: list[tuple[int, float, str]] = []
         self._cache = self._load()
+        self._disabled_sources: set[str] = set()
+        self._logged_at: dict[str, float] = {}
 
     def _load(self) -> dict:
         if not self.path.exists():
@@ -205,6 +207,9 @@ class SentimentFeed:
             return
         titles: list[str] = []
         for name, url in SOURCES.items():
+            if name in self._disabled_sources:
+                snap.sources_failed.append(name)
+                continue
             try:
                 if name == "reddit":
                     titles.extend(self._reddit_titles(url))
@@ -213,7 +218,15 @@ class SentimentFeed:
                 snap.sources_ok.append(name)
             except Exception as exc:
                 snap.sources_failed.append(name)
-                log.info("sentiment source %s failed: %s", name, exc)
+                if _status_code(exc) == 410:
+                    self._disabled_sources.add(name)
+                self._log_source_failure(name, exc)
+        if not titles:
+            cached_news = self._cache.get("news") or {}
+            if cached_news:
+                self._apply_cached_news(symbols, snap, cached_news)
+                snap.sources_ok.append("news_cache")
+                return
         previous = self._cache.get("news_score") or {}
         scored: dict[str, dict] = {}
         for symbol in symbols:
@@ -233,6 +246,14 @@ class SentimentFeed:
         self._cache["news"] = scored
         self._cache["news_score"] = {symbol: row["score"] for symbol, row in scored.items()}
         self._save()
+
+    def _log_source_failure(self, name: str, exc: BaseException) -> None:
+        """One line per source per hour. A dead feed must not fill the cycle log."""
+        now = time.time()
+        if now - self._logged_at.get(name, 0.0) < 3600:
+            return
+        self._logged_at[name] = now
+        log.info("sentiment source %s failed: %s", name, exc)
 
     def _apply_cached_news(self, symbols, snap, cached_news) -> None:
         for symbol in symbols:
@@ -280,6 +301,16 @@ class SentimentFeed:
             if title:
                 titles.append(title)
         return titles[:25]
+
+
+def _status_code(exc: BaseException) -> int | None:
+    code = getattr(exc, "code", None)
+    if code is None and exc.__cause__ is not None:
+        code = getattr(exc.__cause__, "code", None)
+    try:
+        return int(code) if code is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _mentions(symbol: str, title: str) -> bool:

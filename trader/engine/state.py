@@ -56,6 +56,8 @@ def _trim_liquidity(history: dict) -> dict:
         trimmed[str(symbol)] = {
             "depth": [float(item) for item in (row.get("depth") or [])][-48:],
             "spread": [float(item) for item in (row.get("spread") or [])][-48:],
+            "volume": [float(item) for item in (row.get("volume") or [])][-48:],
+            "volume_ts": [int(item) for item in (row.get("volume_ts") or [])][-48:],
         }
     return trimmed
 

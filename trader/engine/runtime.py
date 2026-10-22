@@ -69,7 +69,7 @@ from trader.wallex.client import (
     fill_totals,
     subaccount_blocked,
 )
-from trader.wallex.mcp import WallexMcp
+from trader.wallex.mcp import WallexMcp, candle_data_path
 from trader.wallex.precision import OrderRejected, round_price, round_qty
 
 log = logging.getLogger("trader.runtime")
@@ -218,6 +218,7 @@ def _run_loop(
             "ok": bool(probe),
             "excerpt": (probe or "")[:400],
         })
+    log.info("%s", candle_data_path(mcp))
     hourly, micro = _load_history(client, universe, cfg)
     markets_at = time.time()
     candles_at = time.time()
@@ -231,7 +232,13 @@ def _run_loop(
                 universe, spreads = _refresh_universe(client, cfg, rules, unavailable)
                 markets_at = time.time()
             if time.time() - candles_at > float(cfg["runtime"]["candle_refresh_seconds"]):
-                hourly, micro = _load_history(client, universe, cfg, previous=hourly)
+                # The refresh replaces candle series. Depth and volume samples
+                # live on `state` and must outlive that replacement.
+                warm = _warmup_snapshot(state)
+                hourly, micro = _load_history(
+                    client, universe, cfg, previous=hourly, previous_micro=micro,
+                )
+                _restore_warmup(state, warm)
                 candles_at = time.time()
             _cycle(
                 cfg, mode, client, agent, risk, journal, state, state_path,
@@ -265,11 +272,14 @@ def _emit_contract(
     latency_ms, allowed, cutoff_reason, adjustment_rows, order_errors, order_rejects,
     entry_taker_fills, cancel_errors, b9_skips, maker_rate, taker_rate, hurdle, guard_blocks=None,
     seals=None,
+    llm_calls=None,
 ) -> None:
     """Append the contract logs. Rows are stamped and secrets are presence-only."""
     ops["cycle_seq"] = int(ops.get("cycle_seq") or 0) + 1
     cycle_id = f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}#{ops['cycle_seq']:05d}"
     usage = decision.usage or {}
+    llm_rows = [row for row in (llm_calls if llm_calls is not None else [usage]) if isinstance(row, dict)]
+    llm_cost, llm_today, llm_total = _cycle_llm_usd(llm_rows)
     if decision.source == "llm_cache":
         llm_source = "llm_cache"
     elif decision.source == "llm":
@@ -483,9 +493,9 @@ def _emit_contract(
         "llm_tier": usage.get("tier"),
         "llm_model": usage.get("model"),
         "llm_source": llm_source,
-        "llm_usd": usage.get("usd") or 0,
-        "llm_usd_today": usage.get("spent_today_usd") or usage.get("spent_usd") or 0,
-        "llm_usd_total": usage.get("spent_usd") or 0,
+        "llm_usd": llm_cost,
+        "llm_usd_today": llm_today,
+        "llm_usd_total": llm_total,
         "veto_all": decision.veto_all,
         "zscore_n": facts.zscore_n,
         "zscore_ready": facts.zscore_n >= minimum,
@@ -501,14 +511,99 @@ def _emit_contract(
     emit_cycle_logs(directory, cycle, symbol_rows, attach_evidence(adjustment_rows, cycle_id), replay or None)
 
 
+def _cycle_llm_usd(rows) -> tuple[float, float, float]:
+    """This cycle's model cost, today's ledger, and the running ledger.
+
+    Each figure stays a float. A sub-millidollar call must not collapse to 0.
+    """
+    cost = 0.0
+    spent = 0.0
+    today = 0.0
+    seen_spent = False
+    seen_today = False
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cost += float(row.get("usd") or 0.0)
+        if row.get("spent_usd") is not None:
+            spent = max(spent, float(row["spent_usd"]))
+            seen_spent = True
+        today_value = row.get("spent_today_usd")
+        if today_value is None:
+            today_value = row.get("spent_usd")
+        if today_value is not None:
+            today = max(today, float(today_value))
+            seen_today = True
+    if not seen_spent:
+        spent = cost
+    if not seen_today:
+        today = cost
+    return cost, today, spent
+
+
 def _zscore_n(state: dict, universe: list[str]) -> int:
-    counts = []
+    """Samples behind the current point, for names that have been warming together.
+
+    A symbol that joins on a universe refresh has one sample and would otherwise
+    pull the minimum back to 0. Names more than one sample behind the leader are
+    still recorded; they do not reset the cohort that is already counting.
+    """
     liquidity = state.get("liquidity") or {}
+    counts = []
     for symbol in universe:
-        depth = (liquidity.get(symbol) or {}).get("depth") or []
+        row = liquidity.get(symbol)
+        if not isinstance(row, dict):
+            continue
+        depth = row.get("depth") or []
         if depth:
             counts.append(max(0, len(depth) - 1))
-    return min(counts) if counts else 0
+    if not counts:
+        return 0
+    leader = max(counts)
+    core = [n for n in counts if leader - n <= 1]
+    return min(core)
+
+
+def _warmup_snapshot(state: dict) -> dict:
+    out = {}
+    for symbol, row in (state.get("liquidity") or {}).items():
+        if not isinstance(row, dict):
+            continue
+        out[symbol] = {
+            "depth": list(row.get("depth") or []),
+            "spread": list(row.get("spread") or []),
+            "volume": list(row.get("volume") or []),
+            "volume_ts": list(row.get("volume_ts") or []),
+        }
+    return out
+
+
+def _restore_warmup(state: dict, snap: dict) -> None:
+    """Put back any warm-up series that a candle reload shortened or dropped."""
+    liquidity = state.setdefault("liquidity", {})
+    for symbol, row in snap.items():
+        current = liquidity.get(symbol)
+        if not isinstance(current, dict):
+            current = {}
+            liquidity[symbol] = current
+        for key, values in row.items():
+            have = current.get(key) or []
+            if len(values) > len(have):
+                current[key] = list(values)
+
+
+def merge_bars(previous, fresh) -> list:
+    """Keep the longer candle series. A short refetch must not wipe warm-up bars."""
+    prev = list(previous or [])
+    new = list(fresh or [])
+    if not new:
+        return prev
+    if len(new) < len(prev):
+        by_time = {int(bar.time): bar for bar in prev}
+        for bar in new:
+            by_time[int(bar.time)] = bar
+        return [by_time[key] for key in sorted(by_time)]
+    return new
 
 
 def _unprotected(state: dict, marks: dict, threshold: float) -> list[str]:
@@ -875,6 +970,7 @@ def _cycle(
         latency_ms, allowed, cutoff_reason, pre_rows + post_rows, order_errors, order_rejects,
         entry_taker_fills, cancel_errors, b9_skips, maker_rate, taker_rate, hurdle, guard_blocks,
         seals,
+        llm_calls=[*sentiment_calls, decision.usage] if decision.usage else list(sentiment_calls),
     )
     journal.decision({
         "timestamp": iso(now),
@@ -1914,7 +2010,9 @@ def _refresh_universe(client, cfg, rules, unavailable):
     return universe, spreads
 
 
-def _load_history(client, universe, cfg, previous: dict | None = None) -> tuple[dict, dict]:
+def _load_history(
+    client, universe, cfg, previous: dict | None = None, previous_micro: dict | None = None,
+) -> tuple[dict, dict]:
     end = int(time.time())
     start = end - int(float(cfg["runtime"]["history_days"]) * 86400)
     micro_start = end - 36 * 3600
@@ -1922,15 +2020,21 @@ def _load_history(client, universe, cfg, previous: dict | None = None) -> tuple[
     micro: dict[str, list[Bar]] = {}
     for symbol in universe:
         try:
-            hourly[symbol] = client.get_ohlcv(symbol, "1h", start, end)
+            hourly[symbol] = merge_bars(
+                (previous or {}).get(symbol),
+                client.get_ohlcv(symbol, "1h", start, end),
+            )
         except WallexError as exc:
             log.warning("hourly history %s failed: %s", symbol, exc)
-            hourly[symbol] = (previous or {}).get(symbol) or []
+            hourly[symbol] = list((previous or {}).get(symbol) or [])
         try:
-            micro[symbol] = client.get_ohlcv(symbol, "15m", micro_start, end)
+            micro[symbol] = merge_bars(
+                (previous_micro or {}).get(symbol),
+                client.get_ohlcv(symbol, "15m", micro_start, end),
+            )
         except WallexError as exc:
             log.warning("15m history %s failed: %s", symbol, exc)
-            micro[symbol] = []
+            micro[symbol] = list((previous_micro or {}).get(symbol) or [])
     return hourly, micro
 
 

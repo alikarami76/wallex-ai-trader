@@ -1,5 +1,7 @@
+import io
 import json
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -73,6 +75,49 @@ class SentimentTests(unittest.TestCase):
         self.assertGreater(snap.news_score["BTCTMN"], 0)
         self.assertIsNone(snap.news_score["USDTTMN"])
         self.assertTrue(any("Bitcoin" in title for title in snap.headlines["BTCTMN"]))
+
+    def test_gone_and_unreachable_sources_log_once_and_keep_the_score(self):
+        path = Path("/tmp/sentiment-shadow-cache.json")
+        if path.exists():
+            path.unlink()
+        phase = {"empty": False}
+
+        def flaky(request, timeout=0):
+            url = request.full_url
+            if "fng" in url:
+                payload = {"data": [
+                    {"value": "40", "value_classification": "Fear", "timestamp": "1700000000"},
+                    {"value": "55", "value_classification": "Neutral", "timestamp": "1700086400"},
+                ]}
+                return _Body(json.dumps(payload))
+            if "cryptopanic" in url:
+                raise urllib.error.HTTPError(
+                    url, 410, "Gone", hdrs=None, fp=io.BytesIO(b"gone"),
+                )
+            if "reddit" in url:
+                raise urllib.error.URLError("unreachable")
+            if phase["empty"]:
+                return _Body("<?xml version='1.0'?><rss><channel></channel></rss>")
+            rss = """<?xml version="1.0"?><rss><channel>
+              <item><title>Bitcoin rally continues after the etf approval</title></item>
+            </channel></rss>"""
+            return _Body(rss)
+
+        feed = SentimentFeed(
+            {"sentiment": {"cache_path": str(path), "cache_seconds": 0, "history_cache_seconds": 0}},
+            opener=flaky,
+        )
+        with self.assertLogs("trader.sentiment", level="INFO") as captured:
+            first = feed.snapshot(["BTCTMN"])
+            phase["empty"] = True
+            second = feed.snapshot(["BTCTMN"])
+        text = "\n".join(captured.output)
+        self.assertEqual(text.count("sentiment source cryptopanic failed"), 1)
+        self.assertEqual(text.count("sentiment source reddit failed"), 1)
+        self.assertIn("cryptopanic", feed._disabled_sources)
+        self.assertGreater(first.news_score["BTCTMN"], 0)
+        self.assertEqual(second.news_score["BTCTMN"], first.news_score["BTCTMN"])
+        self.assertIsNotNone(second.news_score["BTCTMN"])
 
     def test_usage_cost_overrides_the_token_estimate(self):
         priced = _price(
